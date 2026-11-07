@@ -580,6 +580,38 @@ Not covered: the "then" preview, the cluster's small map, road shields / route-n
   car, raise Call volume (Settings -> Sound & vibration -> Volume, or the volume panel's settings). It is stored per
   Bluetooth device, so you only need to do it once.
 
+### Parked CID Roadbook test (X20511I)
+
+This opt-in experiment uses the head unit's factory Roadbook renderer for
+ordinary turns, distance, and lane recommendations received over Android Auto.
+Use the native navigation split screen for the first test. The Android Auto
+video surface can cover the native view. Roundabouts, junction artwork, and
+road text are outside this first test.
+
+The first guidance submission selects the diagnostic Roadbook backend. **Restart
+iDrive after the test to restore the factory navigation backend.** Ending a
+route or removing the arm file clears the test models but leaves the diagnostic
+backend selected. The test requires an existing HMI developer webserver and
+its `Roadbook` page on head unit loopback port 8080 or 8081. If the page is
+unavailable, the daemon disarms before sending models.
+
+1. Park the car and end any active BMW Navigation and Android Auto routes.
+   Turn off **Turn arrows in cluster/HUD**.
+2. Set `NBT_ROADBOOK_TEST=1` in `/opt/aa/nbt-aad.env` and restart Android
+   Auto. Connect your phone and wait for the session to open.
+3. In the head unit SSH shell, run
+   `touch /dev/shmem/nbt-aad-roadbook-test.arm`. Wait for
+   `[Roadbook] parked test armed for 60 seconds` in the daemon log.
+   Start a short Google Maps route and look for `[Roadbook] parked test commit`
+   and the native arrow. A commit confirms receipt by the model manager.
+   Confirm rendering on the CID separately.
+4. End guidance or run `rm /dev/shmem/nbt-aad-roadbook-test.arm`.
+   The daemon also disarms on disconnect or timeout. Restart iDrive
+   before returning to normal use.
+
+The message formats were recovered from X20511I firmware. The test
+still needs a physical head unit run to establish arrow and lane visibility.
+
 ## Configuration (`nbt-aad.env`)
 
 `/opt/aa/nbt-aad.env` holds one `NAME=value` per line. Lines starting with `#` and blank lines are skipped.

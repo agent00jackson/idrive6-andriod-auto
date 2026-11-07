@@ -30,6 +30,7 @@
 #include "kombi_nav_msg.hpp"
 #include "kombi_graph.hpp"
 #include "kombi_client.hpp"
+#include "roadbook_test.hpp"
 
 namespace nbt {
 namespace kombinav {
@@ -185,6 +186,9 @@ private:
 
     pthread_mutex_t mu_;
     NavMessages msgs_;           // guarded by mu_
+    NavMessages roadbookMsgs_;   // guarded by mu_, reset at each guidance start
+    bool roadbookCapture_;       // guarded by mu_
+    roadbook::ParkedTest roadbook_;
     double last_msg_t_;          // guarded by mu_
     bool session_ended_;         // guarded by mu_
     bool quit_;                  // guarded by mu_

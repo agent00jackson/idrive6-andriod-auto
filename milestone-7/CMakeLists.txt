@@ -43,6 +43,7 @@ add_executable(nbt-aad
   src/crash_handler.cpp
   src/kombi_client.cpp
   src/kombi_nav.cpp
+  src/roadbook_test.cpp
   src/volume_osd.cpp
   src/audio/speex.c
 )

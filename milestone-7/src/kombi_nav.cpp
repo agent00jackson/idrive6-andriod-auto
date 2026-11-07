@@ -286,7 +286,7 @@ const char* KombiNav::kShownFile = "/dev/shmem/nbt-aad-kombi-nav.shown";
 unsigned KombiNav::kWatchSkip = 0;
 
 KombiNav::KombiNav()
-    : last_msg_t_(0), session_ended_(false), quit_(false), started_(false), handle_(0xC8), host_("160.48.199.96"),
+    : roadbookCapture_(false), last_msg_t_(0), session_ended_(false), quit_(false), started_(false), handle_(0xC8), host_("160.48.199.96"),
       port_(30502), yield_enabled_(true), forced_(-1), enabled_(false), t_setting_(-1e9), prev_guidance_(false),
       disabled_session_(false), backoff_until_(0), link_failures_(0), marked_(false), watch_pid_(-1), watch_fd_(-1),
       watch_thread_(false), watch_spawned_(-1e9), watch_failed_logged_(false), watch_fp_(NULL),
@@ -371,6 +371,10 @@ void KombiNav::start() {
            forced_ >= 0 ? "NBT_KOMBI_NAV" : "iDrive menu / flag file", host_.c_str(), (unsigned)port_, handle_,
            settings_.approach_mi, settings_.hide_bar ? "hidden" : "factory", yield_enabled_ ? "on" : "off",
            settings_.lanes ? "on" : "off", settings_.inplace);
+    const bool roadbookCapture = roadbook_.start();
+    pthread_mutex_lock(&mu_);
+    roadbookCapture_ = roadbookCapture;
+    pthread_mutex_unlock(&mu_);
     if (pthread_create(&thread_, NULL, &KombiNav::workerStub, this) != 0) {
         printf("[KombiNav] cannot start the worker thread: feature disabled\n");
         return;
@@ -391,13 +395,25 @@ void KombiNav::navStatusCallback(uint16_t msg_id, const uint8_t* body, size_t le
     KombiNav* self = static_cast<KombiNav*>(user);
     if (!self) return;
     pthread_mutex_lock(&self->mu_);
-    if (self->msgs_.store(msg_id, body ? body : (const uint8_t*)"", body ? len : 0)) self->last_msg_t_ = monoS();
+    const uint8_t* data = body ? body : reinterpret_cast<const uint8_t*>("");
+    const size_t size = body ? len : 0;
+    if (self->msgs_.store(msg_id, data, size)) self->last_msg_t_ = monoS();
+    if (self->roadbookCapture_) {
+        NavMessages& messages = self->roadbookMsgs_;
+        if (msg_id == 0x8003) {
+            if (!messages.guidanceActive() || !self->msgs_.guidanceActive()) messages.clear();
+            messages.store(msg_id, data, size);
+        } else if (messages.guidanceActive()) {
+            messages.store(msg_id, data, size);
+        }
+    }
     pthread_mutex_unlock(&self->mu_);
 }
 
 void KombiNav::onSessionEnded() {
     pthread_mutex_lock(&mu_);
     msgs_.clear();
+    roadbookMsgs_.clear();
     session_ended_ = true;
     pthread_mutex_unlock(&mu_);
 }
@@ -441,6 +457,7 @@ void KombiNav::worker() {
         tick(monoS());
         for (double t = 0; t < kTickS && !quitting(this); t += 0.05) usleep(50000);
     }
+    roadbook_.stop();
     client_->setTimeoutMs(1500);   // Force Stop sends SIGKILL 10 s after 'quit': keep the exit clear short
     if (core_->shown() || core_->sentAny()) core_->clear("nbt-aad exiting");
     markShown(false);
@@ -465,18 +482,32 @@ void KombiNav::tick(double now) {
         }
     }
     markShown(core_->shown() || core_->sentAny());
-    if (!enabled_) return;
-    if (yield_enabled_) startWatch(now);
+    const bool roadbookArmed = roadbook_.armed();
+    if (!enabled_ && !roadbookArmed) return;
+    if (enabled_ && yield_enabled_) startWatch(now);
 
     NavMessages m;
+    NavMessages roadbookMessages;
     double last_msg;
     bool ended;
     pthread_mutex_lock(&mu_);
-    m = msgs_;
+    if (enabled_) m = msgs_;
+    if (roadbookArmed) roadbookMessages = roadbookMsgs_;
     last_msg = last_msg_t_;
     ended = session_ended_;
     session_ended_ = false;
     pthread_mutex_unlock(&mu_);
+
+    if (roadbookArmed) {
+        if (enabled_ || enabledNow()) roadbook_.rejectArm();
+        else {
+            NavView view;
+            const bool active = roadbookMessages.guidanceActive() && now - last_msg <= 15.0;
+            const bool valid = active && viewFromMessages(roadbookMessages, view);
+            roadbook_.step(valid ? &view : NULL, active, ended, now);
+        }
+    }
+    if (!enabled_) return;
 
     if (ended) {
         if (core_->shown() || core_->sentAny()) core_->clear("Android Auto session ended");
