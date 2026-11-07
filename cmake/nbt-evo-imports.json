@@ -1,0 +1,196 @@
+{
+  "format": 1,
+  "description": "NBT Evo application-specific link interfaces. Symbol metadata only.",
+  "libraries": [
+    {
+      "soname": "liba2i_client.so",
+      "symbols": [
+        {
+          "name": "A2I_Client_Close",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "A2I_Client_GetBuffer",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "A2I_Client_GetErrorDescription",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "A2I_Client_GetNotification",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "A2I_Client_Open",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "A2I_Client_Out_Write",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "A2I_Client_Start",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "A2I_Client_Stop",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "__aeabi_uidiv",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "__aeabi_uidivmod",
+          "kind": "function",
+          "size": 0
+        }
+      ]
+    },
+    {
+      "soname": "libAppFramework.A.so",
+      "symbols": [
+        {
+          "name": "_ZN3bmw11BasicStringIcEC1EPKc",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw11BasicStringIcED1Ev",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw3MapIjNS_7VariantEED1Ev",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw3MapIjNS_7VariantEEixERKj",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw6ParcelD1Ev",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw9PluginApp10addHandlerEjRKNS_8DelegateIbRKNS_6ParcelEvvvEE",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw9PluginApp10addHandlerEjjRKNS_8DelegateIbRKNS_6ParcelEvvvEE",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw9PluginApp10onFinalizeEv",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw9PluginApp11setPropertyEjjRKNS_6ParcelE",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw9PluginApp11updateModelEjRKNS_13DataTableBaseE",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw9PluginApp11updateModelEjRKNS_6TextIDE",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw9PluginApp11updateModelEjRKNS_7ImageIDE",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw9PluginApp11updateModelEjb",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw9PluginApp12triggerEventEj",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw9PluginApp33cdsAddPropertyChangedEventHandlerERNS_11BasicStringIcEEjRKNS_8DelegateIbRKNS1_ItEEvvvEE",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw9PluginApp4postEPNS_8RunnableEj",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw9PluginApp6onInitEv",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw9PluginAppC1ERNS_11IDispatcherENS_11BasicStringIcEEjjNS_20RHMIInterfaceVersionERKNS_6BundleES8_",
+          "kind": "function",
+          "size": 0
+        }
+      ]
+    },
+    {
+      "soname": "libCoreFramework.A.so",
+      "symbols": [
+        {
+          "name": "_ZN3bmw11BasicStringIcED1Ev",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw13DataTableBaseC1EPNS_3MapIjNS_7VariantEEEj",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw3MapIjNS_7VariantEEixERKj",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw6ParcelC1Eb",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw6TextIDC1Ej",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZN3bmw7ImageIDC1Ej",
+          "kind": "function",
+          "size": 0
+        },
+        {
+          "name": "_ZNK3bmw6Parcel8readBoolERb",
+          "kind": "function",
+          "size": 0
+        }
+      ]
+    }
+  ]
+}

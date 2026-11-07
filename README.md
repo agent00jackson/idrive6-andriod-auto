@@ -45,7 +45,10 @@ Installation instructions can be found in the [install.md file](https://github.c
 2. We've also noticed that a /dev/btspp0 not found error. This seems to come an issue with the head unit not fully opening a Bluetooth channel. I recommend trying to re-pair your phone, or going into the device settings in iDrive and go through the list. Tap "Phone", tap "Bluetooth Audio", tap "Apps", and see if any of them trigger a Bluetooth connection again, and see if your phone starts searing for Android Auto.
 
 ## Building Yourself
-The code needs to be compatible with Armv7LE. I built it with [QNX Momentics](https://archive.org/details/qnxsdp-65.7z) because that's probably what the developers iDrive6 did. Be warned, this is from archive.org. Run it in a VM. I cannot guarntee the safety/security of the software. It is as simple as creating a new project in Momentics, adding all the files to the project folder, right clicking on your project folder, selecting "clean", and then "build". 
+Use the Clang/LLVM SDK imported from `bmw-tools` through Nix. CMake is the
+authoritative build system. See [BUILDING.md](BUILDING.md) for Nix and direct
+CMake workflows, and [LLVM_UPDATE.md](LLVM_UPDATE.md) for updating an existing
+installation once you are ready.
 
 ### Feeling Generous?
 I don't charge for this project, I don't charge for deployments, if this has helped you and you're feeling generous, here's my paypal: https://paypal.me/banananaisu
