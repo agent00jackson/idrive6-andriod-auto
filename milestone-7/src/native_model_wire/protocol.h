@@ -18,7 +18,15 @@ enum ng_result {
     NG_OK = 0, NG_BAD_FRAME = 1, NG_BAD_VALUE = 2,
     NG_BAD_SESSION = 3, NG_STALE = 4, NG_BACKEND_REJECTED = 5
 };
-struct ng_lane { uint16_t arrows; uint8_t recommended; };
+enum ng_lane_arrow {
+    NG_LANE_STRAIGHT=1, NG_LANE_LEFT=2, NG_LANE_RIGHT=4,
+    NG_LANE_SLIGHT_LEFT=8, NG_LANE_SLIGHT_RIGHT=16,
+    NG_LANE_SHARP_LEFT=32, NG_LANE_SHARP_RIGHT=64,
+    NG_LANE_UTURN_LEFT=128, NG_LANE_UTURN_RIGHT=256
+};
+#define NG_LANE_ARROW_MASK 511u
+#define NG_MAX_LANE_ARROWS 9u
+struct ng_lane { uint16_t arrows; uint16_t recommended; };
 struct ng_message {
     uint32_t operation, sequence;
     uint64_t session;
@@ -26,6 +34,11 @@ struct ng_message {
     uint16_t direction_centunits;
     uint16_t lane_count;
     struct ng_lane lanes[NG_MAX_LANES];
+    /* 0 encodes unchanged NGV1/fixed-NOW diagnostic behavior. NGV2 carries
+     * explicit native MANPHASE1..4 in reserved word72, never lane word68. */
+    uint32_t phase;
+    /* 0 legacy, 1 NGV3 single direction, 2 NGV4 per-direction highlights. */
+    uint32_t lane_mode;
 };
 struct ng_state {
     uint64_t session;

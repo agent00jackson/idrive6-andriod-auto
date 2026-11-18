@@ -6,9 +6,10 @@ the J29 or 6WA transport, and the existing display presets still select
 their corresponding drivers.
 
 The backend takes the upstream channel-10 view and its approach, repeated
-maneuver, reroute and disconnect policy. It publishes typed straight, normal
-left and normal right turns with distance to the separately loaded Full
-adapter. E114 verified left and right arrows, a distance refresh, and clear
+maneuver, reroute and disconnect policy. It publishes straight, left and right
+turns with distance to the separately loaded Full adapter. A per-session
+capability query enables additional typed maneuvers and lanes when the
+adapter advertises them. E114 verified left and right arrows, a distance refresh, and clear
 on the original BMW emulator software. The ARM Android Auto integration has
 a host replay and still needs an end-to-end BMW trial. Straight is covered
 at the data boundary and still needs visible 6WB verification.
@@ -34,10 +35,13 @@ distance-only updates retain their existing cadence. Factory-route detection
 retires this publisher's own model. Main thread or transport failures are
 handled by the Full lease expiry.
 
-The upstream parser still carries lanes, road names and roundabout exit
-data. Native rendering of those fields requires a larger semantic contract
-and source-qualified OEM behavior. Supported basic turns still work when
-the phone supplies lanes. Unsupported maneuvers retire the current model.
+The expanded contract adds slight turns, sharp turns and U-turns in either
+direction. With lanes enabled, it includes the directions and individual
+recommendations for each lane. A lane update can reuse the same maneuver ID
+without waiting for a distance change. Older adapters receive basic turns
+without lane data. Unsupported maneuvers retire the current model.
+BMW scanout for the expanded inputs still needs qualification. Road names
+and roundabout exit data still need their own OEM input contracts.
 The updated workspace navigation plan tracks each outstanding display test.
 
 The QNX installation tree produced by CMake is an integration artifact.

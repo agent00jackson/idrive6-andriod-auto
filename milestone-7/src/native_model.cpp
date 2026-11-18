@@ -258,7 +258,7 @@ class ControllerRoute {
 } // namespace
 Backend::Backend(const char *d)
     : started_(false), closing_(false), armed_(false), cancel_(false), pending_(false), busy_(false), failed_(false),
-      expiry_(0), generation_(0), haveNav_(false), maneuver_(0), directory_(d), fd_(-1), aliveFd_(-1),
+      expiry_(0), generation_(0), haveNav_(false), maneuver_(0), capabilities_(NG_CAP_TYPED), directory_(d), fd_(-1), aliveFd_(-1),
       aliveDevice_(0), aliveInode_(0), heartbeatSequence_(0), sequence_(0), fullPid_(0), session_(0),
       attempted_(false) {
     pthread_mutex_init(&mutex_, NULL);
@@ -295,10 +295,7 @@ bool Backend::arm(uint64_t expires) {
     pthread_mutex_unlock(&mutex_);
     return ok;
 }
-bool Backend::submit(const kombinav::NavView &v, bool forceNew) {
-    Message m;
-    if (!fromNav(v, m))
-        return false;
+bool Backend::submit(const kombinav::NavView& v, Message m, bool forceNew) {
     pthread_mutex_lock(&mutex_);
     bool ok = armed_ && !cancel_ && !closing_ && !failed_ && millis() < expiry_;
     if (ok) {
@@ -314,6 +311,12 @@ bool Backend::submit(const kombinav::NavView &v, bool forceNew) {
     }
     pthread_mutex_unlock(&mutex_);
     return ok;
+}
+unsigned Backend::capabilities() {
+    pthread_mutex_lock(&mutex_);
+    const unsigned admitted = capabilities_;
+    pthread_mutex_unlock(&mutex_);
+    return admitted;
 }
 void Backend::stop() {
     pthread_mutex_lock(&mutex_);
@@ -409,6 +412,28 @@ bool Backend::exchange(Message &m) {
     }
     return false;
 }
+unsigned Backend::queryCapabilities() {
+    const uint32_t query = ++sequence_;
+    uint8_t frame[NG_CAP_BYTES];
+    ng_cap_request(frame, query);
+    if (send(fd_, frame, sizeof(frame), 0) != ssize_t(sizeof(frame))) return 0;
+    const uint64_t deadline = millis() + 750;
+    while (millis() < deadline && !revoked()) {
+        uint8_t reply[NG_CAP_BYTES + 1];
+        const ssize_t size = recv(fd_, reply, sizeof(reply), 0);
+        if (size == NG_CAP_BYTES) {
+            // Older Full readers answer unknown frames with BAD_FRAME and sequence zero.
+            if (!memcmp(reply,"NGA1",4) && !rd32(reply+4) && rd32(reply+8)==NG_BAD_FRAME &&
+                rd32(reply+12)==kModelId) return 0;
+            if (!memcmp(reply,"NGR1",4) && rd32(reply+4)==query)
+                return ng_cap_read(reply, size_t(size), query);
+        }
+        if (size < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return 0;
+        const timespec pause = {0, 10000000};
+        nanosleep(&pause, NULL);
+    }
+    return 0;
+}
 bool Backend::discover() {
     closeSocket();
     char dir[256];
@@ -444,7 +469,13 @@ bool Backend::discover() {
         probe.operation = Probe;
         if (exchange(probe) && endpoint(p)) {
             found = connectLiveness(std::string(ent->d_name + strlen("native-guidance-")));
-            if (found) fullPid_ = pid;
+            if (found) {
+                fullPid_ = pid;
+                const unsigned advertised = queryCapabilities();
+                pthread_mutex_lock(&mutex_);
+                capabilities_ = advertised;
+                pthread_mutex_unlock(&mutex_);
+            }
             break;
         }
     }
@@ -569,6 +600,12 @@ void Backend::run() {
             }
             if (pending) {
                 active = m;
+                if (!adaptToCapabilities(active, capabilities())) {
+                    stop();
+                    retire();
+                    dirty = false;
+                    continue;
+                }
                 dirty = true;
             }
             const uint64_t now = millis();

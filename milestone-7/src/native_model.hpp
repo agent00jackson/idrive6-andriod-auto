@@ -13,7 +13,8 @@ class Backend {
     ~Backend();
     bool start();
     bool arm(uint64_t expiresMs);
-    bool submit(const kombinav::NavView &, bool forceNew = false);
+    bool submit(const kombinav::NavView&, Message, bool forceNew);
+    unsigned capabilities();
     void stop();
     void guidanceEnded(bool) { stop(); }
     void observeFactoryRoute() { stop(); }
@@ -25,6 +26,7 @@ class Backend {
     static void *entry(void *);
     void run();
     bool discover();
+    unsigned queryCapabilities();
     bool exchange(Message &);
     void closeSocket();
     bool connectLiveness(const std::string& suffix);
@@ -40,6 +42,7 @@ class Backend {
     kombinav::NavView lastNav_;
     bool haveNav_;
     uint32_t maneuver_;
+    unsigned capabilities_;
     std::string directory_, clientDirectory_, clientPath_;
     int fd_, aliveFd_;
     std::string alivePath_;

@@ -33,7 +33,8 @@ static NavView phone(int type, const std::vector<TLane> &lanes, int64_t metres) 
     return v;
 }
 int main(int argc, char** argv) {
-    const bool routeSession = argc == 2 && !strcmp(argv[1], "--controller");
+    const bool typed = argc == 2 && !strcmp(argv[1], "--typed");
+    const bool routeSession = typed || (argc == 2 && !strcmp(argv[1], "--controller"));
     if (routeSession) assert(!setenv("NBT_NATIVE_ROUTE_SESSION", "1", 1));
     else assert(!unsetenv("NBT_NATIVE_ROUTE_SESSION"));
     std::vector<TLane> lanes;
@@ -44,7 +45,7 @@ int main(int argc, char** argv) {
     assert(fromNav(v, m));
     assert(m.distanceMm == 46000 && m.turn == 3 && m.direction == 19200 && m.laneCount == 0);
     uint32_t selectedTurn=77; uint16_t selectedDirection=55;
-    for(int type=-1;type<=256;++type)if(type!=7&&type!=8&&type!=36){
+    for(int type=-1;type<=256;++type)if((type<5||type>12)&&type!=36){
         assert(!turnDirection(type,selectedTurn,selectedDirection));
         assert(selectedTurn==77&&selectedDirection==55);
     }
@@ -54,6 +55,10 @@ int main(int argc, char** argv) {
     for(int type=0;type<=256;++type)if(type!=7&&type!=8&&type!=36)
         assert(!fromNav(phone(type, std::vector<TLane>(), 46), rejected)); // no implicit straight/depart/unknown mapping
     assert(fromNav(phone(8, lanes, 46), rejected) && rejected.laneCount == 0);
+    assert(fromNav(phone(11, {lane2(8,false,9,true)}, 46), rejected, NG_CAP_TYPED));
+    assert(rejected.turn == NG_UTURN && rejected.direction == 6400 && rejected.laneMode == 2);
+    assert(rejected.lanes[0].arrows == (NG_LANE_UTURN_LEFT|NG_LANE_UTURN_RIGHT));
+    assert(rejected.lanes[0].recommended == NG_LANE_UTURN_RIGHT);
     // Codec preserves the native literal lane DTO independently of production qualification.
     m.laneCount = 2;
     m.lanes[0].arrows = 2;
@@ -144,7 +149,7 @@ int main(int argc, char** argv) {
     }
     std::atomic<unsigned> begins(0), updates(0), stops(0), probes(0), beats(0);
     std::atomic<unsigned> controllerArms(0), controllerStops(0), controllerRearms(0), controllerPulses(0);
-    std::atomic<bool> closerTurn(false), followingTurn(false), repeatedTurn(false);
+    std::atomic<bool> closerTurn(false), followingTurn(false), repeatedTurn(false), lateLanes(false);
     std::atomic<bool> done(false);
     std::thread server([&] {
         uint64_t currentSession = 0;
@@ -237,30 +242,53 @@ int main(int argc, char** argv) {
                 ++beats;
                 continue;
             }
+            if (const auto query = ng_cap_query(data, size_t(z))) {
+                uint8_t reply[NG_CAP_BYTES];
+                if (typed) {
+                    ng_cap_response(reply, query, NG_CAP_TYPED);
+                } else {
+                    memcpy(reply, "NGA1", 4);
+                    wr32(reply+4,0);
+                    wr32(reply+8,NG_BAD_FRAME);
+                    wr32(reply+12,kModelId);
+                }
+                assert(sendto(fd, reply, sizeof(reply), 0, (sockaddr*)&peer, len) == sizeof(reply));
+                continue;
+            }
             ng_message x;
             assert(ng_decode(data, z, &x) == NG_OK);
-            if(x.operation==NG_BEGIN||x.operation==NG_UPDATE)
-                assert((x.turn==NG_LEFT&&x.direction_centunits==6400)||(x.turn==NG_RIGHT&&x.direction_centunits==19200));
+            if(x.operation==NG_BEGIN||x.operation==NG_UPDATE) {
+                assert((x.turn==NG_LEFT&&x.direction_centunits==6400)||(x.turn==NG_RIGHT&&x.direction_centunits==19200)||
+                       (typed&&x.turn==NG_UTURN&&x.direction_centunits==6400));
+                assert(typed || (!x.lane_count && !x.lane_mode));
+            }
             if (x.operation == NG_BEGIN) {
                 assert(!currentSession && x.session && x.maneuver);
                 currentSession = x.session;
                 initialManeuver = x.maneuver;
                 latestSequence = x.sequence;
+                if (typed) assert(x.lane_mode == 2 && x.lane_count == 2 &&
+                                  x.lanes[1].recommended == NG_LANE_RIGHT);
                 ++begins;
             } else if (x.operation == NG_UPDATE) {
                 assert(x.session == currentSession && x.sequence > latestSequence);
                 latestSequence = x.sequence;
+                if (typed && x.distance_mm == 46000) {
+                    assert(x.maneuver == initialManeuver && x.lane_count == 2 &&
+                           x.lanes[1].recommended == NG_LANE_UTURN_RIGHT);
+                    lateLanes = true;
+                }
                 if (x.distance_mm == 35000) {
                     assert(x.maneuver == initialManeuver && x.turn == NG_RIGHT);
                     closerTurn = true;
                 }
                 if (x.distance_mm == 28000) {
-                    assert(x.maneuver != initialManeuver && x.turn == NG_LEFT && closerTurn);
+                    assert(x.maneuver != initialManeuver && x.turn == (typed ? NG_UTURN : NG_LEFT) && closerTurn);
                     followingManeuver = x.maneuver;
                     followingTurn = true;
                 }
                 if (x.distance_mm == 900000) {
-                    assert(followingTurn && x.maneuver > followingManeuver && x.turn==NG_LEFT);
+                    assert(followingTurn && x.maneuver > followingManeuver && x.turn==(typed ? NG_UTURN : NG_LEFT));
                     repeatedTurn = true;
                 }
                 ++updates;
@@ -295,12 +323,18 @@ int main(int argc, char** argv) {
         // The separate Full lease must keep the initial semantic version stable.
         for (int i=0; i<600 && beats < 3; ++i) usleep(10000);
         assert(beats >= 3 && updates == 0);
+        if (typed) {
+            auto changed = phone(8, {lane(4,false),lane2(1,false,9,true)}, 46);
+            core.step(&changed, 1.5);
+            for (int i=0; i<350 && !lateLanes; ++i) usleep(10000);
+            assert(lateLanes);
+        }
         auto closer = phone(8, lanes, 35);
         closer.dist_text = "115";
         core.step(&closer, 2.0);
         for (int i=0; i<350 && !closerTurn; ++i) usleep(10000);
         assert(closerTurn);
-        auto following = phone(7, {}, 28);
+        auto following = phone(typed ? 11 : 7, {}, 28);
         core.step(&following, 3.0);
         for (int i=0; i<350 && !followingTurn; ++i) usleep(10000);
         assert(followingTurn && updates >= 2);

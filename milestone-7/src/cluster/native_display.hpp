@@ -12,7 +12,7 @@ public:
     explicit NativeDisplay(const char* directory = NG_SOCKET_ROOT) : backend_(directory) {}
     bool start() { return backend_.start(); }
     const char* name() const override { return "BMW native guidance"; }
-    void setSettings(const Settings&) override {}
+    void setSettings(const Settings& settings) override { lanes_ = settings.lanes; }
     void setLog(LogFn, void*) override {}
     bool sameManeuver(const NavView&, double) override { return false; }
     Result showManeuver(const NavView&, double, bool isNew, bool first) override;
@@ -27,7 +27,8 @@ private:
     Result publish(const NavView&, bool newManeuver);
     native_model::Backend backend_;
     bool active_ = false;
-    uint32_t lastDistanceMm_ = 0;
+    bool lanes_ = true;
+    native_model::Message last_;
 };
 } // namespace kombinav
 } // namespace nbt
