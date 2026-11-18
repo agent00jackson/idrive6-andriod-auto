@@ -29,7 +29,8 @@ socket. Both sockets are local, mode 0600 and source-bound by the same
 endpoint PID. Heartbeats keep an unchanged model's semantic sequence stable.
 Older Full adapters without the companion retain the timed update fallback.
 Updates use the same session until an owned STOP or expiry. A following
-maneuver advances the maneuver ID. Factory-route detection
+maneuver advances the maneuver ID and can publish immediately. Repeated
+distance-only updates retain their existing cadence. Factory-route detection
 retires this publisher's own model. Main thread or transport failures are
 handled by the Full lease expiry.
 

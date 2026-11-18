@@ -516,6 +516,7 @@ void Backend::clearOwned() {
 void Backend::run() {
     uint64_t seen = 0, nextUpdate = 0, nextHeartbeat = 0;
     uint32_t accepted = 0;
+    uint32_t acceptedManeuver = 0;
     Message active;
     bool dirty = false;
     const char* routeSetting = getenv("NBT_NATIVE_ROUTE_SESSION");
@@ -548,6 +549,7 @@ void Backend::run() {
                 session_ = nonce();
                 sequence_ = 0;
                 accepted = 0;
+                acceptedManeuver = 0;
                 dirty = false;
                 nextUpdate = nextHeartbeat = 0;
                 if (!discover()) {
@@ -570,10 +572,11 @@ void Backend::run() {
                 dirty = true;
             }
             const uint64_t now = millis();
-            const bool update = (dirty || (accepted && aliveFd_ < 0)) && now >= nextUpdate;
+            const bool nextManeuver = dirty && active.maneuver != acceptedManeuver;
+            const bool timedUpdate = (dirty || (accepted && aliveFd_ < 0)) && now >= nextUpdate;
             const bool keepAlive = accepted && aliveFd_ >= 0 && now >= nextHeartbeat;
             bool ok = true;
-            if (update && !revoked()) {
+            if ((nextManeuver || timedUpdate) && !revoked()) {
                 active.operation = attempted_ ? Update : Begin;
                 active.session = session_;
                 // A lost ACK can leave an owned model; always attempt its scoped clear.
@@ -583,6 +586,7 @@ void Backend::run() {
                 if (ok) {
                     const bool first = !accepted;
                     accepted = active.sequence;
+                    acceptedManeuver = active.maneuver;
                     heartbeatSequence_ = 0;
                     ok = heartbeat(accepted);
                     if (ok && selectRoute && !revoked())
