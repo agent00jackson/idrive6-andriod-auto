@@ -402,11 +402,15 @@ bool Backend::exchange(Message &m) {
         return false;
     m.sequence = ++sequence_;
     uint8_t bytes[kMaxFrameBytes];
-    if (!encode(m, bytes))
+    if (!encode(m, bytes)) {
+        printf("[Native model] invalid Full request op=%u sequence=%u\n", m.operation, m.sequence);
         return false;
+    }
     const size_t frame_bytes=frameSize(m);
-    if (send(fd_, bytes, frame_bytes, 0) != ssize_t(frame_bytes))
+    if (send(fd_, bytes, frame_bytes, 0) != ssize_t(frame_bytes)) {
+        printf("[Native model] Full send failed op=%u sequence=%u errno=%d\n", m.operation, m.sequence, errno);
         return false;
+    }
     // Bound each wait by the corresponding Full owner-queue budget.
     const unsigned budget = m.operation == Probe ? 17000 : m.operation == Begin ? 6000 : 4000;
     uint64_t deadline = millis() + budget;
@@ -417,13 +421,25 @@ bool Backend::exchange(Message &m) {
         if (n >= 0) {
             if (n >= 8 && rd32(reply + 4) != m.sequence)
                 continue;
-            return replyAccepted(reply, size_t(n), m.sequence);
-        }
-        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            if (replyAccepted(reply, size_t(n), m.sequence))
+                return true;
+            if (size_t(n) == kReplyBytes && !memcmp(reply, "NGA1", 4))
+                printf("[Native model] Full rejected op=%u sequence=%u result=%u frame_bytes=%zu\n",
+                       m.operation, m.sequence, rd32(reply + 8), frame_bytes);
+            else
+                printf("[Native model] invalid Full reply op=%u sequence=%u bytes=%zd\n",
+                       m.operation, m.sequence, n);
             return false;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            printf("[Native model] Full receive failed op=%u sequence=%u errno=%d\n", m.operation, m.sequence, errno);
+            return false;
+        }
         timespec pause = {0, 10000000};
         nanosleep(&pause, NULL);
     }
+    printf("[Native model] Full reply timed out op=%u sequence=%u budget_ms=%u\n",
+           m.operation, m.sequence, budget);
     return false;
 }
 unsigned Backend::queryCapabilities() {
@@ -647,21 +663,30 @@ void Backend::run() {
             const bool timedUpdate = (dirty || (accepted && aliveFd_ < 0)) && now >= nextUpdate;
             const bool keepAlive = accepted && aliveFd_ >= 0 && now >= nextHeartbeat;
             bool ok = true;
+            const char *receiptSource = "Full model";
             if ((nextManeuver || timedUpdate) && !revoked()) {
                 active.operation = attempted_ ? Update : Begin;
                 active.session = session_;
                 // A lost ACK can leave an owned model; always attempt its scoped clear.
                 attempted_ = true;
                 publish(true, false);
-                ok = (!accepted || heartbeat(accepted)) && exchange(active);
+                receiptSource = "Full liveness before model";
+                ok = !accepted || heartbeat(accepted);
+                if (ok) {
+                    receiptSource = "Full model";
+                    ok = exchange(active);
+                }
                 if (ok) {
                     const bool first = !accepted;
                     accepted = active.sequence;
                     acceptedManeuver = active.maneuver;
                     heartbeatSequence_ = 0;
+                    receiptSource = "Full liveness";
                     ok = heartbeat(accepted);
-                    if (ok && selectRoute && !revoked())
+                    if (ok && selectRoute && !revoked()) {
+                        receiptSource = first ? "Controller ARM" : "Controller heartbeat";
                         ok = first ? route.arm(session_, accepted) : route.pulse(accepted);
+                    }
                 }
                 if (ok) {
                     dirty = false;
@@ -670,13 +695,18 @@ void Backend::run() {
                     nextUpdate = nextHeartbeat = millis() + 2000;
                 }
             } else if (keepAlive && !revoked()) {
+                receiptSource = "Full liveness";
                 ok = heartbeat(accepted);
-                if (ok && selectRoute && !revoked()) ok = route.pulse(accepted);
+                if (ok && selectRoute && !revoked()) {
+                    receiptSource = "Controller heartbeat";
+                    ok = route.pulse(accepted);
+                }
                 nextHeartbeat = millis() + 2000;
             }
             if (!ok) {
                 if (!revoked()) {
-                    printf("[Native model] producer receipt unavailable; retiring owned model\n");
+                    printf("[Native model] producer receipt unavailable from %s; retiring owned model\n",
+                           receiptSource);
                     publish(true, true);
                 }
                 stop();
