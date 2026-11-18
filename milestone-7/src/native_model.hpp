@@ -46,6 +46,7 @@ class Backend {
     uint64_t aliveDevice_, aliveInode_;
     uint32_t heartbeatSequence_;
     uint32_t sequence_;
+    uint32_t fullPid_;
     uint64_t session_;
     bool attempted_;
 };

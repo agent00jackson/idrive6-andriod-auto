@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 #include "native_model.hpp"
+#include "native_controller_protocol.hpp"
 #include "native_model_wire/alive_wire.h"
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -80,23 +82,184 @@ bool endpoint(const std::string &p) {
     return !api().lstatFn(p.c_str(), &s) && (s.st_mode & S_IFMT) == S_IFSOCK && (s.st_mode & 0777) == 0600 &&
            s.st_uid == api().geteuidFn();
 }
-bool nameValid(const char *n) {
-    const char *prefix = "native-guidance-";
+uint32_t socketPid(const char *n, const char *prefix) {
     size_t k = strlen(prefix);
     if (strncmp(n, prefix, k))
-        return false;
+        return 0;
     const char *p = n + k;
     if (*p < '1' || *p > '9')
-        return false;
-    while (*p >= '0' && *p <= '9')
-        ++p;
-    return !strcmp(p, ".sock");
+        return 0;
+    uint64_t pid = 0;
+    while (*p >= '0' && *p <= '9') {
+        pid = pid * 10 + (*p++ - '0');
+        if (pid > 0x7fffffffU) return 0;
+    }
+    return pid >= 2 && !strcmp(p, ".sock") ? uint32_t(pid) : 0;
 }
+class ControllerRoute {
+  public:
+    ~ControllerRoute() { close(); }
+
+    bool prepare(const std::string& directory, uint32_t fullPid) {
+        close();
+        DIR* entries = opendir(directory.c_str());
+        if (!entries) return false;
+        unsigned peers = 0;
+        while (dirent* entry = readdir(entries)) {
+            if (!socketPid(entry->d_name, "native-functional-cue-")) continue;
+            const std::string path = directory + "/" + entry->d_name;
+            if (!endpoint(path)) continue;
+            remote_ = path;
+            ++peers;
+        }
+        closedir(entries);
+
+        char name[80];
+        snprintf(name, sizeof(name), "/native-functional-client-%ld.sock", long(getpid()));
+        std::string local = directory + name;
+        LocalAddress source, destination;
+        if (peers != 1 || !address(local, source) || !address(remote_, destination) ||
+            api().lstatFn(remote_.c_str(), &remoteIdentity_))
+            return false;
+        fd_ = socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (fd_ < 0 || fcntl(fd_, F_SETFL, O_NONBLOCK) < 0 ||
+            fcntl(fd_, F_SETFD, FD_CLOEXEC) < 0 ||
+            bind(fd_, reinterpret_cast<sockaddr*>(&source), sizeof(source)) ||
+            api().lstatFn(local.c_str(), &localIdentity_))
+            return false;
+        local_ = local;
+        if (api().chmodFn(local.c_str(), 0600) ||
+            connect(fd_, reinterpret_cast<sockaddr*>(&destination), sizeof(destination)))
+            return false;
+
+        controller::Reply reply;
+        if (!probe(reply)) return false;
+        if (reply.phase == controller::kEmptyReturned) {
+            nonce_ = reply.nonce;
+            epoch_ = reply.epoch;
+            const uint64_t settle = millis() + 7500;
+            while (!(reply.flags & controller::kCompletedRearm) && millis() < settle) {
+                const timespec pause = {0,200000000};
+                nanosleep(&pause, NULL);
+                if (!probe(reply) || reply.phase != controller::kEmptyReturned ||
+                    reply.nonce != nonce_ || reply.epoch != epoch_)
+                    return false;
+            }
+            if (!epoch_ || !(reply.flags & controller::kCompletedRearm) ||
+                !command(controller::kRearm, reply, 2000))
+                return false;
+            const uint64_t end = millis() + 10000;
+            do {
+                const timespec pause = {0,200000000};
+                nanosleep(&pause, NULL);
+                if (!probe(reply)) return false;
+            } while (reply.nonce == nonce_ && reply.phase == controller::kEmptyReturned && millis() < end);
+            if (reply.nonce == nonce_) return false;
+        }
+        if (reply.phase != controller::kIdle || reply.epoch) return false;
+        nonce_ = reply.nonce;
+        fullPid_ = fullPid;
+        sequence_ = 1;
+        return true;
+    }
+
+    bool arm(uint64_t session, uint32_t producer) {
+        session_ = session;
+        epoch_ = session ^ UINT64_C(0x4345554535303030);
+        if (!epoch_) epoch_ = 1;
+        producer_ = producer;
+        armed_ = true; // A lost reply may leave an accepted ARM.
+        controller::Reply reply;
+        return command(controller::kArm, reply, 6000) &&
+               reply.phase == controller::kArmed && reply.deadline > millis();
+    }
+
+    bool pulse(uint32_t producer) {
+        producer_ = producer;
+        controller::Reply reply;
+        return command(controller::kHeartbeat, reply, 5500) &&
+               (reply.phase == controller::kArmed || reply.phase == controller::kSelected);
+    }
+
+    bool retire(uint32_t lastAccepted) {
+        if (!armed_) return true;
+        armed_ = false;
+        if (lastAccepted > producer_) producer_ = lastAccepted;
+        controller::Reply reply;
+        const uint64_t end = millis() + 5500;
+        if (!command(controller::kStop, reply, 2000)) return false;
+        while (reply.phase < controller::kEmptyReturned && millis() < end) {
+            const timespec pause = {0,200000000};
+            nanosleep(&pause, NULL);
+            if (!command(controller::kHeartbeat, reply, 1500)) return false;
+        }
+        return reply.phase >= controller::kEmptyReturned;
+    }
+
+    void close() {
+        if (fd_ >= 0) ::close(fd_);
+        fd_ = -1;
+        if (!local_.empty() && matches(local_, localIdentity_)) unlink(local_.c_str());
+        local_.clear();
+        remote_.clear();
+        nonce_ = epoch_ = session_ = 0;
+        armed_ = false;
+    }
+
+  private:
+    static bool matches(const std::string& path, const struct stat& identity) {
+        struct stat found;
+        return !api().lstatFn(path.c_str(), &found) && found.st_dev == identity.st_dev &&
+               found.st_ino == identity.st_ino && (found.st_mode & S_IFMT) == S_IFSOCK;
+    }
+
+    bool probe(controller::Reply& reply) {
+        return command(controller::kProbe, reply, 2500) &&
+               (reply.flags & controller::kRunningReadyOwner) == controller::kRunningReadyOwner;
+    }
+
+    bool command(controller::Operation operation, controller::Reply& reply, unsigned timeout) {
+        const bool scope = operation == controller::kArm || operation == controller::kHeartbeat ||
+                           operation == controller::kStop;
+        if (fd_ < 0 || (scope && sequence_ >= UINT32_MAX-1) ||
+            !matches(remote_, remoteIdentity_) || !endpoint(remote_))
+            return false;
+        const uint32_t sequence = operation == controller::kProbe ? 1 :
+                                  operation == controller::kRearm ? UINT32_MAX : ++sequence_;
+        uint8_t bytes[controller::kBytes];
+        controller::encode(bytes, operation, sequence, operation == controller::kProbe ? 0 : nonce_,
+                           operation == controller::kProbe ? 0 : epoch_,
+                           scope ? fullPid_ : 0, scope ? producer_ : 0, scope ? session_ : 0, millis());
+        if (send(fd_, bytes, sizeof(bytes), 0) != ssize_t(sizeof(bytes))) return false;
+        const uint64_t end = millis() + timeout;
+        while (millis() < end) {
+            uint8_t received[controller::kBytes + 1];
+            const ssize_t size = recv(fd_, received, sizeof(received), 0);
+            if (size >= 0) {
+                if (!controller::decode(received, size_t(size), sequence, reply)) continue;
+                return !reply.result && (reply.flags & controller::kRouteSession) &&
+                       (!scope || (reply.nonce == nonce_ && reply.epoch == epoch_)) &&
+                       matches(remote_, remoteIdentity_) && endpoint(remote_);
+            }
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return false;
+            const timespec pause = {0,10000000};
+            nanosleep(&pause, NULL);
+        }
+        return false;
+    }
+
+    int fd_ = -1;
+    std::string local_, remote_;
+    struct stat localIdentity_ = {}, remoteIdentity_ = {};
+    uint32_t fullPid_ = 0, producer_ = 0, sequence_ = 0;
+    uint64_t nonce_ = 0, epoch_ = 0, session_ = 0;
+    bool armed_ = false;
+};
 } // namespace
 Backend::Backend(const char *d)
     : started_(false), closing_(false), armed_(false), cancel_(false), pending_(false), busy_(false), failed_(false),
       expiry_(0), generation_(0), haveNav_(false), maneuver_(0), directory_(d), fd_(-1), aliveFd_(-1),
-      aliveDevice_(0), aliveInode_(0), heartbeatSequence_(0), sequence_(0), session_(0),
+      aliveDevice_(0), aliveInode_(0), heartbeatSequence_(0), sequence_(0), fullPid_(0), session_(0),
       attempted_(false) {
     pthread_mutex_init(&mutex_, NULL);
 }
@@ -271,7 +434,8 @@ bool Backend::discover() {
     bool found = false;
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
-        if (!nameValid(ent->d_name))
+        uint32_t pid = socketPid(ent->d_name, "native-guidance-");
+        if (!pid)
             continue;
         std::string p = directory_ + "/" + ent->d_name;
         if (!endpoint(p) || !address(p, a) || connect(fd_, reinterpret_cast<sockaddr *>(&a), sizeof(a)))
@@ -280,6 +444,7 @@ bool Backend::discover() {
         probe.operation = Probe;
         if (exchange(probe) && endpoint(p)) {
             found = connectLiveness(std::string(ent->d_name + strlen("native-guidance-")));
+            if (found) fullPid_ = pid;
             break;
         }
     }
@@ -353,6 +518,15 @@ void Backend::run() {
     uint32_t accepted = 0;
     Message active;
     bool dirty = false;
+    const char* routeSetting = getenv("NBT_NATIVE_ROUTE_SESSION");
+    const bool selectRoute = routeSetting && !strcmp(routeSetting, "1");
+    ControllerRoute route;
+    const auto retire = [&] {
+        if (selectRoute && !route.retire(accepted))
+            printf("[Native model] Controller scoped clear unconfirmed\n");
+        route.close();
+        clearOwned();
+    };
     for (;;) {
         pthread_mutex_lock(&mutex_);
         bool closing = closing_, armed = armed_, cancel = cancel_;
@@ -364,7 +538,7 @@ void Backend::run() {
         pthread_mutex_unlock(&mutex_);
         if (closing || cancel || !armed || millis() >= expiry) {
             if (busy())
-                clearOwned();
+                retire();
             dirty = false;
             if (closing)
                 break;
@@ -381,6 +555,13 @@ void Backend::run() {
                     if (!revoked()) publish(true, true);
                     stop();
                     clearOwned();
+                    continue;
+                }
+                if (selectRoute && (aliveFd_ < 0 || !route.prepare(directory_, fullPid_))) {
+                    printf("[Native model] no ready Controller route-session endpoint\n");
+                    if (!revoked()) publish(true, true);
+                    stop();
+                    retire();
                     continue;
                 }
             }
@@ -400,9 +581,12 @@ void Backend::run() {
                 publish(true, false);
                 ok = (!accepted || heartbeat(accepted)) && exchange(active);
                 if (ok) {
+                    const bool first = !accepted;
                     accepted = active.sequence;
                     heartbeatSequence_ = 0;
                     ok = heartbeat(accepted);
+                    if (ok && selectRoute && !revoked())
+                        ok = first ? route.arm(session_, accepted) : route.pulse(accepted);
                 }
                 if (ok) {
                     dirty = false;
@@ -412,6 +596,7 @@ void Backend::run() {
                 }
             } else if (keepAlive && !revoked()) {
                 ok = heartbeat(accepted);
+                if (ok && selectRoute && !revoked()) ok = route.pulse(accepted);
                 nextHeartbeat = millis() + 2000;
             }
             if (!ok) {
@@ -420,7 +605,7 @@ void Backend::run() {
                     publish(true, true);
                 }
                 stop();
-                clearOwned();
+                retire();
                 dirty = false;
             }
         }

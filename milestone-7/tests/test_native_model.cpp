@@ -2,11 +2,13 @@
 #include "kombi_nav_test_util.hpp"
 #include "cluster/native_display.hpp"
 #include "cluster/nav_core.hpp"
+#include "native_controller_protocol.hpp"
 #include "native_model_wire/alive_wire.h"
 #include <poll.h>
 #include <assert.h>
 #include <atomic>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -30,7 +32,10 @@ static NavView phone(int type, const std::vector<TLane> &lanes, int64_t metres) 
     assert(viewFromMessages(m, v));
     return v;
 }
-int main() {
+int main(int argc, char** argv) {
+    const bool routeSession = argc == 2 && !strcmp(argv[1], "--controller");
+    if (routeSession) assert(!setenv("NBT_NATIVE_ROUTE_SESSION", "1", 1));
+    else assert(!unsetenv("NBT_NATIVE_ROUTE_SESSION"));
     std::vector<TLane> lanes;
     lanes.push_back(lane(4, false));
     lanes.push_back(lane2(1, false, 5, true));
@@ -130,7 +135,15 @@ int main() {
     assert(alive >= 0);
     strcpy(a.sun_path, alivePath.c_str());
     assert(!bind(alive, (sockaddr*)&a, sizeof(a)) && !chmod(alivePath.c_str(), 0600));
+    const std::string controllerPath = std::string(dir) + "/native-functional-cue-456.sock";
+    const int control = routeSession ? socket(AF_UNIX, SOCK_DGRAM, 0) : -1;
+    if (routeSession) {
+        assert(control >= 0);
+        strcpy(a.sun_path, controllerPath.c_str());
+        assert(!bind(control, (sockaddr*)&a, sizeof(a)) && !chmod(controllerPath.c_str(), 0600));
+    }
     std::atomic<unsigned> begins(0), updates(0), stops(0), probes(0), beats(0);
+    std::atomic<unsigned> controllerArms(0), controllerStops(0), controllerRearms(0), controllerPulses(0);
     std::atomic<bool> closerTurn(false), followingTurn(false), repeatedTurn(false);
     std::atomic<bool> done(false);
     std::thread server([&] {
@@ -138,17 +151,81 @@ int main() {
         uint32_t initialManeuver = 0;
         uint32_t latestSequence = 0;
         uint32_t followingManeuver = 0;
+        uint32_t controllerPhase = controller::kIdle;
+        uint32_t controllerProducer = 0;
+        uint64_t controllerNonce = 99, controllerEpoch = 0;
         while (!done) {
-            pollfd fds[] = {{fd, POLLIN, 0}, {alive, POLLIN, 0}};
-            if (poll(fds, 2, 100) <= 0) continue;
+            pollfd fds[] = {{fd, POLLIN, 0}, {alive, POLLIN, 0}, {control, POLLIN, 0}};
+            if (poll(fds, 3, 100) <= 0) continue;
             bool heartbeat = (fds[1].revents & POLLIN) != 0;
-            int ready = heartbeat ? alive : fd;
+            bool routeCommand = (fds[2].revents & POLLIN) != 0;
+            int ready = routeCommand ? control : heartbeat ? alive : fd;
             uint8_t data[256];
             sockaddr_un peer;
             socklen_t len = sizeof(peer);
             ssize_t z = recvfrom(ready, data, sizeof(data), 0, (sockaddr *)&peer, &len);
             if (z <= 0)
                 continue;
+            if (routeCommand) {
+                using namespace controller;
+                assert(z == kBytes && !memcmp(data, "NCT1", 4));
+                uint32_t op = rd32(data + 8), commandSequence = rd32(data + 12);
+                assert(read64(data + 48));
+                if (op == kRearm) {
+                    assert(controllerPhase == kEmptyReturned && !currentSession);
+                    assert(commandSequence == UINT32_MAX && read64(data + 16) == controllerNonce);
+                    assert(read64(data + 24) == controllerEpoch && !rd32(data + 32) && !read64(data + 40));
+                    ++controllerRearms;
+                    ++controllerNonce;
+                    controllerEpoch = 0;
+                    controllerProducer = 0;
+                    controllerPhase = kIdle;
+                } else if (op != kProbe) {
+                    assert(read64(data + 16) == controllerNonce && rd32(data + 32) == 123);
+                    assert(read64(data + 40) == currentSession);
+                    const uint32_t producer = rd32(data + 36);
+                    if (op == kStop) {
+                        // Full can commit an in-flight update after the AA stop.
+                        assert(producer >= controllerProducer && producer <= latestSequence);
+                    } else {
+                        assert(producer == latestSequence);
+                    }
+                    controllerProducer = producer;
+                    if (op == kArm) {
+                        assert(controllerPhase == kIdle && currentSession);
+                        controllerEpoch = read64(data + 24);
+                        assert(controllerEpoch);
+                        ++controllerArms;
+                        controllerPhase = kArmed;
+                    } else {
+                        assert(read64(data + 24) == controllerEpoch);
+                        if (op == kStop) {
+                            controllerPhase = kEmptyReturned;
+                            ++controllerStops;
+                        } else {
+                            assert(op == kHeartbeat && controllerPhase != kIdle);
+                            ++controllerPulses;
+                            controllerPhase = kSelected;
+                        }
+                    }
+                }
+                uint8_t reply[kBytes] = {};
+                memcpy(reply, "NCS1", 4);
+                reply[4] = 1;
+                reply[6] = kBytes;
+                wr32(reply + 8, controllerPhase);
+                write64(reply + 16, controllerNonce);
+                write64(reply + 24, controllerEpoch);
+                wr32(reply + 32, commandSequence);
+                uint32_t flags = kRunningReadyOwner | kRouteSession;
+                if (controllerPhase == kEmptyReturned) flags |= kCompletedRearm;
+                wr32(reply + 36, flags);
+                write64(reply + 40, read64(data + 48) + 60000);
+                wr32(reply + 56, kModelId);
+                wr32(reply + 60, 3201);
+                assert(sendto(control, reply, sizeof(reply), 0, (sockaddr*)&peer, len) == sizeof(reply));
+                continue;
+            }
             if (heartbeat) {
                 ng_alive_message beat;
                 assert(ng_alive_decode(data, z, &beat) == NG_ALIVE_ACCEPTED);
@@ -189,6 +266,7 @@ int main() {
                 ++updates;
             } else if (x.operation == NG_STOP) {
                 assert(x.session == currentSession && x.sequence > latestSequence);
+                if (routeSession) assert(controllerStops == stops + 1);
                 currentSession = 0;
                 ++stops;
             } else if (x.operation == NG_PROBE) {
@@ -245,15 +323,25 @@ int main() {
             core.step(&first, 15.0 + (i+1)*0.01);
         }
         assert(begins == 2);
+        if (routeSession) {
+            for (int i=0; i<200 && controllerArms < 2; ++i) usleep(10000);
+            assert(controllerArms == 2);
+        }
         core.yieldToFactory();
         for (int i=0; i<200 && stops < 2; ++i) usleep(10000);
         assert(stops == 2);
+        if (routeSession) assert(controllerArms == 2 && controllerStops == 2 &&
+                                 controllerRearms == 1 && controllerPulses >= 2);
     }
     done = true;
     server.join();
     close(fd);
     close(alive);
     unlink(alivePath.c_str());
+    if (routeSession) {
+        close(control);
+        unlink(controllerPath.c_str());
+    }
     unlink(path.c_str());
     rmdir(dir);
     puts("PASS upstream policy and AA decoder to native semantic, lease and owned clear sockets");

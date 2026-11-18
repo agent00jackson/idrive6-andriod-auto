@@ -13,10 +13,16 @@ on the original BMW emulator software. The ARM Android Auto integration has
 a host replay and still needs an end-to-end BMW trial. Straight is covered
 at the data boundary and still needs visible 6WB verification.
 
-The Full socket acknowledges an accepted native model. The separately
-qualified Controller path is responsible for selecting it for the 6WB. The
-E114 Controller accepts two explicitly armed trials in a boot. A continuous
-route-mode Controller and compatible car loader are required for a car test.
+The Full socket acknowledges an accepted native model. The Controller
+selects the matching view for the 6WB. E114 accepted two explicitly armed
+cues in one boot. The experimental `NBT_NATIVE_ROUTE_SESSION=1` setting
+requires a separate Controller endpoint advertising the route-session
+protocol and a Full liveness endpoint. In that mode the AA worker arms
+Controller after Full accepts the model, maintains the two leases, and
+requests scoped Controller retirement before Full STOP. A completed
+Controller view can rearm after an authoritative Full idle probe. The
+mock sockets and the Controller owner fixtures cover this ordering.
+The paired BMW runtime and a compatible car loader still need qualification.
 
 The selected Full adapter can accept live session heartbeats on its companion
 socket. Both sockets are local, mode 0600 and source-bound by the same
