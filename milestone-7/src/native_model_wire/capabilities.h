@@ -8,7 +8,10 @@
 #define NG_CAP_BYTES 16u
 #define NG_CAP_TYPED_TURNS 1u
 #define NG_CAP_TYPED_LANES 2u
+#define NG_CAP_EXTENDED_FIELDS 4u
+#define NG_CAP_OFF_RAMPS 8u
 #define NG_CAP_TYPED (NG_CAP_TYPED_TURNS | NG_CAP_TYPED_LANES)
+#define NG_CAP_SUPPORTED (NG_CAP_TYPED | NG_CAP_EXTENDED_FIELDS | NG_CAP_OFF_RAMPS)
 #define NG_CAP_MODEL_ID 0x7f4e4701u
 
 static inline uint32_t ng_cap_word(const unsigned char *p) {
@@ -38,7 +41,7 @@ static inline uint32_t ng_cap_read(const unsigned char *p, size_t size, uint32_t
     if (size!=NG_CAP_BYTES || memcmp(p,"NGR1",4) || !sequence ||
         ng_cap_word(p+4)!=sequence || ng_cap_word(p+12)!=NG_CAP_MODEL_ID)
         return 0;
-    return ng_cap_word(p+8)&NG_CAP_TYPED;
+    return ng_cap_word(p+8)&NG_CAP_SUPPORTED;
 }
 
 #endif

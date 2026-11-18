@@ -45,20 +45,79 @@ int main(int argc, char** argv) {
     assert(fromNav(v, m));
     assert(m.distanceMm == 46000 && m.turn == 3 && m.direction == 19200 && m.laneCount == 0);
     uint32_t selectedTurn=77; uint16_t selectedDirection=55;
-    for(int type=-1;type<=256;++type)if((type<5||type>12)&&type!=36){
-        assert(!turnDirection(type,selectedTurn,selectedDirection));
-        assert(selectedTurn==77&&selectedDirection==55);
+    for(int type=-1;type<=256;++type) {
+        const bool roundabout=(type>=32&&type<=35)||(type>=43&&type<=46);
+        const bool offRamp=type>=21&&type<=24;
+        if((type<2||type>12)&&type!=36&&!roundabout&&!offRamp){
+            assert(!turnDirection(type,selectedTurn,selectedDirection));
+            assert(selectedTurn==77&&selectedDirection==55);
+        }
     }
     Message rejected;
     assert(fromNav(phone(7, std::vector<TLane>(), 46), rejected));
     assert(rejected.turn == 2 && rejected.direction == 6400);
-    for(int type=0;type<=256;++type)if(type!=7&&type!=8&&type!=36)
+    for(int type=0;type<=256;++type)if(type!=2&&type!=7&&type!=8&&type!=36)
         assert(!fromNav(phone(type, std::vector<TLane>(), 46), rejected)); // no implicit straight/depart/unknown mapping
+    assert(fromNav(phone(2, {}, 46), rejected));
+    assert(rejected.turn == NG_STRAIGHT && rejected.direction == 0);
+    assert(fromNav(phone(2, {}, 46), rejected, NG_CAP_SUPPORTED));
+    assert(rejected.aaType == 2 && rejected.roadLength == 11);
+    const uint16_t offRampAngles[] = {3200, 22400, 6400, 19200};
+    for (int type = 21; type <= 24; ++type) {
+        const NavView upcomingExit = phone(type, {}, 46);
+        Message exit;
+        assert(fromNav(upcomingExit, exit, NG_CAP_SUPPORTED));
+        assert(exit.aaType == type && exit.direction == offRampAngles[type - 21]);
+        assert(!adaptToCapabilities(exit, NG_CAP_TYPED | NG_CAP_EXTENDED_FIELDS));
+        assert(!fromNav(upcomingExit, rejected, NG_CAP_SUPPORTED & ~NG_CAP_EXTENDED_FIELDS));
+        assert(!fromNav(upcomingExit, rejected, NG_CAP_SUPPORTED & ~NG_CAP_OFF_RAMPS));
+    }
     assert(fromNav(phone(8, lanes, 46), rejected) && rejected.laneCount == 0);
+    Message keep, slight;
+    for (int type = 3; type <= 4; ++type) {
+        assert(fromNav(phone(type, {}, 46), keep, NG_CAP_SUPPORTED));
+        assert(fromNav(phone(type + 2, {}, 46), slight, NG_CAP_SUPPORTED));
+        assert(keep.aaType == type && keep.turn == slight.turn && keep.direction == slight.direction);
+    }
     assert(fromNav(phone(11, {lane2(8,false,9,true)}, 46), rejected, NG_CAP_TYPED));
     assert(rejected.turn == NG_UTURN && rejected.direction == 6400 && rejected.laneMode == 2);
     assert(rejected.lanes[0].arrows == (NG_LANE_UTURN_LEFT|NG_LANE_UTURN_RIGHT));
     assert(rejected.lanes[0].recommended == NG_LANE_UTURN_RIGHT);
+    NavView roundabout=phone(35,std::vector<TLane>(),46);
+    roundabout.has_exit_number=true;roundabout.exit_number=3;
+    roundabout.has_exit_angle=true;roundabout.exit_angle=180;
+    Message extended;
+    assert(fromNav(roundabout,extended,NG_CAP_SUPPORTED));
+    assert(extended.aaType==35&&extended.turn==NG_LEFT&&extended.direction==6400&&
+           extended.metadataFlags==(NG_META_AA_TYPE|NG_META_ROAD|NG_META_EXIT_NUMBER|NG_META_EXIT_ANGLE)&&
+           extended.exitNumber==3&&extended.exitAngle==180&&extended.roadLength==11&&
+           !memcmp(extended.road,"OWN AA ROAD",11));
+    extended.operation=Begin;extended.sequence=1;extended.session=1;extended.maneuver=1;
+    uint8_t extendedWire[kMaxFrameBytes];
+    assert(encode(extended,extendedWire)&&frameSize(extended)==NG_EXT_FRAME_BYTES);
+    ng_message extendedDecoded;
+    assert(ng_decode(extendedWire,frameSize(extended),&extendedDecoded)==NG_OK&&
+           extendedDecoded.aa_type==35&&extendedDecoded.exit_number==3&&extendedDecoded.exit_angle==180&&
+           extendedDecoded.road_length==11);
+    assert(!fromNav(roundabout,rejected,NG_CAP_TYPED));
+    // The manual display's blank name does not create a native street record.
+    NavView named = v;
+    named.road = " ";
+    Message road;
+    assert(fromNav(named, road, NG_CAP_SUPPORTED));
+    assert(road.metadataFlags == NG_META_AA_TYPE && road.roadLength == 0);
+    // Cap road bytes on a complete character even when Core's code point
+    // limit leaves a longer UTF-8 name.
+    named.road.clear();
+    for (int i = 0; i < 22; ++i)
+        named.road += "\xe5\xb1\xb1";
+    named.road.insert(0, "A");
+    assert(fromNav(named, road, NG_CAP_SUPPORTED));
+    assert(road.metadataFlags == (NG_META_AA_TYPE | NG_META_ROAD));
+    assert(road.roadLength == 61 && !memcmp(road.road, named.road.data(), road.roadLength));
+    named.road += "\xff";
+    assert(fromNav(named, road, NG_CAP_SUPPORTED));
+    assert(road.metadataFlags == NG_META_AA_TYPE && road.roadLength == 0);
     // Codec preserves the native literal lane DTO independently of production qualification.
     m.laneCount = 2;
     m.lanes[0].arrows = 2;
@@ -120,9 +179,23 @@ int main(int argc, char** argv) {
     assert(fromNav(v, m) && m.laneCount == 0);
     v = phone(8, std::vector<TLane>(1, lane(0, true)), 46);
     assert(fromNav(v, m) && m.laneCount == 0);
+    if(argc==2&&!strcmp(argv[1],"--fields-only"))return 0;
     // Real local0600 datagrams: probe→begin→heartbeat/update→owned stop, with no DSI.
     char dir[] = "/private/tmp/aa-model-test-XXXXXX";
     assert(mkdtemp(dir));
+    {
+        // The native adapter can appear after the Android Auto daemon starts.
+        Backend lateAdapter(dir);
+        assert(lateAdapter.start() && lateAdapter.arm(UINT64_MAX));
+        NavView left = phone(7, {}, 46);
+        Message first;
+        assert(fromNav(left, first) && lateAdapter.submit(left, first, true));
+        for (int i = 0; i < 200 && lateAdapter.busy(); ++i)
+            usleep(10000);
+        assert(lateAdapter.failed() && !lateAdapter.busy());
+        assert(lateAdapter.arm(UINT64_MAX));
+        lateAdapter.stop();
+    }
     std::string path = std::string(dir) + "/native-guidance-123.sock";
     int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
     assert(fd >= 0);
@@ -245,7 +318,7 @@ int main(int argc, char** argv) {
             if (const auto query = ng_cap_query(data, size_t(z))) {
                 uint8_t reply[NG_CAP_BYTES];
                 if (typed) {
-                    ng_cap_response(reply, query, NG_CAP_TYPED);
+                    ng_cap_response(reply, query, NG_CAP_SUPPORTED|0x100);
                 } else {
                     memcpy(reply, "NGA1", 4);
                     wr32(reply+4,0);
@@ -267,8 +340,15 @@ int main(int argc, char** argv) {
                 currentSession = x.session;
                 initialManeuver = x.maneuver;
                 latestSequence = x.sequence;
-                if (typed) assert(x.lane_mode == 2 && x.lane_count == 2 &&
-                                  x.lanes[1].recommended == NG_LANE_RIGHT);
+                if (typed) {
+                    assert(x.lane_mode == 2 && x.lane_count == 2 &&
+                           x.lanes[1].recommended == NG_LANE_RIGHT);
+                    assert(x.metadata_flags == (NG_META_AA_TYPE | NG_META_ROAD) &&
+                           x.aa_type == 8 && x.road_length == 11 &&
+                           !memcmp(x.road, "OWN AA ROAD", 11));
+                } else {
+                    assert(z == NG_FRAME_BYTES && !x.metadata_flags);
+                }
                 ++begins;
             } else if (x.operation == NG_UPDATE) {
                 assert(x.session == currentSession && x.sequence > latestSequence);
@@ -377,6 +457,6 @@ int main(int argc, char** argv) {
         unlink(controllerPath.c_str());
     }
     unlink(path.c_str());
-    rmdir(dir);
+    assert(!rmdir(dir));
     puts("PASS upstream policy and AA decoder to native semantic, lease and owned clear sockets");
 }

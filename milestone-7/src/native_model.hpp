@@ -9,7 +9,7 @@ namespace native_model {
 // Opt-in local producer. Native operations and ACK waits run only on this thread.
 class Backend {
   public:
-    explicit Backend(const char *directory = NG_SOCKET_ROOT);
+    explicit Backend(const char *directory = NG_SOCKET_ROOT, bool routeSession = false);
     ~Backend();
     bool start();
     bool arm(uint64_t expiresMs);
@@ -43,10 +43,11 @@ class Backend {
     bool haveNav_;
     uint32_t maneuver_;
     unsigned capabilities_;
-    std::string directory_, clientDirectory_, clientPath_;
+    const bool routeSession_;
+    std::string directory_, clientPath_;
     int fd_, aliveFd_;
     std::string alivePath_;
-    uint64_t aliveDevice_, aliveInode_;
+    uint64_t clientDevice_, clientInode_, aliveDevice_, aliveInode_;
     uint32_t heartbeatSequence_;
     uint32_t sequence_;
     uint32_t fullPid_;

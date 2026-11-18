@@ -9,7 +9,8 @@ namespace nbt {
 namespace kombinav {
 class NativeDisplay final : public ClusterDisplay {
 public:
-    explicit NativeDisplay(const char* directory = NG_SOCKET_ROOT) : backend_(directory) {}
+    explicit NativeDisplay(const char* directory = NG_SOCKET_ROOT, bool routeSession = false)
+        : backend_(directory, routeSession) {}
     bool start() { return backend_.start(); }
     const char* name() const override { return "BMW native guidance"; }
     void setSettings(const Settings& settings) override { lanes_ = settings.lanes; }

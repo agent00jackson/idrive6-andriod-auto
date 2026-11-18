@@ -34,9 +34,8 @@ typedef sockaddr_un LocalAddress;
 struct LocalApi {
     int (*lstatFn)(const char *, struct stat *);
     int (*chmodFn)(const char *, mode_t);
-    int (*rmdirFn)(const char *);
     uid_t (*geteuidFn)();
-    LocalApi() : lstatFn(NULL), chmodFn(NULL), rmdirFn(NULL), geteuidFn(NULL) {
+    LocalApi() : lstatFn(NULL), chmodFn(NULL), geteuidFn(NULL) {
 #if defined(__QNXNTO__)
         void *h = dlopen("libc.so.3", RTLD_NOW | RTLD_LOCAL);
 #else
@@ -46,10 +45,9 @@ struct LocalApi {
             return;
         lstatFn = reinterpret_cast<int (*)(const char *, struct stat *)>(dlsym(h, "lstat"));
         chmodFn = reinterpret_cast<int (*)(const char *, mode_t)>(dlsym(h, "chmod"));
-        rmdirFn = reinterpret_cast<int (*)(const char *)>(dlsym(h, "rmdir"));
         geteuidFn = reinterpret_cast<uid_t (*)()>(dlsym(h, "geteuid"));
     }
-    bool ready() const { return lstatFn && chmodFn && rmdirFn && geteuidFn; }
+    bool ready() const { return lstatFn && chmodFn && geteuidFn; }
 };
 LocalApi &api() {
     static LocalApi value;
@@ -71,11 +69,20 @@ bool address(const std::string &path, LocalAddress &a) {
         return false;
     memset(&a, 0, sizeof(a));
     a.sun_family = AF_UNIX;
-#if defined(__QNXNTO__) || defined(__APPLE__)
+#if defined(__QNXNTO__)
+    a.sun_len = offsetof(LocalAddress, sun_path) + path.size() + 1;
+#elif defined(__APPLE__)
     a.sun_len = sizeof(a);
 #endif
     memcpy(a.sun_path, path.c_str(), path.size() + 1);
     return true;
+}
+socklen_t addressLength(const LocalAddress& address) {
+#if defined(__QNXNTO__)
+    return address.sun_len;
+#else
+    return sizeof(address);
+#endif
 }
 bool endpoint(const std::string &p) {
     struct stat s;
@@ -124,12 +131,12 @@ class ControllerRoute {
         fd_ = socket(AF_UNIX, SOCK_DGRAM, 0);
         if (fd_ < 0 || fcntl(fd_, F_SETFL, O_NONBLOCK) < 0 ||
             fcntl(fd_, F_SETFD, FD_CLOEXEC) < 0 ||
-            bind(fd_, reinterpret_cast<sockaddr*>(&source), sizeof(source)) ||
+            bind(fd_, reinterpret_cast<sockaddr*>(&source), addressLength(source)) ||
             api().lstatFn(local.c_str(), &localIdentity_))
             return false;
         local_ = local;
         if (api().chmodFn(local.c_str(), 0600) ||
-            connect(fd_, reinterpret_cast<sockaddr*>(&destination), sizeof(destination)))
+            connect(fd_, reinterpret_cast<sockaddr*>(&destination), addressLength(destination)))
             return false;
 
         controller::Reply reply;
@@ -256,10 +263,14 @@ class ControllerRoute {
     bool armed_ = false;
 };
 } // namespace
-Backend::Backend(const char *d)
+Backend::Backend(const char *d, bool routeSession)
     : started_(false), closing_(false), armed_(false), cancel_(false), pending_(false), busy_(false), failed_(false),
-      expiry_(0), generation_(0), haveNav_(false), maneuver_(0), capabilities_(NG_CAP_TYPED), directory_(d), fd_(-1), aliveFd_(-1),
-      aliveDevice_(0), aliveInode_(0), heartbeatSequence_(0), sequence_(0), fullPid_(0), session_(0),
+      expiry_(0), generation_(0), haveNav_(false), maneuver_(0),
+      // Retain the first maneuver's fields while discovery is pending.
+      // The worker adapts them to the actual receiver before sending Begin.
+      capabilities_(NG_CAP_SUPPORTED), routeSession_(routeSession), directory_(d), fd_(-1), aliveFd_(-1),
+      clientDevice_(0), clientInode_(0), aliveDevice_(0), aliveInode_(0), heartbeatSequence_(0),
+      sequence_(0), fullPid_(0), session_(0),
       attempted_(false) {
     pthread_mutex_init(&mutex_, NULL);
 }
@@ -281,8 +292,11 @@ bool Backend::start() {
 }
 bool Backend::arm(uint64_t expires) {
     pthread_mutex_lock(&mutex_);
-    bool ok = started_ && !closing_ && !failed_ && !busy_ && !armed_ && expires > millis();
+    bool ok = started_ && !closing_ && !busy_ && !armed_ && expires > millis();
     if (ok) {
+        // A fresh attempt may clear the previous link failure once the worker
+        // has released its old endpoints.
+        failed_ = false;
         armed_ = true;
         busy_ = true;
         cancel_ = false;
@@ -377,21 +391,21 @@ void Backend::closeSocket() {
     if (fd_ >= 0)
         close(fd_);
     fd_ = -1;
-    if (!clientPath_.empty())
+    if (!clientPath_.empty() && !api().lstatFn(clientPath_.c_str(), &found) &&
+        (found.st_mode & S_IFMT) == S_IFSOCK && uint64_t(found.st_dev) == clientDevice_ &&
+        uint64_t(found.st_ino) == clientInode_)
         unlink(clientPath_.c_str());
-    if (!clientDirectory_.empty())
-        api().rmdirFn(clientDirectory_.c_str());
     clientPath_.clear();
-    clientDirectory_.clear();
 }
 bool Backend::exchange(Message &m) {
     if (fd_ < 0 || sequence_ == 0xffffffffU)
         return false;
     m.sequence = ++sequence_;
-    uint8_t bytes[kFrameBytes];
+    uint8_t bytes[kMaxFrameBytes];
     if (!encode(m, bytes))
         return false;
-    if (send(fd_, bytes, sizeof(bytes), 0) != ssize_t(sizeof(bytes)))
+    const size_t frame_bytes=frameSize(m);
+    if (send(fd_, bytes, frame_bytes, 0) != ssize_t(frame_bytes))
         return false;
     // Bound each wait by the corresponding Full owner-queue budget.
     const unsigned budget = m.operation == Probe ? 17000 : m.operation == Begin ? 6000 : 4000;
@@ -436,18 +450,32 @@ unsigned Backend::queryCapabilities() {
 }
 bool Backend::discover() {
     closeSocket();
-    char dir[256];
-    snprintf(dir, sizeof(dir), "%s/aa-native-model-%ld-%llx", directory_.c_str(), long(getpid()),
+    // QNX's /dev/shmem namespace allows socket names but cannot create directories.
+    char leaf[72];
+    snprintf(leaf, sizeof(leaf), "/aa-native-model-%ld-%llx.sock", long(getpid()),
              (unsigned long long)nonce());
-    if (mkdir(dir, 0700))
-        return false;
-    clientDirectory_ = dir;
-    clientPath_ = clientDirectory_ + "/client.sock";
-    fd_ = socket(AF_UNIX, SOCK_DGRAM, 0);
+    const std::string client = directory_ + leaf;
     LocalAddress a;
-    if (fd_ < 0 || !address(clientPath_, a) || fcntl(fd_, F_SETFL, O_NONBLOCK) < 0 ||
-        fcntl(fd_, F_SETFD, FD_CLOEXEC) < 0 || bind(fd_, reinterpret_cast<sockaddr *>(&a), sizeof(a)) ||
-        api().chmodFn(clientPath_.c_str(), 0600)) {
+    if (!address(client, a)) {
+        printf("[Native model] private client socket path is too long\n");
+        return false;
+    }
+    struct stat identity;
+    fd_ = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (fd_ < 0 || fcntl(fd_, F_SETFL, O_NONBLOCK) < 0 ||
+        fcntl(fd_, F_SETFD, FD_CLOEXEC) < 0 ||
+        bind(fd_, reinterpret_cast<sockaddr *>(&a), addressLength(a)) ||
+        api().lstatFn(client.c_str(), &identity) || (identity.st_mode & S_IFMT) != S_IFSOCK ||
+        identity.st_uid != api().geteuidFn()) {
+        printf("[Native model] private client socket setup failed errno=%d\n", errno);
+        closeSocket();
+        return false;
+    }
+    clientPath_ = client;
+    clientDevice_ = uint64_t(identity.st_dev);
+    clientInode_ = uint64_t(identity.st_ino);
+    if (api().chmodFn(clientPath_.c_str(), 0600) || !endpoint(clientPath_)) {
+        printf("[Native model] private client socket permissions unconfirmed\n");
         closeSocket();
         return false;
     }
@@ -463,8 +491,12 @@ bool Backend::discover() {
         if (!pid)
             continue;
         std::string p = directory_ + "/" + ent->d_name;
-        if (!endpoint(p) || !address(p, a) || connect(fd_, reinterpret_cast<sockaddr *>(&a), sizeof(a)))
+        if (!endpoint(p) || !address(p, a))
             continue;
+        if (connect(fd_, reinterpret_cast<sockaddr *>(&a), addressLength(a))) {
+            printf("[Native model] Full socket connect failed pid=%u errno=%d\n", pid, errno);
+            continue;
+        }
         Message probe;
         probe.operation = Probe;
         if (exchange(probe) && endpoint(p)) {
@@ -476,8 +508,10 @@ bool Backend::discover() {
                 capabilities_ = advertised;
                 pthread_mutex_unlock(&mutex_);
             }
+            else printf("[Native model] Full liveness socket setup failed pid=%u\n", pid);
             break;
         }
+        printf("[Native model] Full probe unconfirmed pid=%u\n", pid);
     }
     closedir(d);
     if (!found)
@@ -498,14 +532,14 @@ bool Backend::connectLiveness(const std::string& suffix) {
     aliveFd_ = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (aliveFd_ < 0 || fcntl(aliveFd_, F_SETFL, O_NONBLOCK) < 0 ||
         fcntl(aliveFd_, F_SETFD, FD_CLOEXEC) < 0 ||
-        bind(aliveFd_, reinterpret_cast<sockaddr*>(&local), sizeof(local)) ||
+        bind(aliveFd_, reinterpret_cast<sockaddr*>(&local), addressLength(local)) ||
         api().lstatFn(path.c_str(), &state) || (state.st_mode & S_IFMT) != S_IFSOCK)
         return false;
     alivePath_ = path;
     aliveDevice_ = uint64_t(state.st_dev);
     aliveInode_ = uint64_t(state.st_ino);
     return !api().chmodFn(path.c_str(), 0600) && endpoint(path) &&
-           !connect(aliveFd_, reinterpret_cast<sockaddr*>(&remote), sizeof(remote)) && endpoint(peer);
+           !connect(aliveFd_, reinterpret_cast<sockaddr*>(&remote), addressLength(remote)) && endpoint(peer);
 }
 
 bool Backend::heartbeat(uint32_t semanticSequence) {
@@ -551,7 +585,7 @@ void Backend::run() {
     Message active;
     bool dirty = false;
     const char* routeSetting = getenv("NBT_NATIVE_ROUTE_SESSION");
-    const bool selectRoute = routeSetting && !strcmp(routeSetting, "1");
+    const bool selectRoute = routeSession_ || (routeSetting && !strcmp(routeSetting, "1"));
     ControllerRoute route;
     const auto retire = [&] {
         if (selectRoute && !route.retire(accepted))

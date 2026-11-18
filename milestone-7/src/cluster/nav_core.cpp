@@ -402,7 +402,7 @@ void KombiNav::logLine(const char* line, void* /*user*/) {
 // The place to add a cluster: its driver, what it needs, and how the log names it.
 bool KombiNav::createDisplay(const char* id, most::Client* most) {
     if (!strcmp(id, "native")) {
-        NativeDisplay* native = new NativeDisplay;
+        NativeDisplay* native = new NativeDisplay(NG_SOCKET_ROOT, true);
         if (!native->start()) {
             delete native;
             return false;

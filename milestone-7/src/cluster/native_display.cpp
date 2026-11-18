@@ -5,7 +5,8 @@ namespace nbt {
 namespace kombinav {
 ClusterDisplay::Result NativeDisplay::publish(const NavView& view, bool newManeuver) {
     native_model::Message message;
-    const unsigned capabilities = backend_.capabilities() & (lanes_ ? NG_CAP_TYPED : NG_CAP_TYPED_TURNS);
+    const unsigned capabilities = backend_.capabilities() &
+        (lanes_ ? NG_CAP_SUPPORTED : (NG_CAP_SUPPORTED & ~NG_CAP_TYPED_LANES));
     if (!native_model::fromNav(view, message, capabilities)) {
         // Release this model while the unsupported maneuver is current.
         forget();
@@ -36,7 +37,8 @@ ClusterDisplay::Result NativeDisplay::keepUp(const NavView& view, double) {
     native_model::Message candidate;
     native_model::Message previous = last_;
     const unsigned advertised = backend_.capabilities();
-    const unsigned capabilities = advertised & (lanes_ ? NG_CAP_TYPED : NG_CAP_TYPED_TURNS);
+    const unsigned capabilities = advertised &
+        (lanes_ ? NG_CAP_SUPPORTED : (NG_CAP_SUPPORTED & ~NG_CAP_TYPED_LANES));
     if (!active_ || !backend_.busy() || !native_model::fromNav(view, candidate, capabilities) ||
         !native_model::adaptToCapabilities(previous, advertised) ||
         !native_model::samePayload(candidate, previous))

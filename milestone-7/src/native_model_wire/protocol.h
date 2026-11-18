@@ -5,8 +5,16 @@
 
 /* Little-endian, fixed-size local messages. Never cast untrusted wire bytes. */
 #define NG_FRAME_BYTES 80u
+#define NG_EXT_FRAME_BYTES 160u
+#define NG_MAX_FRAME_BYTES NG_EXT_FRAME_BYTES
 #define NG_MAX_LANES 8u
+#define NG_MAX_ROAD_BYTES 63u
 #define NG_MAX_DISTANCE_MM 2000000000u
+#define NG_META_AA_TYPE 1u
+#define NG_META_ROAD 2u
+#define NG_META_EXIT_NUMBER 4u
+#define NG_META_EXIT_ANGLE 8u
+#define NG_META_MASK (NG_META_AA_TYPE | NG_META_ROAD | NG_META_EXIT_NUMBER | NG_META_EXIT_ANGLE)
 #ifdef __QNXNTO__
 #define NG_SOCKET_ROOT "/dev/shmem"
 #else
@@ -39,6 +47,11 @@ struct ng_message {
     uint32_t phase;
     /* 0 legacy, 1 NGV3 single direction, 2 NGV4 per-direction highlights. */
     uint32_t lane_mode;
+    /* NGV5 optional Android Auto metadata. Road bytes are strict UTF-8 and
+     * are constructed as an OEM CHBString by the native adapter. */
+    uint16_t metadata_flags, aa_type, road_length;
+    int32_t exit_number, exit_angle;
+    char road[NG_MAX_ROAD_BYTES + 1u];
 };
 struct ng_state {
     uint64_t session;
@@ -54,5 +67,6 @@ struct ng_backend {
 enum ng_result ng_decode(const unsigned char *, size_t, struct ng_message *);
 enum ng_result ng_apply(struct ng_state *, const struct ng_message *,
                         const struct ng_backend *);
-void ng_encode(unsigned char [NG_FRAME_BYTES], const struct ng_message *);
+size_t ng_frame_size(const struct ng_message *);
+void ng_encode(unsigned char [NG_MAX_FRAME_BYTES], const struct ng_message *);
 #endif
