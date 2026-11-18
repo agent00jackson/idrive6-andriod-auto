@@ -20,8 +20,10 @@ route-mode Controller and compatible car loader are required for a car test.
 
 The selected Full adapter can accept live session heartbeats on its companion
 socket. Both sockets are local, mode 0600 and source-bound by the same
-endpoint PID. Updates use the same session until an owned STOP or expiry.
-A following maneuver advances the maneuver ID. Factory-route detection
+endpoint PID. Heartbeats keep an unchanged model's semantic sequence stable.
+Older Full adapters without the companion retain the timed update fallback.
+Updates use the same session until an owned STOP or expiry. A following
+maneuver advances the maneuver ID. Factory-route detection
 retires this publisher's own model. Main thread or transport failures are
 handled by the Full lease expiry.
 

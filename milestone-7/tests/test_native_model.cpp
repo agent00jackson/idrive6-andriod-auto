@@ -214,6 +214,9 @@ int main() {
         core.step(&first, 1.0);
         for (int i=0; i<200 && !beats; ++i) usleep(10000);
         assert(probes == 1 && begins == 1 && beats > 0);
+        // The separate Full lease must keep the initial semantic version stable.
+        for (int i=0; i<600 && beats < 3; ++i) usleep(10000);
+        assert(beats >= 3 && updates == 0);
         auto closer = phone(8, lanes, 35);
         closer.dist_text = "115";
         core.step(&closer, 2.0);

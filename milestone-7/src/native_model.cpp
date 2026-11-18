@@ -349,10 +349,10 @@ void Backend::clearOwned() {
     publish(false, false);
 }
 void Backend::run() {
-    uint64_t seen = 0, next = 0;
+    uint64_t seen = 0, nextUpdate = 0, nextHeartbeat = 0;
     uint32_t accepted = 0;
     Message active;
-    bool have = false;
+    bool dirty = false;
     for (;;) {
         pthread_mutex_lock(&mutex_);
         bool closing = closing_, armed = armed_, cancel = cancel_;
@@ -365,7 +365,7 @@ void Backend::run() {
         if (closing || cancel || !armed || millis() >= expiry) {
             if (busy())
                 clearOwned();
-            have = false;
+            dirty = false;
             if (closing)
                 break;
         } else {
@@ -374,8 +374,8 @@ void Backend::run() {
                 session_ = nonce();
                 sequence_ = 0;
                 accepted = 0;
-                have = false;
-                next = 0;
+                dirty = false;
+                nextUpdate = nextHeartbeat = 0;
                 if (!discover()) {
                     printf("[Native model] no ready private adapter; trial failed\n");
                     if (!revoked()) publish(true, true);
@@ -386,33 +386,42 @@ void Backend::run() {
             }
             if (pending) {
                 active = m;
-                have = true;
+                dirty = true;
             }
-            if (have && millis() >= next && !revoked()) {
+            const uint64_t now = millis();
+            const bool update = (dirty || (accepted && aliveFd_ < 0)) && now >= nextUpdate;
+            const bool keepAlive = accepted && aliveFd_ >= 0 && now >= nextHeartbeat;
+            bool ok = true;
+            if (update && !revoked()) {
                 active.operation = attempted_ ? Update : Begin;
                 active.session = session_;
                 // A lost ACK can leave an owned model; always attempt its scoped clear.
                 attempted_ = true;
                 publish(true, false);
-                bool ok = (!accepted || heartbeat(accepted)) && exchange(active);
+                ok = (!accepted || heartbeat(accepted)) && exchange(active);
                 if (ok) {
                     accepted = active.sequence;
                     heartbeatSequence_ = 0;
                     ok = heartbeat(accepted);
                 }
-                if (!ok) {
-                    if (!revoked()) {
-                        printf("[Native model] producer receipt unavailable; retiring owned model\n");
-                        publish(true, true);
-                    }
-                    stop();
-                    clearOwned();
-                    have = false;
-                } else {
+                if (ok) {
+                    dirty = false;
                     printf("[Native model] AA model accepted distance_mm=%u lanes=%u (HUD unqualified)\n",
                            active.distanceMm, unsigned(active.laneCount));
-                    next = millis() + 2000;
+                    nextUpdate = nextHeartbeat = millis() + 2000;
                 }
+            } else if (keepAlive && !revoked()) {
+                ok = heartbeat(accepted);
+                nextHeartbeat = millis() + 2000;
+            }
+            if (!ok) {
+                if (!revoked()) {
+                    printf("[Native model] producer receipt unavailable; retiring owned model\n");
+                    publish(true, true);
+                }
+                stop();
+                clearOwned();
+                dirty = false;
             }
         }
         timespec pause = {0, 20000000};
