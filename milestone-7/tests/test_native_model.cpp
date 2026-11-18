@@ -131,12 +131,13 @@ int main() {
     strcpy(a.sun_path, alivePath.c_str());
     assert(!bind(alive, (sockaddr*)&a, sizeof(a)) && !chmod(alivePath.c_str(), 0600));
     std::atomic<unsigned> begins(0), updates(0), stops(0), probes(0), beats(0);
-    std::atomic<bool> closerTurn(false), followingTurn(false);
+    std::atomic<bool> closerTurn(false), followingTurn(false), repeatedTurn(false);
     std::atomic<bool> done(false);
     std::thread server([&] {
         uint64_t currentSession = 0;
         uint32_t initialManeuver = 0;
         uint32_t latestSequence = 0;
+        uint32_t followingManeuver = 0;
         while (!done) {
             pollfd fds[] = {{fd, POLLIN, 0}, {alive, POLLIN, 0}};
             if (poll(fds, 2, 100) <= 0) continue;
@@ -178,7 +179,12 @@ int main() {
                 }
                 if (x.distance_mm == 28000) {
                     assert(x.maneuver != initialManeuver && x.turn == NG_LEFT && closerTurn);
+                    followingManeuver = x.maneuver;
                     followingTurn = true;
+                }
+                if (x.distance_mm == 900000) {
+                    assert(followingTurn && x.maneuver > followingManeuver && x.turn==NG_LEFT);
+                    repeatedTurn = true;
                 }
                 ++updates;
             } else if (x.operation == NG_STOP) {
@@ -217,15 +223,23 @@ int main() {
         core.step(&following, 3.0);
         for (int i=0; i<350 && !followingTurn; ++i) usleep(10000);
         assert(followingTurn && updates >= 2);
-        core.step(NULL, 4.0, "reroute gap");
+        auto nextSame = following;
+        nextSame.step_m = 900;
+        nextSame.dist_text = "0.6";
+        nextSame.aa_unit = 4;
+        ++nextSame.step_seq;
+        core.step(&nextSame, 4.0);
+        for (int i=0; i<350 && !repeatedTurn; ++i) usleep(10000);
+        assert(repeatedTurn);
+        core.step(NULL, 5.0, "reroute gap");
         assert(stops == 0);
-        core.step(NULL, 13.0, "guidance expired");
+        core.step(NULL, 14.0, "guidance expired");
         for (int i=0; i<300 && !stops; ++i) usleep(10000);
         assert(stops == 1);
-        core.step(&first, 14.0);
+        core.step(&first, 15.0);
         for (int i=0; i<200 && begins < 2; ++i) {
             usleep(10000);
-            core.step(&first, 14.0 + (i+1)*0.01);
+            core.step(&first, 15.0 + (i+1)*0.01);
         }
         assert(begins == 2);
         core.yieldToFactory();
