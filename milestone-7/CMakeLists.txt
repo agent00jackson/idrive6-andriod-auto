@@ -3,10 +3,12 @@
 # This is the authoritative target source list; no qcc/project files are read.
 add_executable(nbt-aad
   src/main.cpp
+  src/pf_aa_embed.cpp
   src/audio/a2i_audio.cpp
   src/audio/config.cpp
   src/audio/bt_audio.cpp
   src/audio/speech_out.cpp
+  src/audio/speech_focus.cpp
   src/audio/mic_uplink.cpp
   src/audio/a2i_stream.cpp
   src/audio/audio_route.cpp
@@ -28,6 +30,8 @@ add_executable(nbt-aad
   src/aa_cryptor.cpp
   src/bluetooth_manager.cpp
   src/wireless_setup.cpp
+  src/wfd_own.cpp
+  src/gcf_client.cpp
   src/touch_probe.cpp
   src/dsi_client.cpp
   src/audio/voice_scenario.cpp
@@ -39,11 +43,14 @@ add_executable(nbt-aad
   src/car/input_activity.cpp
   src/car/geoid.cpp
   src/car/gps.cpp
+  src/car/vehicle.cpp
   src/sdr_builder.cpp
   src/crash_handler.cpp
-  src/kombi_client.cpp
-  src/kombi_nav.cpp
-  src/roadbook_test.cpp
+  src/cluster/j29_client.cpp
+  src/cluster/j29_display.cpp
+  src/cluster/nav_core.cpp
+  src/cluster/hud_terminal.cpp
+  src/cluster/hud6wa_display.cpp
   src/volume_osd.cpp
   src/audio/speex.c
 )

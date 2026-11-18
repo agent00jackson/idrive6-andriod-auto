@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Required Notice: Copyright (c) 2026 nanaisu - NBT-AAD (https://github.com/Sq00ky/Supra-iDrive6-Android-Auto)
 #include "video_manager.hpp"
+#include "nbt_env.hpp"
 #include "car_config.hpp"
 #include "lm_geometry.hpp"
 #include <stdio.h>
@@ -154,12 +155,16 @@ VideoManager::VideoManager()
       mmr_saved_z_(0),
       screen_events_logged_(0),
       idr_dropped_(0),
+      idr_wanted_(false),
       decoder_gen_(0), frames_in_gen_(0), window_ready_(false), overlay_surface_(0), overlay_verified_(false),
-      overlay_failed_(false), aa_surface_seen_(false), aa_surface_logged_(false), aa_surface_ticks_(0) {
+      overlay_failed_(false), aa_surface_seen_(false), aa_surface_logged_(false), aa_surface_ticks_(0),
+      cp_ctx_(NULL), cp_detached_(false), frame_queue_(nbt::videoQueueCapacity()) {
     memset(&sink_, 0, sizeof(sink_));
     pthread_mutex_init(&queue_mutex_, NULL);
     pthread_mutex_init(&decoder_mutex_, NULL);
     pthread_cond_init(&queue_cond_, NULL);
+    printf("[VideoManager] video queue capacity=%u frames (NBT_VIDEO_QUEUE; default 15)\n",
+           static_cast<unsigned int>(frame_queue_.capacity()));
 }
 
 VideoManager::~VideoManager() {
@@ -522,7 +527,21 @@ void VideoManager::stop() {
         if (mmr_ctxt_) {
             if (fn_stop) fn_stop(mmr_ctxt_);
             if (fn_destroy) fn_destroy(mmr_ctxt_);   // also closes the context handle
+            mmr_ctxt_ = NULL;
         }
+        pthread_mutex_lock(&decoder_mutex_);
+        if (cp_ctx_) {
+            if (cp_detached_) {
+                if (mdev_fd_ >= 0) { name_close(mdev_fd_); mdev_fd_ = -1; }   // mdev is CarPlay's again
+                usleep(50000);
+                reattachFactoryContext("nbt-aad stops");
+            }
+            typedef int (*mmr_context_close_t)(void*);
+            mmr_context_close_t fn_close = (mmr_context_close_t)dlsym(mmr_lib_, "mmr_context_close");
+            if (fn_close) fn_close(cp_ctx_);         // our handle only: mmr_context_close() never destroys the context
+            cp_ctx_ = NULL;
+        }
+        pthread_mutex_unlock(&decoder_mutex_);
         if (fn_disconn && mmr_cnx_) fn_disconn(mmr_cnx_);
         dlclose(mmr_lib_);
         mmr_lib_ = NULL;
@@ -562,6 +581,195 @@ void VideoManager::stop() {
 bool VideoManager::cpHandoff() {
     const char* e = getenv("NBT_CP_HANDOFF");
     return !(e && e[0] == '0');
+}
+
+// ---- factory CarPlay context: detach / re-attach (v1.9.50-cpdetach, issue #156) -----------------------------------
+// Destroying cpvideoctx<pid> (the purge in createDecoder) took CarPlay's decoder away for the rest of the boot: the
+// factory creates it once and cannot create it again (err 17), so after the full yield (v1.9.49-cpgroup3) CarPlay had
+// no context at all (#156 log: no cpvideoctx left at the next start). Instead we now open it, stop it and detach its
+// input and outputs - which frees mdev and its window exactly like the purge did - but the context and the factory's
+// own handle on it stay valid. The PPS objects (output<N>, input, param) are read first, and when Android Auto is done
+// (session over and idle, CarPlay taking the screen, or nbt-aad stopping) our context is destroyed and CarPlay's is
+// rebuilt from that snapshot: the factory's own URL, window id 1280 and window group cpvideogrp<pid>.
+// NBT_CP_PURGE=1 destroys it as before.
+// v1.9.57-cpcompat: only with the "CarPlay compatibility" checkbox (nbt_env.hpp); NBT_CP_PURGE=1 / 0 wins.
+bool VideoManager::cpPurge() { return nbt::cpPurgeOn(); }
+
+static const char* kMmrCtxDir = "/pps/services/multimedia/renderer/context";
+
+static std::string ppsOneLine(const std::string& text) {
+    std::string s;
+    for (size_t i = 0; i < text.size() && s.size() < 400; ++i) {
+        char c = text[i];
+        if (c == '\r') continue;
+        if (c == '\n') { if (i + 1 < text.size()) s += " | "; continue; }
+        s += c;
+    }
+    return s;
+}
+
+static void readCtxSnapshot(const std::string& name, nbt::MmrCtxSnapshot& snap) {
+    snap.clear();
+    std::string dir = std::string(kMmrCtxDir) + "/" + name;
+    DIR* d = opendir(dir.c_str());
+    if (!d) {
+        printf("[VideoManager] %s: PPS directory %s not readable (errno=%d)\n", name.c_str(), dir.c_str(), errno);
+        return;
+    }
+    struct dirent* de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        std::string text;
+        if (!nbt::ppsReadFile((dir + "/" + de->d_name).c_str(), text)) continue;
+        snap.add(de->d_name, text);
+        printf("[VideoManager] %s/%s: %s\n", name.c_str(), de->d_name, ppsOneLine(text).c_str());
+    }
+    closedir(d);
+}
+
+void* VideoManager::makeDict(const std::vector<PpsAttr>& attrs) {
+    if (attrs.empty() || !strm_lib_) return NULL;
+    typedef void* (*strm_dict_new_t)();
+    typedef void* (*strm_dict_set_t)(void*, const char*, const char*);
+    strm_dict_new_t fn_new = (strm_dict_new_t)dlsym(strm_lib_, "strm_dict_new");
+    strm_dict_set_t fn_set = (strm_dict_set_t)dlsym(strm_lib_, "strm_dict_set");
+    if (!fn_new || !fn_set) return NULL;
+    void* d = fn_new();
+    for (size_t i = 0; d && i < attrs.size(); ++i) d = fn_set(d, attrs[i].name.c_str(), attrs[i].value.c_str());
+    return d;   // mm-renderer takes ownership in mmr_*_parameters()
+}
+
+bool VideoManager::detachFactoryContext(const char* name) {
+    if (!mmr_lib_ || !mmr_cnx_ || !name) return false;
+    typedef void* (*mmr_context_open_t)(void*, const char*);
+    typedef int (*mmr_context_close_t)(void*);
+    typedef int (*mmr_stop_t)(void*);
+    typedef int (*mmr_input_detach_t)(void*);
+    typedef int (*mmr_output_detach_t)(void*, unsigned);
+    mmr_context_open_t fn_open = (mmr_context_open_t)dlsym(mmr_lib_, "mmr_context_open");
+    mmr_context_close_t fn_close = (mmr_context_close_t)dlsym(mmr_lib_, "mmr_context_close");
+    mmr_stop_t fn_stop = (mmr_stop_t)dlsym(mmr_lib_, "mmr_stop");
+    mmr_input_detach_t fn_in_det = (mmr_input_detach_t)dlsym(mmr_lib_, "mmr_input_detach");
+    mmr_output_detach_t fn_out_det = (mmr_output_detach_t)dlsym(mmr_lib_, "mmr_output_detach");
+    if (!fn_open || !fn_in_det || !fn_out_det) {
+        printf("[VideoManager] %s: MM-Renderer detach API missing\n", name);
+        return false;
+    }
+    if (cp_ctx_ && cp_name_ != name) {             // a different factory context (CarPlay engine restarted)
+        if (fn_close) fn_close(cp_ctx_);
+        cp_ctx_ = NULL;
+        cp_detached_ = false;
+        cp_snap_.clear();
+    }
+    if (cp_ctx_ && cp_detached_) {
+        printf("[VideoManager] CarPlay's decoder context %s is still detached\n", name);
+        return true;
+    }
+    nbt::MmrCtxSnapshot snap;
+    readCtxSnapshot(name, snap);
+    if (snap.hasOutput() || snap.hasInput()) cp_snap_ = snap;
+    else if (cp_snap_.hasOutput()) printf("[VideoManager] %s lists nothing attached: keeping the earlier snapshot\n", name);
+    else printf("[VideoManager] %s lists nothing attached: re-attach will use the factory window URL\n", name);
+    if (!cp_ctx_) {
+        cp_ctx_ = fn_open(mmr_cnx_, name);
+        cp_name_ = name;
+        if (!cp_ctx_) {
+            printf("[VideoManager] could not open CarPlay's decoder context %s (errno=%d)\n", name, errno);
+            return false;
+        }
+    }
+    int r_stop = fn_stop ? fn_stop(cp_ctx_) : -9999;
+    int r_in = fn_in_det(cp_ctx_);
+    std::vector<int> ids = snap.outputIds;
+    if (ids.empty()) ids.push_back(0);
+    std::string outs;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        char b[32];
+        snprintf(b, sizeof(b), "%s%d:%d", i ? " " : "", ids[i], fn_out_det(cp_ctx_, (unsigned)ids[i]));
+        outs += b;
+    }
+    cp_detached_ = true;
+    printf("[VideoManager] CarPlay's decoder context %s detached, not destroyed (stop %d, input detach %d, output detach "
+           "%s): handed back when Android Auto is done (NBT_CP_PURGE=1: destroy it as before)\n",
+           name, r_stop, r_in, outs.c_str());
+    return true;
+}
+
+bool VideoManager::reattachFactoryContext(const char* why) {
+    if (!cp_ctx_ || !cp_detached_ || !mmr_lib_) return false;
+    typedef int (*mmr_context_parameters_t)(void*, void*);
+    typedef int (*mmr_output_attach_t)(void*, const char*, const char*);
+    typedef int (*mmr_output_parameters_t)(void*, int, void*);
+    typedef int (*mmr_input_parameters_t)(void*, void*);
+    typedef int (*mmr_input_attach_t)(void*, const char*, const char*);
+    typedef int (*mmr_play_t)(void*);
+    mmr_context_parameters_t fn_ctx_params = (mmr_context_parameters_t)dlsym(mmr_lib_, "mmr_context_parameters");
+    mmr_output_attach_t fn_out_attach = (mmr_output_attach_t)dlsym(mmr_lib_, "mmr_output_attach");
+    mmr_output_parameters_t fn_out_params = (mmr_output_parameters_t)dlsym(mmr_lib_, "mmr_output_parameters");
+    mmr_input_parameters_t fn_in_params = (mmr_input_parameters_t)dlsym(mmr_lib_, "mmr_input_parameters");
+    mmr_input_attach_t fn_in_attach = (mmr_input_attach_t)dlsym(mmr_lib_, "mmr_input_attach");
+    mmr_play_t fn_play = (mmr_play_t)dlsym(mmr_lib_, "mmr_play");
+    if (!fn_out_attach) {
+        printf("[VideoManager] CarPlay's decoder context %s: mmr_output_attach missing, not re-attached\n", cp_name_.c_str());
+        return false;
+    }
+    int r_ctx = -9999;
+    if (fn_ctx_params) {
+        void* d = makeDict(cp_snap_.param);
+        if (d) r_ctx = fn_ctx_params(cp_ctx_, d);
+    }
+    std::vector<std::vector<PpsAttr> > outs = cp_snap_.outputs;
+    if (!cp_snap_.hasOutput()) {
+        // Nothing captured: the factory's own URL (Supra capture in tests/test_mmr_pps.cpp), group cpvideogrp<pid>.
+        const nbt::CarConfig& cc = nbt::carConfig();
+        int w = cc.iniW > 0 ? cc.iniW : cc.screenW;
+        int h = cc.iniH > 0 ? cc.iniH : cc.screenH;
+        char url[256];
+        snprintf(url, sizeof(url), "screen:/any?winid=%s&nodstviewport=0&dstx=0&dsty=0&dstw=%d&dsth=%d&wingrp=cpvideogrp%s",
+                 NBT_SCREEN_WINDOW_ID, w, h, cp_name_.size() > 10 ? cp_name_.c_str() + 10 : "");
+        std::vector<PpsAttr> o;
+        PpsAttr a;
+        a.name = "mmf.SCREEN_WRITER_DISABLE_CADENCE"; a.value = "1"; o.push_back(a);
+        a.name = "mmf.SCREEN_WRITER_DISABLE_MEDIACLOCK"; o.push_back(a);
+        a.name = "mmf.SCREEN_WRITER_POST_BUFFER_NOSYNC"; o.push_back(a);
+        a.name = "type"; a.value = "video"; o.push_back(a);
+        a.name = "url"; a.value = url; o.push_back(a);
+        outs.clear();
+        outs.push_back(o);
+    }
+    std::string res;
+    int attached = 0;
+    for (size_t i = 0; i < outs.size(); ++i) {
+        std::string url = ppsGet(outs[i], "url");
+        if (url.empty()) continue;
+        std::string type = ppsGet(outs[i], "type", "video");
+        int r = fn_out_attach(cp_ctx_, url.c_str(), type.c_str());
+        int rp = -9999;
+        if (r >= 0 && fn_out_params) {
+            void* d = makeDict(ppsSettings(outs[i]));
+            if (d) rp = fn_out_params(cp_ctx_, r, d);
+        }
+        if (r >= 0) ++attached;
+        char b[400];
+        snprintf(b, sizeof(b), "%s%s -> %d (params %d)", res.empty() ? "" : "; ", url.c_str(), r, rp);
+        res += b;
+    }
+    int r_in = -9999, r_inp = -9999, r_play = -9999;
+    if (cp_snap_.hasInput() && fn_in_attach) {
+        std::string url = ppsGet(cp_snap_.input, "url");
+        std::string type = ppsGet(cp_snap_.input, "type", "track");
+        r_in = fn_in_attach(cp_ctx_, url.c_str(), type.c_str());
+        if (r_in >= 0 && fn_in_params) {
+            void* d = makeDict(ppsSettings(cp_snap_.input));
+            if (d) r_inp = fn_in_params(cp_ctx_, d);
+        }
+        if (r_in >= 0 && fn_play) r_play = fn_play(cp_ctx_);
+    }
+    cp_detached_ = false;
+    printf("[VideoManager] CarPlay's decoder context %s re-attached (%s): params %d, output %s, input %d (params %d), "
+           "play %d%s\n", cp_name_.c_str(), why, r_ctx, res.c_str(), r_in, r_inp, r_play,
+           cp_snap_.hasInput() ? "" : " (no input was attached: CarPlay attaches its own)");
+    return attached > 0;
 }
 
 void VideoManager::quiesceWorker() {
@@ -662,6 +870,10 @@ bool VideoManager::createDecoder() {
             if (!mine) {
                 printf("[VideoManager] Leaving MM-Renderer context alone: %s\n", de->d_name);
                 continue;
+            }
+            if (strncmp(de->d_name, "cpvideoctx", 10) == 0 && !cpPurge() && getenv("NBT_PURGE_ALL") == NULL) {
+                if (detachFactoryContext(de->d_name)) continue;
+                printf("[VideoManager] could not detach %s: destroying it as before\n", de->d_name);
             }
             printf("[VideoManager] Purging stale MM-Renderer context: %s\n", de->d_name);
             if (fn_ctx_open) {
@@ -850,6 +1062,17 @@ bool VideoManager::prepareForSession() {
 bool VideoManager::retuneForCarPlay() {
     if (!is_initialized_ || !cpHandoff()) return false;
     pthread_mutex_lock(&decoder_mutex_);
+    if (cp_ctx_ && cp_detached_ && !cp_mode_) {
+        // v1.9.50-cpdetach: CarPlay's own context still exists (detached, not destroyed): destroy ours - it frees mdev
+        // and the window - and give CarPlay back exactly what it had. The next Android Auto connection detaches it again.
+        destroyDecoder();
+        usleep(50000);
+        bool ok = reattachFactoryContext("Android Auto handed the decoder back");
+        cp_mode_ = true;             // prepareForSession() / the main loop: rebuild ours when Android Auto returns
+        parked_ = false;
+        pthread_mutex_unlock(&decoder_mutex_);
+        return ok;
+    }
     if (!mmr_ctxt_ || cp_mode_ || !mmr_lib_ || !strm_lib_) { pthread_mutex_unlock(&decoder_mutex_); return false; }
     typedef int (*mmr_input_detach_t)(void*);
     typedef int (*mmr_output_detach_t)(void*, unsigned);
@@ -894,9 +1117,21 @@ bool VideoManager::retuneForCarPlay() {
     }
     // CarPlay plays through this context with CarPlay's own window id (carplay.ini WindowName=1280), so iDrive shows
     // it on surface 1280 as usual - never on Android Auto's surface.
+    // No wingrp (v1.9.49, issue #156): with "&wingrp=<our group>" CarPlay's window 1280 was created as a CHILD of our
+    // window, which is hidden whenever Android Auto is not shown, so CarPlay stayed black ("mm-renderer's video window
+    // joined our group ... vis 0") until the head unit restarted - after a clean Android Auto disconnect as well as
+    // over a live session. carplay.ini's own VideoURL has no wingrp: the factory window is top-level. NBT_CP_WINGRP=1
+    // restores the old URL.
     char out_url[256];
-    snprintf(out_url, sizeof(out_url), "screen:/any?winid=%s&nodstviewport=0&dstx=0&dsty=0&dstw=%d&dsth=%d&wingrp=%s",
-             NBT_SCREEN_WINDOW_ID, w, h, grp_name_.c_str());
+    const bool inGroup = nbt::cpWinGroupOn();   // v1.9.57: top-level only with CarPlay compatibility; NBT_CP_WINGRP wins
+    if (inGroup)
+        snprintf(out_url, sizeof(out_url), "screen:/any?winid=%s&nodstviewport=0&dstx=0&dsty=0&dstw=%d&dsth=%d&wingrp=%s",
+                 NBT_SCREEN_WINDOW_ID, w, h, grp_name_.c_str());
+    else
+        snprintf(out_url, sizeof(out_url), "screen:/any?winid=%s&nodstviewport=0&dstx=0&dsty=0&dstw=%d&dsth=%d",
+                 NBT_SCREEN_WINDOW_ID, w, h);
+    printf("[VideoManager] CarPlay output window: %s (%s)\n", out_url,
+           inGroup ? "in our window group: CarPlay compatibility off / NBT_CP_WINGRP=1" : "top-level, like carplay.ini's VideoURL");
     int r_out = fn_out_attach(mmr_ctxt_, out_url, "video");
     if (r_out >= 0) mmr_output_id_ = r_out;
     int r_outp = -9999;
@@ -949,6 +1184,19 @@ bool VideoManager::waitingForKeyframe() {
     bool w = wait_idr_;
     pthread_mutex_unlock(&queue_mutex_);
     return w;
+}
+
+bool VideoManager::keyframeWanted() {
+    pthread_mutex_lock(&queue_mutex_);
+    bool w = idr_wanted_;
+    pthread_mutex_unlock(&queue_mutex_);
+    return w;
+}
+
+void VideoManager::clearKeyframeWanted() {
+    pthread_mutex_lock(&queue_mutex_);
+    idr_wanted_ = false;
+    pthread_mutex_unlock(&queue_mutex_);
 }
 
 void VideoManager::releaseKeyframeWait() {
@@ -1412,6 +1660,14 @@ static FILE* g_dump = NULL;
 static int g_dumpState = 0;        // 0 = not yet decided, 1 = active, 2 = off
 static size_t g_dumpBytes = 0;
 static int g_dumpFrames = 0;
+static bool videoDumpMayRun() {
+    if (g_dumpState == 1) return true;
+    if (g_dumpState == 2) return false;
+    const char* e = getenv("NBT_VIDEO_DUMP");
+    if (!e || !*e) { g_dumpState = 2; return false; }
+    return true;
+}
+
 static void dumpVideo(const uint8_t* d, size_t n, bool is_config) {
     if (g_dumpState == 0) {
         const char* e = getenv("NBT_VIDEO_DUMP");
@@ -1451,7 +1707,7 @@ bool VideoManager::postCodecConfig(const uint8_t* data, size_t length) {
     item.has_inline_config = false;
     item.raw_size = length;
     item.inline_config_size = 0;
-    frame_queue_.push_back(item);
+    frame_queue_.push(item);   // config packets are not subject to the cap
     pthread_cond_signal(&queue_cond_);
     pthread_mutex_unlock(&queue_mutex_);
     return true;
@@ -1469,56 +1725,74 @@ static bool looksLikeIdr(const uint8_t* d, size_t n) {
     return false;
 }
 
-bool VideoManager::postVideoFrame(const uint8_t* data, size_t length, uint64_t pts) {
-    if (!data || length == 0) return false;
+bool VideoManager::postVideoFrame(std::vector<uint8_t>& frame_data, size_t offset, size_t length, uint64_t pts) {
+    if (length == 0 || offset > frame_data.size() || length > frame_data.size() - offset) return false;
+    const uint8_t* data = &frame_data[offset];
+
+    // IDR detection scans the H.264 access unit. Do that once, before taking queue_mutex_, so the network receive
+    // thread does not hold the decoder worker behind the scan.
+    const bool is_idr = looksLikeIdr(data, length);
+
+    // Video dumping is opt-in and may block on storage. Preserve the usual gating while keeping file I/O outside the
+    // queue lock; in normal runs this branch is skipped entirely.
+    if (videoDumpMayRun()) {
+        pthread_mutex_lock(&queue_mutex_);
+        const bool should_dump = accepting_ && (!wait_idr_ || is_idr);
+        pthread_mutex_unlock(&queue_mutex_);
+        if (should_dump) dumpVideo(data, length, false);
+    }
 
     // Non-blocking enqueue: network thread pushes frame and returns immediately!
     pthread_mutex_lock(&queue_mutex_);
     if (!accepting_) { pthread_mutex_unlock(&queue_mutex_); return false; }
     if (wait_idr_) {
-        if (!looksLikeIdr(data, length)) { ++idr_dropped_; pthread_mutex_unlock(&queue_mutex_); return true; }
+        if (!is_idr) { ++idr_dropped_; pthread_mutex_unlock(&queue_mutex_); return true; }
         wait_idr_ = false;
         printf("[VideoManager] keyframe after the decoder rebuild (%u frames without one dropped)\n", idr_dropped_);
     }
-    if (frame_queue_.size() >= 15) {
-        bool dropped = false;
-        size_t dropped_size = 0;
-        for (std::vector<VideoQueueItem>::iterator it = frame_queue_.begin(); it != frame_queue_.end(); ++it) {
-            if (!it->is_config && !it->is_idr) {   // never sacrifice a keyframe
-                dropped_size = it->data.size();
-                frame_queue_.erase(it);
-                dropped = true;
-                break;
-            }
-        }
-        if (!dropped) {
-            printf("[VideoManager] Warning: video queue full of codec config packets; rejecting %u byte frame.\n",
-                   static_cast<unsigned int>(length));
-            pthread_mutex_unlock(&queue_mutex_);
-            return false;
-        }
-        printf("[VideoManager] Warning: video queue full; dropped oldest non-config frame (%u bytes), queued=%u.\n",
-               static_cast<unsigned int>(dropped_size),
-               static_cast<unsigned int>(frame_queue_.size()));
-    }
-    dumpVideo(data, length, false);
     VideoQueueItem item;
     item.raw_size = length;
     item.inline_config_size = cached_codec_config_.size();
     item.has_inline_config = item.inline_config_size != 0;
-    if (item.has_inline_config) {
-        item.data.resize(item.inline_config_size + length);
-        memcpy(&item.data[0], &cached_codec_config_[0], item.inline_config_size);
-        memcpy(&item.data[item.inline_config_size], data, length);
+    if (item.inline_config_size <= VideoQueueItem::kInlineConfigCapacity) {
+        if (item.inline_config_size)
+            memcpy(item.inline_config_data, &cached_codec_config_[0], item.inline_config_size);
     } else {
-        item.data.assign(data, data + length);
+        item.large_inline_config.assign(cached_codec_config_.begin(), cached_codec_config_.end());
     }
+    item.data_offset = offset;
+    item.data_length = length;
+    item.data.swap(frame_data);   // hand off the decrypted AA message without copying the H.264 access unit
     item.pts = pts;
     item.is_config = false;
-    item.is_idr = looksLikeIdr(data, length);
-    frame_queue_.push_back(item);
-    pthread_cond_signal(&queue_cond_);
+    item.is_idr = is_idr;
+    // The queue takes the bytes (no copy), and drops the oldest plain frame when it is full (frame_queue.hpp).
+    const FrameQueue::PushResult pushed = frame_queue_.push(item);
+    // The slot's previous allocation (or the rejected input allocation) is now back in the session-thread scratch
+    // vector. Keep its capacity for the next decrypted message instead of freeing it with this stack item.
+    frame_data.swap(item.data);
+    frame_data.clear();
+    const size_t queued_before_push = frame_queue_.size() - (pushed == FrameQueue::kRejectedFullOfConfig ? 0 : 1);
+    const size_t dropped_size = frame_queue_.lastDroppedSize();
+    if (pushed != FrameQueue::kRejectedFullOfConfig) {
+        // Every frame up to the next keyframe decodes against a dropped one. A keyframe already queued behind it
+        // repairs the picture by itself; otherwise the phone has to be asked (keyframeWanted()).
+        if (pushed == FrameQueue::kQueuedDroppedOldest && !frame_queue_.lastDropKeyframeBehind()) idr_wanted_ = true;
+        if (item.is_idr) idr_wanted_ = false;   // the phone's keyframe repairs whatever was lost before it
+        pthread_cond_signal(&queue_cond_);
+    }
     pthread_mutex_unlock(&queue_mutex_);
+    // Log after the unlock: with a slow log destination (USB stick) a printf under queue_mutex_ stalled the worker
+    // and, through it, the session thread.
+    if (pushed == FrameQueue::kRejectedFullOfConfig) {
+        printf("[VideoManager] Warning: video queue full of codec config packets; rejecting %u byte frame.\n",
+               static_cast<unsigned int>(length));
+        return false;
+    }
+    if (pushed == FrameQueue::kQueuedDroppedOldest) {
+        printf("[VideoManager] Warning: video queue full; dropped oldest non-config frame (%u bytes), queued=%u.\n",
+               static_cast<unsigned int>(dropped_size), static_cast<unsigned int>(queued_before_push));
+    }
     return true;
 }
 
@@ -1535,8 +1809,7 @@ void VideoManager::workerLoop() {
             pthread_mutex_unlock(&queue_mutex_);
             break;
         }
-        item = frame_queue_.front();
-        frame_queue_.erase(frame_queue_.begin());
+        frame_queue_.pop(item);   // not empty here; takes the bytes without a copy
         size_t queued_after_pop = frame_queue_.size();
         bool do_reset = reset_pending_;
         reset_pending_ = false;
@@ -1552,7 +1825,7 @@ void VideoManager::workerLoop() {
                 // into that dispatcher, even when it is later reported unchanged.
                 bool ok = sendMdevSync() &&
                           sendMdevFormat((uint32_t)nbt::videoCanvasWidth(), (uint32_t)vidEnvInt("NBT_VID_SRC_H", nbt::videoCanvasHeight()), sink_.config.fps) &&
-                          sendMdevConfig(&item.data[0], item.data.size());
+                          sendMdevConfig(&item.data[item.data_offset], item.data_length);
                 mdev_initialized_ = ok;
                 if (!ok) {
                     printf("[VideoManager] Warning: mdev initialization handshake failed; frames will wait for retry.\n");
@@ -1578,7 +1851,7 @@ void VideoManager::workerLoop() {
 
                 memset(&hdr, 0, sizeof(hdr));
                 hdr.msg_code = 3; // 3 = MDEV_PACKET_DATA
-                hdr.payload_len = static_cast<uint32_t>(item.data.size() + 8);
+                hdr.payload_len = static_cast<uint32_t>(item.inline_config_size + item.data_length + 8);
 
                 // Always calculate microsecond PTS matching local QNX CLOCK_MONOTONIC timebase
                 // (Matches mdev_streamer FUN_00015828 clock_gettime(2, &ts) / GraphClock)
@@ -1586,16 +1859,23 @@ void VideoManager::workerLoop() {
                 clock_gettime(CLOCK_MONOTONIC, &ts);
                 uint64_t pts = static_cast<uint64_t>(ts.tv_sec) * 1000000ULL + ts.tv_nsec / 1000ULL;
 
-                iov_t iov[3];
+                iov_t iov[4];
                 SETIOV(&iov[0], &hdr, sizeof(hdr));
                 SETIOV(&iov[1], &pts, sizeof(pts));
-                SETIOV(&iov[2], &item.data[0], item.data.size());
+                int iov_count = 3;
+                if (item.inline_config_size) {
+                    SETIOV(&iov[2], item.inlineConfigData(), item.inline_config_size);
+                    SETIOV(&iov[3], &item.data[item.data_offset], item.data_length);
+                    iov_count = 4;
+                } else {
+                    SETIOV(&iov[2], &item.data[item.data_offset], item.data_length);
+                }
 
                 uint32_t next_frame = frame_count + 1;
                 if (next_frame <= 35 || (next_frame % 30) == 0) {
                     printf("[VideoManager] mdev frame #%u BEGIN (%u bytes%s, raw=%u, cfg=%u, queue_after_pop=%u)\n",
                            next_frame,
-                           static_cast<unsigned int>(item.data.size()),
+                           static_cast<unsigned int>(item.inline_config_size + item.data_length),
                            item.has_inline_config ? " incl-config" : "",
                            static_cast<unsigned int>(item.raw_size),
                            static_cast<unsigned int>(item.inline_config_size),
@@ -1614,7 +1894,7 @@ void VideoManager::workerLoop() {
                                  _NTO_TIMEOUT_SEND | _NTO_TIMEOUT_REPLY,
                                  NULL, &send_timeout_ns, NULL);
                     errno = 0;
-                    ret = MsgSendvs_r(mdev_fd_, iov, 3, NULL, 0);
+                    ret = MsgSendvs_r(mdev_fd_, iov, iov_count, NULL, 0);
                     if (ret == 0) break;
                     err = (ret < 0) ? -ret : errno;
                     break;
@@ -1626,9 +1906,15 @@ void VideoManager::workerLoop() {
 
                 frame_count++;
                 if (ret == 0) ++frames_in_gen_;
+                if (ret != 0) {
+                    // mdev did not take the frame: it is lost like a queue-full drop (see postVideoFrame).
+                    pthread_mutex_lock(&queue_mutex_);
+                    if (!frame_queue_.hasKeyframe()) idr_wanted_ = true;
+                    pthread_mutex_unlock(&queue_mutex_);
+                }
                 if (ret != 0 || frame_count <= 35 || (frame_count % 30) == 0) {
                     printf("[VideoManager] mdev frame #%u END (%u bytes%s, raw=%u, cfg=%u, pts=%llu, elapsed=%llu us) -> MsgSendvs_r ret=%d (status: %s)\n",
-                           frame_count, static_cast<unsigned int>(item.data.size()),
+                           frame_count, static_cast<unsigned int>(item.inline_config_size + item.data_length),
                            item.has_inline_config ? " incl-config" : "",
                            static_cast<unsigned int>(item.raw_size),
                            static_cast<unsigned int>(item.inline_config_size),

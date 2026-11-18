@@ -3,12 +3,13 @@
 #ifndef NBT_USB_DIRECT_HPP
 #define NBT_USB_DIRECT_HPP
 
-// NBT_USB_DIRECT=1 (experimental, QNX only): talk to a phone in accessory mode through libusbdi instead of
-// devc-serusb-aoap. That driver lets every client read /dev/oap*, and a transfer that completes while our read() is
-// not waiting goes to whichever client reads next (the media app's A4A handler opens the node too), or is lost in the
-// driver's own queue: TLS records went missing in every burst (car logs 2026-10-31). Here io-usb hands the bulk-in
-// transfers to us only, with several reads queued so a burst always has somewhere to land. The driver has to go
-// first (it keeps a read queued on the same endpoint): UsbAccessory stops it once the phone is in accessory mode.
+// NBT_USB_DIRECT (QNX only; on by default with Android Auto over USB, 0 turns it off): talk to a phone in accessory
+// mode through libusbdi instead of devc-serusb-aoap. That driver lets every client read /dev/oap*, and a transfer that
+// completes while our read() is not waiting goes to whichever client reads next (the media app's A4A handler opens
+// the node too), or is lost in the driver's own queue: TLS records went missing in every burst (car logs 2026-10-31).
+// Here io-usb hands the bulk-in transfers to us only, with several reads queued so a burst always has somewhere to
+// land. The driver has to go first (it keeps a read queued on the same endpoint): UsbAccessory stops it once the
+// phone is in accessory mode.
 //
 // It also switches phones itself. vdev-medialaunch asks a new USB device for its AOA protocol once, when it is
 // plugged in, and only creates /dev/android* (aoap-switch) when it gets an answer. A phone that is still in "charging
@@ -72,6 +73,10 @@ public:
     // before this daemon ran, so a session of an earlier one may still be running on it.
     bool takePresentAtStart(const std::string& key);
 
+    // nbt-aad is about to send an accessory switch (either path: /dev/android* or switchPhones): an accessory that
+    // appears after this is the phone we switched, not one left over from before, and is not reset.
+    void noteSwitchSent();
+
     // Devices other than accessories that have been plugged in for at least min_age_s: asks each one for its AOA
     // protocol (again every second while it does not answer, for up to 2 minutes) and switches the ones that answer to
     // accessory mode with `id`. Blocks for the control transfers (1 s timeout each). Returns how many it switched.
@@ -120,6 +125,7 @@ private:
     pthread_mutex_t mu_;
     struct usbd_connection* conn_;
     double connected_s_;                 // guarded by mu_: when usbd_connect returned, 0 until then
+    double switch_s_;                    // guarded by mu_: when nbt-aad last sent a switch, 0 = never
     std::vector<Accessory> accs_;
     std::vector<Candidate> cands_;
     std::vector<Signalled> signalled_;   // watch thread only

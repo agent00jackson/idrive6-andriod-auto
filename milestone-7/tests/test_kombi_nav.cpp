@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Required Notice: Copyright (c) 2026 nanaisu - NBT-AAD (https://github.com/Sq00ky/Supra-iDrive6-Android-Auto)
 // Host test: kombi_nav state machine + SOME/IP client against a fake KOMBI on 127.0.0.1, the iDrive-route watch,
-// and the daemon runtime end to end (src/kombi_nav.cpp, src/kombi_client.cpp).
-// Build: g++ -std=gnu++98 -Iinclude -Isrc -Itests tests/test_kombi_nav.cpp src/kombi_nav.cpp src/kombi_client.cpp -lpthread
-#include "kombi_nav.hpp"
+// and the daemon runtime end to end (src/cluster/nav_core.cpp, src/cluster/j29_client.cpp).
+// Build: g++ -std=gnu++98 -Iinclude -Isrc -Itests tests/test_kombi_nav.cpp src/cluster/nav_core.cpp src/cluster/j29_client.cpp -lpthread
+#include "cluster/nav_core.hpp"
 #include "kombi_nav_test_util.hpp"
 #include <assert.h>
 #include <errno.h>
@@ -26,133 +26,8 @@ static double monoS() {
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-// ---- fake KOMBI --------------------------------------------------------------------------------------------------
-struct Seen { uint16_t method; Bytes body; };
-
-class FakeKombi {
-public:
-    enum Reject { kNone, kNth, kUntil };
-    FakeKombi() : reject_(kNone), nth_(0), until_(0), cookie_ms_(0), stop_(false) {
-        pthread_mutex_init(&mu_, NULL);
-        srv_ = socket(AF_INET, SOCK_STREAM, 0);
-        int one = 1;
-        setsockopt(srv_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        struct sockaddr_in a;
-        memset(&a, 0, sizeof(a));
-        a.sin_family = AF_INET;
-        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        assert(bind(srv_, (struct sockaddr*)&a, sizeof(a)) == 0 && listen(srv_, 8) == 0);
-        socklen_t l = sizeof(a);
-        getsockname(srv_, (struct sockaddr*)&a, &l);
-        port_ = ntohs(a.sin_port);
-        pthread_create(&acc_, NULL, &FakeKombi::acceptStub, this);
-    }
-    ~FakeKombi() {
-        pthread_mutex_lock(&mu_);
-        stop_ = true;
-        pthread_mutex_unlock(&mu_);
-        shutdown(srv_, SHUT_RDWR);
-        close(srv_);
-        pthread_join(acc_, NULL);
-        dropAll();
-        usleep(50000);
-    }
-    uint16_t port() const { return port_; }
-    void rejectNth(size_t n) { pthread_mutex_lock(&mu_); reject_ = kNth; nth_ = n; pthread_mutex_unlock(&mu_); }
-    void rejectUntil(double t) { pthread_mutex_lock(&mu_); reject_ = kUntil; until_ = t; pthread_mutex_unlock(&mu_); }
-    void cookies(int ms) { pthread_mutex_lock(&mu_); cookie_ms_ = ms; pthread_mutex_unlock(&mu_); }
-    bool stopping() { pthread_mutex_lock(&mu_); bool s = stop_; pthread_mutex_unlock(&mu_); return s; }
-    std::vector<Seen> seen() { pthread_mutex_lock(&mu_); std::vector<Seen> s = seen_; pthread_mutex_unlock(&mu_); return s; }
-    size_t count() { pthread_mutex_lock(&mu_); size_t n = seen_.size(); pthread_mutex_unlock(&mu_); return n; }
-    void dropAll() {   // the KOMBI closes every connection (link blip)
-        pthread_mutex_lock(&mu_);
-        for (size_t i = 0; i < conns_.size(); ++i) shutdown(conns_[i], SHUT_RDWR);
-        pthread_mutex_unlock(&mu_);
-    }
-
-private:
-    static void* acceptStub(void* p) { static_cast<FakeKombi*>(p)->acceptLoop(); return NULL; }
-    void acceptLoop() {
-        while (!stopping()) {
-            int c = accept(srv_, NULL, NULL);
-            if (c < 0) return;
-            pthread_mutex_lock(&mu_);
-            conns_.push_back(c);
-            int cookie_ms = cookie_ms_;
-            pthread_mutex_unlock(&mu_);
-            Conn* k = new Conn;
-            k->self = this; k->fd = c;
-            pthread_t t;
-            pthread_create(&t, NULL, &FakeKombi::connStub, k);
-            pthread_detach(t);
-            if (cookie_ms) {
-                Conn* k2 = new Conn;
-                k2->self = this; k2->fd = c;
-                pthread_create(&t, NULL, &FakeKombi::cookieStub, k2);
-                pthread_detach(t);
-            }
-        }
-    }
-    struct Conn { FakeKombi* self; int fd; };
-    static bool rd(int fd, uint8_t* p, size_t n) {
-        while (n) { ssize_t r = recv(fd, p, n, 0); if (r <= 0) return false; p += r; n -= r; }
-        return true;
-    }
-    static void* connStub(void* p) {
-        Conn* k = static_cast<Conn*>(p);
-        FakeKombi* s = k->self;
-        int fd = k->fd;
-        delete k;
-        for (;;) {
-            uint8_t h[16];
-            if (!rd(fd, h, 16)) break;
-            uint32_t len = ((uint32_t)h[4] << 24) | (h[5] << 16) | (h[6] << 8) | h[7];
-            Bytes body(len - 8);
-            if (len > 8 && !rd(fd, &body[0], body.size())) break;
-            Seen x;
-            x.method = (uint16_t)((h[2] << 8) | h[3]);
-            x.body = body;
-            pthread_mutex_lock(&s->mu_);
-            s->seen_.push_back(x);
-            size_t n = s->seen_.size();
-            bool bad = (s->reject_ == kNth && n == s->nth_) || (s->reject_ == kUntil && monoS() < s->until_);
-            pthread_mutex_unlock(&s->mu_);
-            uint8_t r[16];
-            memcpy(r, h, 16);
-            r[4] = 0; r[5] = 0; r[6] = 0; r[7] = 8; r[14] = 0x80; r[15] = bad ? 1 : 0;
-            if (send(fd, r, 16, MSG_NOSIGNAL) != 16) break;
-        }
-        close(fd);
-        return NULL;
-    }
-    static void* cookieStub(void* p) {
-        Conn* k = static_cast<Conn*>(p);
-        FakeKombi* s = k->self;
-        int fd = k->fd;
-        delete k;
-        const uint8_t cookie[16] = { 0xFF, 0xFF, 0x80, 0x00, 0, 0, 0, 8, 0xDE, 0xAD, 0xBE, 0xEF, 1, 1, 2, 0 };
-        pthread_mutex_lock(&s->mu_);
-        int ms = s->cookie_ms_;
-        pthread_mutex_unlock(&s->mu_);
-        while (!s->stopping()) {
-            usleep(ms * 1000);
-            if (send(fd, cookie, 16, MSG_NOSIGNAL) != 16) break;
-        }
-        return NULL;
-    }
-
-    int srv_;
-    uint16_t port_;
-    pthread_t acc_;
-    pthread_mutex_t mu_;
-    std::vector<Seen> seen_;
-    std::vector<int> conns_;
-    Reject reject_;               // guarded by mu_ (like everything below)
-    size_t nth_;
-    double until_;
-    int cookie_ms_;
-    bool stop_;
-};
+#include "fake_kombi.hpp"
+#include "nbt_env.hpp"   // navAnyDistanceWanted (the "Show directions at any distance" precedence)
 
 // ---- harness -------------------------------------------------------------------------------------------------------
 struct TestLink {
@@ -182,7 +57,14 @@ static bool hasLog(const char* s) {
 }
 
 // The tests below pin the full-graph path (NBT_KOMBI_NAV_INPLACE=0); the in-place path has its own tests (inPlace()).
-static Settings noApproach() { Settings s; s.approach_mi = 0; s.min_update_s = 0; s.inplace = 0; return s; }
+static Settings noApproach() {
+    Settings s;
+    s.approach = kApproachOff;
+    s.approach_mi = 0;
+    s.min_update_s = 0;
+    s.inplace = 0;
+    return s;
+}
 static Settings inPlace(int mode = 1) { Settings s = noApproach(); s.inplace = mode; return s; }
 
 // method + model type of every frame (0x0004 init has no model)
@@ -202,9 +84,10 @@ struct Rig {
     Graph g;
     KombiClient c;
     TestLink l;
+    J29Display d;
     Core core;
     explicit Rig(const Settings& s = noApproach())
-        : g(0xC8, 255), c("127.0.0.1", k.port()), l(c, g), core(g, l.link, s, &logFn, NULL) {
+        : g(0xC8, 255), c("127.0.0.1", k.port()), l(c, g), d(g, l.link), core(d, s, &logFn, NULL) {
         g_log.clear();
     }
     void feed(const NavMessages& m, double t) {
@@ -328,7 +211,410 @@ static void yieldThroughChild(unsigned skip, int expect) {
     rmdir(dir);
 }
 
+// The daemon keeps the newest message of each kind; this does the same, so a new step can meet the old position.
+struct Nav {
+    NavMessages m;
+    Nav() { Bytes s = status(1); m.store(0x8003, &s[0], s.size()); }
+    void step(int type, const char* road) { Bytes ns = navState(type, road); m.store(0x8006, &ns[0], ns.size()); }
+    // A step body that differs from step()'s only in the steps after it (the phone's next step looks the same).
+    void stepThen(int type, const char* road, int then_type, const char* then_road) {
+        std::vector<std::pair<int, std::string> > nx(1, std::make_pair(then_type, std::string(then_road)));
+        Bytes ns = navState(type, road, -1, nx);
+        m.store(0x8006, &ns[0], ns.size());
+    }
+    void guidance(int st) { Bytes s = status(st); m.store(0x8003, &s[0], s.size()); }
+    void pos(int64_t metres, int secs) {
+        std::string d;
+        int u;
+        mapsDisplay((double)metres, d, u);
+        Bytes cp = curPos(metres, d, u, secs);
+        m.store(0x8007, &cp[0], cp.size());
+    }
+};
+
+static Settings timeApproach() { Settings s; s.min_update_s = 0; s.inplace = 0; return s; }   // the default rule
+
+// kApproachTime (the default): warned by the phone's seconds, shown again at the main prompt, kept until the next
+// maneuver; off-ramps and forks by distance too; a new step judged only on a position of its own; no seconds = the
+// distance rule.
+static void testTimeApproach() {
+    assert(Settings().approach == kApproachTime);
+    {
+        Rig r(timeApproach());
+        Nav n;
+        n.pos(1400, 70);
+        n.step(8, "TIME RD");
+        r.feed(n.m, 0.0);                                            // first seen: waits for a position of its own
+        n.pos(1300, 65);
+        r.feed(n.m, 1.0);
+        assert(!r.core.shown() && r.k.count() == 0 && countLog("APPROACH") == 0);
+        n.pos(1000, 50);
+        r.feed(n.m, 2.0);
+        assert(r.core.shown() && hasLog("WARN type 8: 50 s, 1000 m (time)"));
+        n.pos(700, 35);
+        r.feed(n.m, 3.0);
+        assert(countLog("MAIN") == 0);
+        n.pos(380, 19);
+        r.feed(n.m, 4.0);
+        assert(countLog("MAIN") == 1 && hasLog("MAIN type 8: 19 s, 380 m"));
+        n.pos(300, 70);                                              // stuck in traffic: the seconds go up
+        r.feed(n.m, 5.0);
+        assert(r.core.shown() && countLog("APPROACH") == 0);
+        n.pos(200, 15);
+        r.feed(n.m, 6.0);
+        assert(countLog("MAIN") == 1);                               // once per maneuver
+        // the turn is made: the next step arrives before its own position, which still says 10 m / 1 s
+        n.pos(10, 1);
+        r.feed(n.m, 7.0);
+        n.step(7, "NEXT ST");
+        r.feed(n.m, 7.25);
+        assert(r.core.shown() && r.core.current().road == "TIME RD" && countLog("SHOW ") == 1);
+        n.pos(1800, 90);                                             // its own position: far, so hidden
+        r.feed(n.m, 7.5);
+        assert(!r.core.shown() && hasLog("CLEAR (approach)"));
+        n.pos(950, 48);
+        r.feed(n.m, 8.5);
+        assert(r.core.shown() && r.core.current().road == "NEXT ST" && hasLog("WARN type 7: 48 s, 950 m (time)"));
+        // a short step: due for its main prompt when first judged, so no reminder later
+        n.step(5, "SHORT AVE");
+        r.feed(n.m, 9.0);
+        n.pos(150, 12);
+        r.feed(n.m, 9.5);
+        assert(r.core.current().road == "SHORT AVE");
+        assert(hasLog("WARN type 5: 12 s, 150 m (time), main prompt already due"));
+        n.pos(100, 8);
+        r.feed(n.m, 10.0);
+        assert(countLog("MAIN") == 1);
+        assert(!r.core.takeFallback());
+    }
+    // a new step that never gets a position of its own is judged on the old one after 3 s
+    {
+        Rig r(timeApproach());
+        Nav n;
+        n.step(8, "A RD");
+        n.pos(400, 20);
+        r.feed(n.m, 0.0);
+        n.pos(390, 19);
+        r.feed(n.m, 0.5);
+        assert(r.core.shown());
+        n.step(7, "B RD");
+        r.feed(n.m, 1.0);
+        r.feed(n.m, 3.9);
+        assert(r.core.current().road == "A RD");
+        r.feed(n.m, 4.1);
+        assert(r.core.current().road == "B RD");
+    }
+    // motorway: an off-ramp is warned at 2 km and gets its main prompt at 1 km, whatever the seconds say
+    {
+        Rig r(timeApproach());
+        Nav n;
+        n.step(24, "EXIT 9");
+        n.pos(2100, 130);
+        r.feed(n.m, 0.0);
+        n.pos(2050, 125);
+        r.feed(n.m, 1.0);
+        assert(!r.core.shown());
+        n.pos(1990, 120);
+        r.feed(n.m, 2.0);
+        assert(r.core.shown() && hasLog("WARN type 24: 120 s, 1990 m (motorway distance)"));
+        n.pos(990, 60);
+        r.feed(n.m, 3.0);
+        assert(hasLog("MAIN type 24: 60 s, 990 m"));
+    }
+    // an on-ramp is not a motorway turn: time only
+    {
+        Rig r(timeApproach());
+        Nav n;
+        n.step(16, "RAMP RD");
+        n.pos(1900, 100);
+        r.feed(n.m, 0.0);
+        n.pos(1850, 98);
+        r.feed(n.m, 1.0);
+        assert(!r.core.shown());
+    }
+    // no main prompt with main_s 0
+    {
+        Settings s = timeApproach();
+        s.main_s = 0;
+        Rig r(s);
+        Nav n;
+        n.step(8, "NO MAIN RD");
+        n.pos(800, 40);
+        r.feed(n.m, 0.0);
+        n.pos(780, 39);
+        r.feed(n.m, 1.0);
+        assert(r.core.shown());
+        n.pos(100, 5);
+        r.feed(n.m, 2.0);
+        assert(countLog("MAIN") == 0 && hasLog("WARN type 8: 40 s, 800 m (time)"));
+    }
+    // an unnamed road and a road longer than the cluster's 40 characters: the shown turn still counts as the same one
+    // (warned once, its main prompt, kept when the seconds go up)
+    for (int k = 0; k < 2; ++k) {
+        Rig r(timeApproach());
+        Nav n;
+        const char* road = k == 0 ? "" : "AN INVENTED ROAD NAME THAT GOES ON FOR WELL OVER FORTY CHARACTERS";
+        n.step(8, road);
+        n.pos(900, 45);
+        r.feed(n.m, 0.0);
+        assert(r.core.shown() && countLog("WARN") == 1);
+        n.pos(800, 40);
+        r.feed(n.m, 1.0);
+        n.pos(400, 19);
+        r.feed(n.m, 2.0);
+        assert(countLog("WARN") == 1 && countLog("MAIN") == 1);
+        n.pos(350, 60);
+        r.feed(n.m, 3.0);
+        assert(r.core.shown() && countLog("APPROACH") == 0 && countLog("SHOW ") == 1);
+    }
+    // a shown turn whose position comes once without seconds stays (the 1 mi rule would hide it at 1.15 mi)
+    {
+        Rig r(timeApproach());
+        Nav n;
+        n.step(8, "FAST RD");
+        n.pos(1800, 48);
+        r.feed(n.m, 0.0);
+        assert(r.core.shown());
+        n.pos(1900, 0);
+        r.feed(n.m, 1.0);
+        assert(r.core.shown() && countLog("APPROACH") == 0);
+        assert(r.core.takeFallback());                               // still noted: a position without seconds
+        n.pos(1700, 45);
+        r.feed(n.m, 2.0);
+        assert(r.core.shown() && countLog("SHOW ") == 1);
+    }
+    // a shown turn's position at the turn without seconds: not a fallback (the phone sends them, just not at 0 m)
+    {
+        Rig r(timeApproach());
+        Nav n;
+        n.step(7, "AT RD");
+        n.pos(300, 15);
+        r.feed(n.m, 0.0);
+        assert(r.core.shown());
+        n.pos(0, -1);                                                // no seconds field (-1: never > 0)
+        r.feed(n.m, 1.0);
+        n.pos(40, -1);
+        r.feed(n.m, 1.5);
+        assert(r.core.shown() && !r.core.takeFallback());
+        n.pos(60, -1);                                               // further out it still counts
+        r.feed(n.m, 2.0);
+        assert(r.core.takeFallback());
+    }
+    // a route's first step before any position: not a fallback (no "no seconds" line for every route start)
+    {
+        Rig r(timeApproach());
+        Nav n;
+        n.step(8, "START RD");
+        r.feed(n.m, 0.0);
+        assert(!r.core.takeFallback());
+        n.pos(600, 30);
+        r.feed(n.m, 1.0);
+        assert(r.core.shown() && !r.core.takeFallback());
+    }
+    // no seconds from the phone: the 1 mi distance rule, and the core says so
+    {
+        Rig r(timeApproach());
+        Nav n;
+        n.step(7, "PLAIN RD");
+        n.pos(1700, 0);
+        r.feed(n.m, 0.0);
+        n.pos(1650, 0);
+        r.feed(n.m, 1.0);
+        assert(!r.core.shown() && r.core.takeFallback() && !r.core.takeFallback());
+        n.pos(1500, 0);
+        r.feed(n.m, 2.0);
+        assert(r.core.shown() && countLog("WARN") == 0);
+    }
+}
+
+// The turn is made and the next step looks the same (same type and road): drawn again as a new maneuver, judged by
+// the time rule from scratch, whichever of its body and its position comes first; a same step's body change (lanes)
+// with a little GPS noise is not a new step.
+static void testRenewedStep() {
+    for (int order = 0; order < 2; ++order) {
+        Rig r(timeApproach());
+        Nav n;
+        n.stepThen(8, "SAME RD", 8, "SAME RD");
+        n.pos(600, 30);
+        r.feed(n.m, 0.0);
+        assert(r.core.shown() && countLog("WARN") == 1);
+        n.pos(10, 1);
+        r.feed(n.m, 1.0);
+        if (order == 0) {                                            // body, its old position, then its own
+            n.stepThen(8, "SAME RD", 7, "OTHER ST");
+            r.feed(n.m, 2.0);
+            n.pos(0, 0);
+            r.feed(n.m, 2.5);
+            assert(r.core.shown() && countLog("NEW STEP") == 0);
+            n.pos(1300, 110);
+            r.feed(n.m, 3.0);
+        } else {                                                     // its position, then its body
+            n.pos(1300, 110);
+            r.feed(n.m, 2.0);
+            assert(r.core.shown() && countLog("NEW STEP") == 0);
+            n.stepThen(8, "SAME RD", 7, "OTHER ST");
+            r.feed(n.m, 3.0);
+        }
+        assert(hasLog(order == 0 ? "NEW STEP type 8: looks like the one shown, but 0 m -> 1300 m"
+                                 : "NEW STEP type 8: looks like the one shown, but 10 m -> 1300 m"));
+        if (order == 1) {                                            // its position came first: judged on the next one
+            assert(r.core.shown() && countLog("CLEAR") == 0);
+            n.pos(1250, 75);
+            r.feed(n.m, 3.5);
+        }
+        assert(!r.core.shown() && hasLog("CLEAR (approach)"));
+        n.pos(1200, 70);
+        r.feed(n.m, 4.0);
+        assert(!r.core.shown());
+        n.pos(1000, 50);
+        r.feed(n.m, 5.0);
+        assert(r.core.shown() && countLog("WARN") == 2 && countLog("SHOW ") == 2);
+        n.pos(400, 20);
+        r.feed(n.m, 6.0);
+        assert(countLog("MAIN") == 2 && countLog("NEW STEP") == 1);            // one main prompt each
+    }
+    // the same step: its body changes near the junction and the distance wobbles up a little
+    {
+        Rig r(timeApproach());
+        Nav n;
+        n.step(8, "SAME RD");
+        n.pos(500, 25);
+        r.feed(n.m, 0.0);
+        n.pos(300, 15);
+        r.feed(n.m, 1.0);
+        n.stepThen(8, "SAME RD", 7, "OTHER ST");
+        r.feed(n.m, 1.5);
+        n.pos(360, 16);
+        r.feed(n.m, 2.0);
+        assert(r.core.shown() && countLog("NEW STEP") == 0 && countLog("SHOW ") == 1 && countLog("CLEAR") == 0);
+    }
+    // no approach rule: still drawn again, as a new maneuver
+    {
+        Rig r;
+        Nav n;
+        n.step(8, "SAME RD");
+        n.pos(300, 15);
+        r.feed(n.m, 0.0);
+        n.pos(0, 0);
+        r.feed(n.m, 1.0);
+        n.stepThen(8, "SAME RD", 7, "OTHER ST");
+        n.pos(900, 60);
+        r.feed(n.m, 2.0);
+        assert(r.core.shown() && countLog("NEW STEP") == 1 && countLog("SHOW ") == 2);
+    }
+}
+
+// A DEPART at 0 m (route start, each reroute) is never drawn: the arrow shown stays through the reroute, and goes
+// after the grace time if nothing else comes.
+static void testDepart() {
+    {
+        Rig r(timeApproach());
+        Nav n;
+        n.step(1, "TOWARDS START RD");
+        n.pos(0, 0);
+        r.feed(n.m, 0.0);
+        r.feed(n.m, 0.25);
+        assert(!r.core.shown() && r.k.count() == 0 && countLog("DEPART") == 1 && hasLog("DEPART at 0 m: not shown"));
+        n.step(8, "FIRST RD");
+        n.pos(400, 20);
+        r.feed(n.m, 1.0);
+        assert(r.core.shown() && r.core.current().aa_type == 8 && countLog("SHOW ") == 1);
+        assert(!r.core.takeFallback());                              // the DEPART had no seconds: not a fallback
+        // a reroute: off, then a DEPART, then the new route's first turn
+        n.guidance(2);
+        r.feed(n.m, 2.0);
+        n.guidance(1);
+        n.step(1, "TOWARDS NEW RD");
+        n.pos(0, 0);
+        r.feed(n.m, 2.5);
+        assert(r.core.shown() && r.core.current().aa_type == 8 && countLog("SHOW ") == 1 && countLog("CLEAR") == 0);
+        assert(hasLog("DEPART at 0 m: not shown, the arrow shown stays"));
+        n.step(7, "NEW RD");
+        n.pos(300, 15);
+        r.feed(n.m, 3.0);
+        assert(r.core.shown() && r.core.current().aa_type == 7 && countLog("SHOW ") == 2);
+    }
+    // a DEPART that stays: the arrow shown goes after the grace time, counted from guidance off
+    {
+        Rig r(timeApproach());
+        Nav n;
+        n.step(8, "FIRST RD");
+        n.pos(400, 20);
+        r.feed(n.m, 0.0);
+        n.guidance(2);
+        r.feed(n.m, 1.0);
+        n.guidance(1);
+        n.step(1, "TOWARDS NEW RD");
+        n.pos(0, 0);
+        r.feed(n.m, 2.0);
+        r.feed(n.m, 8.9);
+        assert(r.core.shown());
+        r.feed(n.m, 9.1);
+        assert(!r.core.shown() && hasLog("CLEAR (depart only)"));
+    }
+    // a DEPART with a distance of its own is drawn as before
+    {
+        Rig r;
+        Nav n;
+        n.step(1, "TOWARDS START RD");
+        n.pos(200, 15);
+        r.feed(n.m, 0.0);
+        assert(r.core.shown() && countLog("DEPART") == 0);
+    }
+}
+
 int main() {
+    // "Disable logging": env wins, then the checkbox
+    assert(nbt::noLogWanted(NULL, false) == false);
+    assert(nbt::noLogWanted(NULL, true)  == true);
+    assert(nbt::noLogWanted("0", true)   == false);
+    assert(nbt::noLogWanted("1", false)  == true);
+    // nav settings: NBT_KOMBI_NAV_APPROACH / _APPROACH_MI each decide alone; the checkbox only when both are unset
+    assert(nbt::navAnyDistanceWanted(NULL, NULL, false) == false);
+    assert(nbt::navAnyDistanceWanted(NULL, NULL, true)  == true);
+    assert(nbt::navAnyDistanceWanted("distance", NULL, true) == false);   // env wins
+    assert(nbt::navAnyDistanceWanted(NULL, "2.5", true)      == false);   // ditto
+    assert(nbt::navAnyDistanceWanted("", "", true)           == true);    // empty = unset
+
+    // LD_PRELOAD is stripped for children unless the setting is explicitly turned off.
+    {
+        const char* old = getenv("NBT_CHILD_NO_PRELOAD");
+        unsetenv("NBT_CHILD_NO_PRELOAD");
+        assert(nbt::childNoPreload() == true);            // unset = on
+        setenv("NBT_CHILD_NO_PRELOAD", "", 1);
+        assert(nbt::childNoPreload() == true);            // empty = on
+        setenv("NBT_CHILD_NO_PRELOAD", "0", 1);
+        assert(nbt::childNoPreload() == false);           // explicit off
+        setenv("NBT_CHILD_NO_PRELOAD", "off", 1);
+        assert(nbt::childNoPreload() == false);
+        setenv("NBT_CHILD_NO_PRELOAD", "1", 1);
+        assert(nbt::childNoPreload() == true);
+        if (old) setenv("NBT_CHILD_NO_PRELOAD", old, 1); else unsetenv("NBT_CHILD_NO_PRELOAD");
+    }
+
+    // "Android Auto over USB" closes the wireless path: with NBT_USB set there is no Bluetooth advert and no TCP accept.
+    {
+        const char* oldUsb = getenv("NBT_USB");
+        const char* oldWl = getenv("NBT_WIRELESS");
+        unsetenv("NBT_USB");
+        unsetenv("NBT_WIRELESS");
+        assert(nbt::wirelessEnabledForTransport() == true);      // no USB: wireless as before
+        setenv("NBT_USB", "1", 1);
+        assert(nbt::wirelessEnabledForTransport() == false);     // USB selected: Wi-Fi is not offered
+        setenv("NBT_USB", "0", 1);
+        assert(nbt::wirelessEnabledForTransport() == true);
+        setenv("NBT_WIRELESS", "0", 1);
+        assert(nbt::wirelessEnabledForTransport() == false);     // NBT_WIRELESS=0 still wins
+        // every switch in nbt-aad.env parses the same way
+        assert(nbt::usbSettingOn("1", false) == true);            // NBT_SPEECH_BT=1 / 0 / unset + flag file
+        assert(nbt::usbSettingOn("0", true) == false);
+        assert(nbt::usbSettingOn(NULL, false) == false);
+        assert(nbt::usbSettingOn("1", false) == true);
+        assert(nbt::usbSettingOn("0", true) == false);           // env forces it off
+        assert(nbt::usbSettingOn(NULL, true) == true);           // flag file, no env
+        if (oldUsb) setenv("NBT_USB", oldUsb, 1); else unsetenv("NBT_USB");
+        if (oldWl) setenv("NBT_WIRELESS", oldWl, 1); else unsetenv("NBT_WIRELESS");
+    }
     // in-place (default on the car): the first maneuver is the full graph; each next maneuver is the template's own
     // maneuver-0 update block (no route-start state 1), patched; a guidance gap (reroute) gets the full graph again;
     // a gap that comes back on the same maneuver doesn't; mode 2 leaves out the 0x07 guiding model
@@ -654,7 +940,8 @@ int main() {
         KombiClient c("127.0.0.1", 9, 500);
         TestLink l(c, g);
         g_log.clear();
-        Core core(g, l.link, noApproach(), &logFn, NULL);
+        J29Display d(g, l.link);
+        Core core(d, noApproach(), &logFn, NULL);
         std::vector<Tick> drive = demoDrive(demoRoute());
         NavView v;
         assert(viewFromMessages(drive[1].m, v));
@@ -673,9 +960,10 @@ int main() {
         r.feed(one(7, "TEST ST", curPos(700, "0.4", 5)), 3.0);
         assert(r.k.count() == 97 + 97);
     }
-    // approach: a far maneuver is hidden until within the limit; distance text <= 3 characters
+    // approach by distance: a far maneuver is hidden until within the limit; distance text <= 3 characters
     {
         Settings s;
+        s.approach = kApproachDistance;
         s.approach_mi = 2.0;
         s.min_update_s = 0;
         Rig r(s);
@@ -707,6 +995,7 @@ int main() {
     // hysteresis applies to the same maneuver only
     {
         Settings s;
+        s.approach = kApproachDistance;
         s.approach_mi = 2.0;
         s.min_update_s = 0;
         Rig r(s);
@@ -723,6 +1012,7 @@ int main() {
     // unknown distance fails open (no approach hold); shown with "-" after the 3 s wait
     {
         Settings s;
+        s.approach = kApproachDistance;
         s.approach_mi = 2.0;
         Rig r(s);
         r.feed(one(7, "X", Bytes()), 0.0);
@@ -849,6 +1139,9 @@ int main() {
 #endif
     yieldThroughChild((1u << KombiNav::kWatchPosixSpawn) | (1u << KombiNav::kWatchQnxSpawn), KombiNav::kWatchPopen);
     yieldThroughChild(7u, -1);                                               // nothing starts: no yield, AA carries on
+    testTimeApproach();
+    testRenewedStep();
+    testDepart();
     printf("test_kombi_nav OK\n");
     return 0;
 }

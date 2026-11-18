@@ -20,6 +20,10 @@ LDLIBS   := -lpthread -lssl -lcrypto -lm
 # The vendored speexdsp resampler, built as C the way the daemon builds it.
 SPEEX := $(ROOT)/src/audio/speex.c
 
+# The guidance runtime with both cluster drivers (KombiNav creates either).
+SRC_KOMBI_NAV := src/cluster/j29_client.cpp src/cluster/j29_display.cpp src/cluster/nav_core.cpp \
+                 src/cluster/hud6wa_display.cpp src/cluster/hud_terminal.cpp src/most/client.cpp tests/fake_dsi_client.cpp
+
 # Each test and the daemon sources it links (beyond its own .cpp).
 SRC_test_aa_proto          := src/wireless_setup.cpp
 SRC_test_aa_sensor_msg     :=
@@ -38,20 +42,27 @@ SRC_test_pf_aa             :=
 SRC_test_bt_play           := src/audio/bt_play.cpp
 SRC_test_car_config        := src/sdr_builder.cpp
 SRC_test_car_gps           := src/car/geoid.cpp src/car/gps.cpp src/most/client.cpp tests/fake_dsi_client.cpp
+SRC_test_car_vehicle       := src/car/vehicle.cpp src/most/client.cpp tests/fake_dsi_client.cpp
 SRC_test_ccs_config        :=
 SRC_test_ccs_decoder       :=
 SRC_test_ccs_input         := src/car/ccs_input.cpp src/most/client.cpp tests/fake_dsi_client.cpp
 SRC_test_ccs_push          :=
 SRC_test_cds_parse         :=
 SRC_test_ctl_wizard        :=
+SRC_test_hud6wa            := $(SRC_KOMBI_NAV)
+SRC_test_hud_terminal      := src/cluster/hud_terminal.cpp src/most/client.cpp tests/fake_dsi_client.cpp
+SRC_test_hudterm           :=
+SRC_test_j29_golden        := $(SRC_KOMBI_NAV)
+SRC_test_frame_queue       :=
 SRC_test_input_activity    := src/car/input_activity.cpp src/car/ccs_input.cpp src/most/client.cpp tests/fake_dsi_client.cpp
 SRC_test_kombi_graph       :=
-SRC_test_kombi_nav         := src/kombi_client.cpp src/kombi_nav.cpp src/roadbook_test.cpp
-SRC_test_roadbook_models   :=
+SRC_test_kombi_nav         := $(SRC_KOMBI_NAV)
 SRC_test_kombi_nav_msg     :=
 SRC_test_lm_geometry       :=
 SRC_test_media_ack         :=
 SRC_test_media_msgs        :=
+SRC_test_media_state       :=
+SRC_test_mfl               :=
 SRC_test_mmr_launch        :=
 SRC_test_mmr_pps           :=
 SRC_test_most_client       := src/most/client.cpp tests/fake_dsi_client.cpp
@@ -60,19 +71,27 @@ SRC_test_most_reassembler  :=
 SRC_test_most_registry     :=
 SRC_test_most_router       :=
 SRC_test_most_trace        := src/most/client.cpp src/most/trace.cpp tests/fake_dsi_client.cpp
+SRC_test_nbt_paths         :=
 SRC_test_neutral_resume    :=
+SRC_test_keyframe_ask      :=
 SRC_test_pcm               := src/audio/pcm_ring.cpp src/audio/resampler.cpp $(SPEEX)
 SRC_test_resampler         := src/audio/resampler.cpp $(SPEEX)
 SRC_test_ptt               :=
+SRC_test_nav_prompt_policy :=
+SRC_test_speech_focus      := src/audio/speech_focus.cpp
+SRC_test_speech_format     :=
 SRC_test_route_policy      :=
 SRC_test_sdr               := src/sdr_builder.cpp
 SRC_test_sdr_drop          := src/sdr_builder.cpp
 SRC_test_video_geometry    := src/sdr_builder.cpp
 SRC_test_session_control   := src/aa_cryptor.cpp src/aa_session.cpp src/audio/audio_acks.cpp src/crash_handler.cpp src/sdr_builder.cpp
+SRC_test_session_fragments := src/aa_cryptor.cpp src/aa_session.cpp src/audio/audio_acks.cpp src/crash_handler.cpp src/sdr_builder.cpp
 SRC_test_session_lifecycle := src/aa_cryptor.cpp src/aa_session.cpp src/audio/audio_acks.cpp src/crash_handler.cpp src/sdr_builder.cpp
 SRC_test_session_bye       := src/aa_session.cpp src/audio/audio_acks.cpp src/crash_handler.cpp src/sdr_builder.cpp
 SRC_test_session_owner     :=
+SRC_test_spp_rereg         :=
 SRC_test_session_sensors   := src/audio/audio_acks.cpp src/crash_handler.cpp src/sdr_builder.cpp
+SRC_test_session_rx_timeout := src/audio/audio_acks.cpp src/crash_handler.cpp src/sdr_builder.cpp
 SRC_test_touch             := src/touch_probe.cpp
 SRC_test_touch_frame       :=
 SRC_test_usb_accessory     := src/tcp_server.cpp src/usb_accessory.cpp src/usb_direct.cpp src/wireless_setup.cpp
@@ -82,11 +101,14 @@ SRC_test_volume_input      := src/car/volume_input.cpp src/car/ccs_input.cpp src
 SRC_test_volume_level      :=
 SRC_test_volume            := src/audio/mixer.cpp src/audio/playout.cpp src/audio/drift.cpp src/audio/stream_rate.cpp
 SRC_test_wpp               := src/wireless_setup.cpp
+SRC_test_settings_watch    :=
+SRC_test_wfd_own           := src/wireless_setup.cpp src/gcf_client.cpp
 
 # Arguments some tests take (paths relative to milestone-7).
 ARGS_test_ccs_decoder := tests/fixtures/controls_2026-10-22_e5.txt
 ARGS_test_ccs_push    := tests/fixtures/controls_2026-10-23_push.txt
 ARGS_test_ccs_input   := tests/fixtures/controls_2026-10-23_push.txt
+ARGS_test_j29_golden  := tests/fixtures/j29_golden.txt
 
 TESTS := $(patsubst SRC_%,%,$(filter SRC_test_%,$(.VARIABLES)))
 
@@ -119,6 +141,7 @@ $(foreach t,$(TESTS),$(eval $(call TEST_RULES,$(t))))
 # This one #includes aa_session.cpp, so it is not in its SRC list, and with several sources -MF keeps only the last one's
 # dependencies: without this line, a change to the session would not rebuild it.
 $(OUT)/test_session_sensors: $(ROOT)/src/aa_session.cpp $(ROOT)/src/aa_session.hpp $(ROOT)/src/aa_sensor_msg.hpp $(ROOT)/src/aa_proto.hpp stub_cryptor.hpp
+$(OUT)/test_session_rx_timeout: $(ROOT)/src/aa_session.cpp $(ROOT)/src/aa_session.hpp $(ROOT)/src/aa_sensor_msg.hpp $(ROOT)/src/aa_proto.hpp stub_cryptor.hpp
 
 # Frames are not really encrypted in this one, so it can script the phone without a TLS handshake.
 $(OUT)/test_session_bye: CXXFLAGS += -include stub_cryptor.hpp

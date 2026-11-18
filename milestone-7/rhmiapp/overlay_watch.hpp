@@ -26,9 +26,22 @@
 //
 // Pure logic, no I/O: times are monotonic ms from the caller, unit test tests/test_overlay_watch.cpp.
 
+#include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 namespace nbt {
+
+// hmi.graphicalContext reported with widget GFXIDENTIFIER_INVALID: true = iDrive between two screens (skipped by the
+// watch), false = a real screen that just reports no widget. Untitled ones and our own states (50000+, "Android Auto")
+// are transitions; a titled iDrive screen is real: Max eDRIVE's 'eDRIVE mode' (context 1534, NBTevo_Y21272I,
+// 2026-11-09) never reported a widget, so the watch never saw it and the hold put Android Auto back over it. The other
+// eDRIVE modes reported LT_Button_1Row and worked.
+inline bool betweenScreens(int vc, const char* widget, const char* title) {
+    if (!widget || strcmp(widget, "GFXIDENTIFIER_INVALID") != 0) return false;
+    if (!title || !title[0]) return true;
+    return vc >= 50000;
+}
 
 class OverlayWatch {
 public:
@@ -161,6 +174,31 @@ private:
     bool ownSet_;
 };
 
+} // namespace nbt
+
+// Camera screens (rhmiapp-46): iDrive contexts that are a camera view. The full-screen camera reports only
+// GFXIDENTIFIER_INVALID (1023 on an F-series NBTevo_Y24073J, 2026-11-09: never a real widget, so the overlay watch
+// above skips it and the hold's OPTIONS fallback put Android Auto back over the camera within ~2 s, six times in a
+// row); 692 is the Supra's Top View (widget TopViewCamera). NBT_AA_CAMERA_CTX in nbt-aad.env replaces the list.
+// Pure (host-tested): parses "692,1023" (any separators) into out[], returns the count; NULL/empty = the default.
+namespace nbt {
+static const char* const kDefaultCameraCtx = "692,1023";
+inline int parseCameraContexts(const char* s, int* out, int max) {
+    if (!s || !*s) s = kDefaultCameraCtx;
+    int n = 0;
+    for (const char* p = s; *p && n < max;) {
+        char* e = 0;
+        long v = strtol(p, &e, 10);
+        if (e == p) { ++p; continue; }
+        if (v > 0) out[n++] = (int)v;
+        p = e;
+    }
+    return n;
+}
+inline bool isCameraContext(int vc, const int* list, int n) {
+    for (int i = 0; i < n; ++i) if (list[i] == vc) return true;
+    return false;
+}
 } // namespace nbt
 
 #endif // NBT_RHMIAPP_OVERLAY_WATCH_HPP

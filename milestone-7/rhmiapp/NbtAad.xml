@@ -17,9 +17,21 @@
       <raAction id="28"/>
       <raAction id="29"/>
       <raAction id="30"/>
+      <raAction id="167"/>
+      <raAction id="173"/>
+      <raAction id="174"/>
       <hmiAction id="25" target="12"/>
+      <hmiAction id="81" target="15"/>
       <hmiAction id="80" target="14"/>
       <raAction id="83"/>
+      <raAction id="87"/>
+      <raAction id="91"/>
+      <raAction id="120"/>
+      <raAction id="124"/>
+      <raAction id="132"/>
+      <raAction id="136"/>
+      <raAction id="137"/>
+      <raAction id="159"/>
     </actions>
     <models>
       <textIdModel id="3" textId="1">
@@ -61,6 +73,23 @@
       <textIdModel id="47" textId="21">
         <synonyms/>
       </textIdModel>
+      <raDataModel id="163" modelType="Richtext"/>
+      <raDataModel id="164" modelType="Richtext"/>
+      <textIdModel id="165" textId="45">
+        <synonyms/>
+      </textIdModel>
+      <raBoolModel id="170"/>
+      <textIdModel id="168" textId="46">
+        <synonyms/>
+      </textIdModel>
+      <raBoolModel id="175"/>
+      <raBoolModel id="177"/>
+      <textIdModel id="178" textId="48">
+        <synonyms/>
+      </textIdModel>
+      <textIdModel id="176" textId="47">
+        <synonyms/>
+      </textIdModel>
       <raBoolModel id="48"/>
       <textIdModel id="49" textId="22">
         <synonyms/>
@@ -72,6 +101,73 @@
       </textIdModel>
       <raBoolModel id="84"/>
       <textIdModel id="85" textId="24">
+        <synonyms/>
+      </textIdModel>
+      <raBoolModel id="88"/>
+      <textIdModel id="89" textId="25">
+        <synonyms/>
+      </textIdModel>
+      <raBoolModel id="92"/>
+      <textIdModel id="93" textId="26">
+        <synonyms/>
+      </textIdModel>
+      <raBoolModel id="121"/>
+      <textIdModel id="122" textId="27">
+        <synonyms/>
+      </textIdModel>
+      <raBoolModel id="125"/>
+      <textIdModel id="126" textId="28">
+        <synonyms/>
+      </textIdModel>
+      <textIdModel id="134" textId="29">
+        <synonyms/>
+      </textIdModel>
+      <textIdModel id="138" textId="30">
+        <synonyms/>
+      </textIdModel>
+      <textIdModel id="139" textId="31">
+        <synonyms/>
+      </textIdModel>
+      <!-- textIds 32-43: the PF rows' step / result texts, set at runtime. Declared (unbound) because iDrive drops the
+           whole NbtAad_ALL_Texts.zip (every label blank) when it has an ID above the highest one declared here. -->
+      <textIdModel id="143" textId="32">
+        <synonyms/>
+      </textIdModel>
+      <textIdModel id="144" textId="33">
+        <synonyms/>
+      </textIdModel>
+      <textIdModel id="145" textId="34">
+        <synonyms/>
+      </textIdModel>
+      <textIdModel id="146" textId="35">
+        <synonyms/>
+      </textIdModel>
+      <textIdModel id="147" textId="36">
+        <synonyms/>
+      </textIdModel>
+      <textIdModel id="148" textId="37">
+        <synonyms/>
+      </textIdModel>
+      <textIdModel id="149" textId="38">
+        <synonyms/>
+      </textIdModel>
+      <textIdModel id="150" textId="39">
+        <synonyms/>
+      </textIdModel>
+      <textIdModel id="151" textId="40">
+        <synonyms/>
+      </textIdModel>
+      <textIdModel id="152" textId="41">
+        <synonyms/>
+      </textIdModel>
+      <textIdModel id="153" textId="42">
+        <synonyms/>
+      </textIdModel>
+      <textIdModel id="154" textId="43">
+        <synonyms/>
+      </textIdModel>
+      <raBoolModel id="160"/>
+      <textIdModel id="161" textId="44">
         <synonyms/>
       </textIdModel>
     </models>
@@ -90,6 +186,7 @@
           <separator id="66"/>
           <button action="80" id="81" model="82" text="Settings"/>
           <button action="25" id="65" model="36" text="About"/>
+          <button action="81" id="166" model="165" text="Version"/>
         </components>
       </hmiState>
       <hmiState id="12" parentId="10" text="About" textModel="36">
@@ -148,9 +245,38 @@
           <checkbox action="26" id="67" model="38" text="Save logs to USB" textModel="39"/>
           <checkbox action="27" id="68" model="42" text="MENU key opens iDrive" textModel="43"/>
           <checkbox action="28" id="69" model="44" text="Show driving mode changes" textModel="45"/>
-          <checkbox action="29" id="72" model="46" text="Turn arrows in cluster/HUD" textModel="47"/>
+          <checkbox action="29" id="72" model="46" text="Show navigation in HUD/gauge cluster" textModel="47"/>
+          <checkbox action="167" id="169" model="170" text="Show directions at any distance" textModel="168"/>
+          <checkbox action="173" id="174" model="175" text="Disable logging (performance test)" textModel="176"/>
+          <checkbox action="174" id="180" model="177" text="Prompts on car radio (BT, beta)" textModel="178"/>
           <checkbox action="30" id="73" model="48" text="Show iDrive warnings" textModel="49"/>
           <checkbox action="83" id="86" model="84" text="Android Auto over USB (beta)" textModel="85"/>
+          <checkbox action="87" id="90" model="88" text="Use Phone GPS" textModel="89"/>
+          <checkbox action="91" id="94" model="92" text="Use WiFi Direct Network (own password)" textModel="93"/>
+          <checkbox action="120" id="123" model="121" text="Use Native Audio instead of Bluetooth" textModel="122"/>
+          <checkbox action="124" id="127" model="125" text="Media Controls for LCI Steering Wheels" textModel="126"/>
+          <checkbox action="159" id="162" model="160" text="CarPlay compatibility" textModel="161"/>
+          <separator id="142"/>
+          <button action="132" id="135" model="134" text="Install PF Rules"/>
+          <button action="136" id="140" model="138" text="Check PF Rules"/>
+          <button action="137" id="141" model="139" text="Uninstall PF Rules"/>
+        </components>
+      </hmiState>
+      <!-- Build versions, filled when the page is shown (BasicString into two Richtext labels): the daemon build
+           tag scanned out of /opt/aa/nbt-aad, and this app's compile-time version. Appended after state 14 so the
+           50000+n numbering of the existing states does not move. -->
+      <hmiState id="15" parentId="10" text="Version" textModel="165">
+        <components>
+          <label id="171" model="163" text="Android Auto:">
+            <properties>
+              <property id="2" value="false"/>
+            </properties>
+          </label>
+          <label id="172" model="164" text="RHMI app:">
+            <properties>
+              <property id="2" value="false"/>
+            </properties>
+          </label>
         </components>
       </hmiState>
     </hmiStates>

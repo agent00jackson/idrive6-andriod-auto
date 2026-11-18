@@ -62,6 +62,61 @@ static int audioType(const std::vector<uint8_t>& p, int ch) {
 
 static int audioType(const ServiceDiscovery& m, int ch) { return audioType(serializeManifest(m), ch); }
 
+// driver_position (ServiceDiscoveryResponse field 6) as it goes to the phone, -1 if absent.
+static int driverPositionOnWire(const std::vector<uint8_t>& p) {
+    size_t pos = 0;
+    while (pos < p.size()) {
+        unsigned long long k, v;
+        if (!getV(p, p.size(), pos, k) || !getV(p, p.size(), pos, v)) return -2;
+        if ((k & 7) == 0) { if ((k >> 3) == 6) return (int)v; }
+        else if ((k & 7) == 2) pos += (size_t)v;
+        else return -2;
+    }
+    return -1;
+}
+
+static void testDriverPosition() {
+    const ServiceDiscovery reference = referenceManifest(dhuIdentity());
+    CHECK(driverPositionOnWire(serializeManifest(reference)) == DRIVER_POSITION_LEFT);
+
+    // Left unless told otherwise, including by anything it doesn't understand.
+    unsetenv("NBT_DRIVER_SIDE");
+    {
+        ServiceDiscovery m = reference;
+        CHECK(!configureDriverPosition(m) && m.driverPosition == DRIVER_POSITION_LEFT);
+    }
+    const char* const kIgnored[] = { "", "RHD", "Right", "right ", "1" };
+    for (size_t i = 0; i < sizeof(kIgnored) / sizeof(kIgnored[0]); ++i) {
+        setenv("NBT_DRIVER_SIDE", kIgnored[i], 1);
+        ServiceDiscovery m = reference;
+        m.driverPosition = DRIVER_POSITION_RIGHT;
+        CHECK(configureDriverPosition(m) && m.driverPosition == DRIVER_POSITION_LEFT);
+    }
+
+    setenv("NBT_DRIVER_SIDE", "left", 1);
+    {
+        ServiceDiscovery m = reference;
+        CHECK(!configureDriverPosition(m) && driverPositionOnWire(serializeManifest(m)) == DRIVER_POSITION_LEFT);
+    }
+
+    // Right changes that one byte of the message and nothing else.
+    setenv("NBT_DRIVER_SIDE", "right", 1);
+    {
+        ServiceDiscovery m = reference;
+        CHECK(configureDriverPosition(m) && driverPositionOnWire(serializeManifest(m)) == DRIVER_POSITION_RIGHT);
+        const std::vector<uint8_t> a = serializeManifest(reference), b = serializeManifest(m);
+        CHECK(a.size() == b.size());
+        size_t diffs = 0;
+        for (size_t i = 0; i < a.size() && i < b.size(); ++i) if (a[i] != b[i]) ++diffs;
+        CHECK(diffs == 1);
+    }
+
+    // The manifest a session sends follows it.
+    CHECK(driverPositionOnWire(serializeManifest(sessionManifest(dhuIdentity()))) == DRIVER_POSITION_RIGHT);
+    unsetenv("NBT_DRIVER_SIDE");
+    CHECK(driverPositionOnWire(serializeManifest(sessionManifest(dhuIdentity()))) == DRIVER_POSITION_LEFT);
+}
+
 int main() {
     const char* toyota = "#Version: 1.10\n#Coded is: def,1280_480,touch_screen\n[General]\r\nModel=J29-NBTEvo-0319\r\n"
                          "Manufacturer=Toyota\r\n[Screen]\r\nWidth=1280\r\nHeight=480\r\nWindowName=1280\r\n";
@@ -131,6 +186,43 @@ int main() {
     c = carcfg_detail::load();
     CHECK(!c.bmw && c.screenW == 1280 && c.screenH == 480);
     CHECK(strcmp(c.vehicleFrom, "default") == 0);
+    CHECK(strcmp(c.screenFrom, "default") == 0);
+
+    // no file, but LayerManager knows the panel (issue #169: a car that never had CarPlay): the panel's size. The
+    // vehicle has no other source and stays the default.
+    setenv("NBT_DISPLAY_SIZE", "1440x540", 1);
+    c = carcfg_detail::load();
+    CHECK(c.screenW == 1440 && c.screenH == 540 && c.iniW == 0 && c.iniH == 0 && c.dispW == 1440 && c.dispH == 540);
+    CHECK(strcmp(c.screenFrom, "display size (no carplay.ini)") == 0);
+    CHECK(!c.bmw && strcmp(c.vehicleFrom, "default") == 0);
+    setenv("NBT_SCREEN", "1280x480", 1);                               // NBT_SCREEN still wins
+    c = carcfg_detail::load();
+    CHECK(c.screenW == 1280 && c.screenH == 480 && strcmp(c.screenFrom, "NBT_SCREEN") == 0);
+    unsetenv("NBT_SCREEN");
+    setenv("NBT_DISPLAY_SIZE", "0x0", 1);                              // LayerManager gave nothing usable: default
+    c = carcfg_detail::load();
+    CHECK(c.screenW == 1280 && c.screenH == 480 && strcmp(c.screenFrom, "default") == 0);
+    setenv("NBT_DISPLAY_SIZE", "100x100", 1);
+    c = carcfg_detail::load();
+    CHECK(c.screenW == 1280 && c.screenH == 480 && strcmp(c.screenFrom, "default") == 0);
+    // a carplay.ini without a [Screen] size: the same
+    writeFile("/tmp/nbt_cfg_noscreen.ini", "[General]\nManufacturer=BMW\n");
+    setenv("NBT_CARPLAY_INI", "/tmp/nbt_cfg_noscreen.ini", 1);
+    setenv("NBT_DISPLAY_SIZE", "1440x540", 1);
+    c = carcfg_detail::load();
+    CHECK(c.bmw && c.screenW == 1440 && c.screenH == 540);
+    CHECK(strcmp(c.screenFrom, "display size (carplay.ini has no screen size)") == 0);
+    // with a coded size the rule is as before: the display counts only when it is larger than the coded picture
+    setenv("NBT_CARPLAY_INI", "/tmp/nbt_cfg_bmw.ini", 1);
+    c = carcfg_detail::load();
+    CHECK(c.screenW == 1440 && c.screenH == 540 && strcmp(c.screenFrom, "carplay.ini") == 0);   // same size
+    setenv("NBT_DISPLAY_SIZE", "1280x480", 1);
+    c = carcfg_detail::load();
+    CHECK(c.screenW == 1440 && c.screenH == 540 && strcmp(c.screenFrom, "carplay.ini") == 0);   // smaller: not used
+    setenv("NBT_DISPLAY_SIZE", "1920x720", 1);
+    c = carcfg_detail::load();
+    CHECK(c.screenW == 1920 && c.screenH == 720 && c.iniW == 1440);                             // larger: the display
+    unsetenv("NBT_DISPLAY_SIZE");
 
     // Process-wide config for the rest: BMW 1440x540 from the ini
     setenv("NBT_CARPLAY_INI", "/tmp/nbt_cfg_bmw.ini", 1);
@@ -168,6 +260,8 @@ int main() {
     size_t diffs = 0;
     for (size_t i = 0; i < retyped.size(); ++i) if (retyped[i] != copy[i]) ++diffs;
     CHECK(diffs == 1);
+
+    testDriverPosition();
 
     printf(fails ? "test_car_config FAILED (%d)\n" : "test_car_config OK\n", fails);
     return fails ? 1 : 0;

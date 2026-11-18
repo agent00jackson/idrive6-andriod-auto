@@ -100,6 +100,8 @@
 #include "bluetooth_manager.hpp"
 #include "wireless_setup.hpp"
 #include "alt_wifi.hpp"
+#include "wfd_own.hpp"     // DIRECT mode: nbt-aad's own passphrase on the car's Wi-Fi Direct group
+#include "keyframe_ask.hpp"
 #include "touch_probe.hpp"
 #include "aa_keys.hpp"
 #include "car/ccs_config.hpp"
@@ -107,17 +109,21 @@
 #include "car/volume_input.hpp"
 #include "car/input_activity.hpp"
 #include "car/gps.hpp"
+#include "car/vehicle.hpp"
 #include "most/client.hpp"
 #include "most/trace.hpp"
 #include "crash_handler.hpp"
 #include "a2i_client.h"
+#include "audio/media_state.hpp"
 #include "audio/voice_scenario.hpp"
+#include "audio/focus_volume_quiet.hpp"
 #include "usb_log.hpp"
 #include "spp_rereg.hpp"
 #include "spp_link_policy.hpp"
+#include "../tools/pf_aa.hpp"
 #include "spp_direction.hpp"
 #include "neutral_resume.hpp"
-#include "kombi_nav.hpp"
+#include "cluster/nav_core.hpp"
 #include <termios.h>
 
 #include <stdio.h>
@@ -155,6 +161,7 @@ static nbt::car::CcsInput g_ccs;             // iDrive controller and voice butt
 static nbt::car::VolumeInput g_carVolume;    // the car's master volume for the overlay: a consumer of g_most
 static nbt::car::InputActivity g_carInput;   // any car control the driver touched: a consumer of g_most
 static nbt::car::CarGps g_gps;               // the car's GPS fix: a consumer of g_most
+static nbt::car::CarVehicle g_vehicle;       // the car's wheel speed, gear and parking brake: a consumer of g_most
 static nbt::most::Trace g_mostTrace;         // NBT_MOST_LOG=1: logs what g_most sees
 
 // ---- Single instance + control port (NBT_CTL=0 disables, NBT_CTL_PORT overrides 52790) -------------------
@@ -178,6 +185,7 @@ static int g_ctlFd = -1;
 //                 pressed. NBT_PDC_ACTIVE lists the active values (default 1).
 //   g_inputToPhone - touch / knob events reach the phone only while the overlay is up.
 static volatile sig_atomic_t g_userExit = 0;
+static volatile sig_atomic_t g_cpYielded = 0;   // CarPlay took the screen: Android Auto yielded completely (v1.9.48)
 static volatile sig_atomic_t g_carExit = 0;   // minimized by the BACK hold: only the iDrive entry / a new session undoes it
 // Phone focus and mic open/close used to be one slot. The main loop reads a value and then stores 0,
 // so a newer request written in between was lost. A short queue keeps both.
@@ -207,6 +215,9 @@ static bool popSlot(int* q, int* n, int* v) {
 }
 static volatile int g_gear = -1;
 static volatile int g_pdc = -1;                    // -1 = unknown (no report yet)
+// iDrive camera view (rhmiapp-46 "camera <ctx>"): the iDrive app saw a camera context (NBT_AA_CAMERA_CTX) in
+// hmi.graphicalContext - the button-opened 360 / Top View, which neither reverse nor PDCStatus reports. 0 = none.
+static volatile int g_camera = 0;
 
 // ---- driving mode (Sport / Comfort / ECO PRO ...), like reverse -------------------------------------------------
 // The iDrive app relays CDS driving.mode / driving.mode35up ('{"mode":%d}', libhmiremoting CCdsPropertyDrivingMode::
@@ -214,14 +225,13 @@ static volatile int g_pdc = -1;                    // -1 = unknown (no report ye
 // iDrive menu checkbox "Show driving mode changes" (flag file below, read on every change) a change of mode makes
 // Android Auto step aside for NBT_DRIVEMODE_SHOW_MS (default 3500) so iDrive's own driving-mode popup is visible, then
 // it comes back by itself. The first value after start is only the baseline. Not car-verified.
-static const char* const kDriveModeFlag   = "/var/opt/aa/show-drivemode";
-static const char* const kDriveModeManual = "/opt/aa/show-drivemode";
+static const char* const kDriveModeFlag   = "show-drivemode";   // nbt_paths.hpp flagSet()
 static volatile int g_driveMode = -1;              // last valid mode (-1 = none yet)
 static volatile uint32_t g_dmPeekUntil = 0;        // upMs() until which iDrive keeps the screen (0 = never set)
 static volatile uint32_t g_dmPeekFrom = 0;         // upMs() from which it does (change + NBT_DRIVEMODE_DELAY_MS)
 static volatile sig_atomic_t g_dmShown = 0;        // main loop: currently stepped aside for it
 static volatile sig_atomic_t g_mainWake = 0;       // cuts the main loop's 250 ms sleep short (driving-mode change)
-static bool showDriveModeOn() { return access(kDriveModeFlag, F_OK) == 0 || access(kDriveModeManual, F_OK) == 0; }
+static bool showDriveModeOn() { return nbt::flagSet(kDriveModeFlag); }
 static int driveModeShowMs() {
     const char* e = getenv("NBT_DRIVEMODE_SHOW_MS");
     int v = (e && *e) ? atoi(e) : 3500;
@@ -365,6 +375,7 @@ static void readGearFile() {
     if (fscanf(f, "gear %d", &g) == 1) {
         g_gear = g;
         printf("[Gear] initial gear %d (from %s)\n", g, kGearFile);
+        g_vehicle.gearFromApp(g);
     }
     fclose(f);
 }
@@ -375,8 +386,12 @@ static uint16_t ctlPort() {
     return (uint16_t)((v > 0 && v < 65536) ? v : 52790);
 }
 
+// Control port "media ..." (now-playing record or a transport key). False: nothing to reply.
+static bool mediaCtlPrepare(const char* cmd, std::string& reply);
+static void resetMedia(const char* why);   // now-playing record (defined with the media block below)
+
 static void* ctlThread(void*) {
-    char buf[32];
+    char buf[512];
     while (g_running) {
         struct sockaddr_in from;
         socklen_t flen = sizeof(from);
@@ -393,6 +408,7 @@ static void* ctlThread(void*) {
             int g = atoi(buf + 5);
             if (g != g_gear) printf("[Gear] gear %d -> %d (from iDrive app)\n", (int)g_gear, g);
             g_gear = g;
+            g_vehicle.gearFromApp(g);
         }
         else if (!strncmp(buf, "pdc ", 4)) {
             int v = atoi(buf + 4);
@@ -404,8 +420,18 @@ static void* ctlThread(void*) {
             if (v != g_dayNight) printf("[Night] day/night change-over %d -> %d (from iDrive app)\n", (int)g_dayNight, v);
             g_dayNight = v;
         }
+        else if (!strncmp(buf, "media", 5) && (buf[5] == 0 || buf[5] == ' ' || buf[5] == '\n')) {
+            std::string reply;
+            if (mediaCtlPrepare(buf + 5, reply))
+                sendto(g_ctlFd, reply.data(), reply.size(), 0, (struct sockaddr*)&from, flen);
+        }
         else if (!strncmp(buf, "drivemode ", 10)) onDriveModeMsg(buf + 10);
         else if (!strncmp(buf, "dsc ", 4)) onDscMsg(buf + 4);
+        else if (!strncmp(buf, "camera ", 7)) {
+            int v = atoi(buf + 7);
+            if (v != g_camera) printf("[Camera] iDrive camera view %d -> %d (from iDrive app)\n", (int)g_camera, v);
+            g_camera = v;
+        }
         else if (!strncmp(buf, "quit", 4)) { printf("[Ctl] [%9.3f] 'quit' received.\n", upSec()); g_running = 0; }
         else if (!strncmp(buf, "hide", 4)) { printf("[Ctl] 'hide' from the iDrive app: a hard key took iDrive elsewhere.\n"); g_hideReq = 1; }
         else printf("[Ctl] unknown request '%s' ignored.\n", buf);
@@ -460,9 +486,10 @@ static volatile int g_btLink = 0;              // wireless thread: phone's Bluet
 // sees the BACK press too and leaves the blank state, and the plugin must not put it back while the hold may still
 // minimize Android Auto (car 2026-10-28, rhmiapp-11: refocus fought the minimize).
 static const char* const kUiStateFile = "/dev/shmem/nbt-aad-state";
-// The iDrive app's "Start with the car" bootloop guard (rhmiapp-20): it records each autostart here and skips the
+// The iDrive app's "Start automatically" bootloop guard (rhmiapp-20): it records each autostart here and skips the
 // autostart after 3 within 15 min. A clean exit or 10 min of uptime clears it (persistent: survives the reset).
-static const char* const kBootGuardFile = "/var/opt/aa/bootguard";
+// <data dir>/bootguard (nbt_paths.hpp).
+static const char* const kBootGuardName = "bootguard";
 static void writeUiState(const char* state, int overlay) {
     // One fixed record, written over the previous bytes before the file is shortened. QNX /dev/shmem
     // has no rename(), and opening with O_TRUNC left a moment where the plugin read nothing and then
@@ -499,14 +526,18 @@ static nbt::VideoManager* g_video = NULL;       // for the session callbacks (va
 static nbt::AudioBackend* g_audioBackend = NULL;
 
 // Prints the Wi-Fi clients the head unit currently knows on the AP subnet (ARP table), so a log
-// shows whether the phone actually joined the CarPlay network.
+// shows whether the phone actually joined the network it was offered: the /24 of the address the daemon listens on
+// (CarPlay hotspot 172.16.224.x, Wi-Fi Direct 172.16.222.x, or NBT_AP_IP's). It used to look for 172.16.224. only and
+// so reported "none" for every Wi-Fi Direct run.
 static void logStations(const char* tag) {
+    std::string net = nbt::subnetPrefix24(nbt::wirelessListenIp());
+    if (net.empty()) net = "172.16.224.";
     FILE* p = popen("arp -an", "r");
     if (!p) return;
     char line[256];
     int n = 0;
     while (fgets(line, sizeof(line), p)) {
-        if (strstr(line, "172.16.224.")) {
+        if (strstr(line, net.c_str())) {
             size_t l = strlen(line);
             while (l && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
             printf("[Wireless] AP client (%s): %s\n", tag, line);
@@ -514,7 +545,7 @@ static void logStations(const char* tag) {
         }
     }
     pclose(p);
-    if (!n) printf("[Wireless] AP clients (%s): none in ARP table\n", tag);
+    if (!n) printf("[Wireless] AP clients (%s): none in ARP table (%sx)\n", tag, net.c_str());
 }
 
 // The head unit numbers its SPP links /dev/btspp0, 1, ... in connect order, so another Bluetooth
@@ -552,17 +583,18 @@ static void configureSppSilence() {
 
 // Who opened each link (src/spp_direction.hpp): Android Auto links are opened by the phone (a GAP ServiceRequest
 // comes first), BMW Apps links (MyBMW / BMW Connected / AAIdrive) by the car. Once this car has shown that (an Android
-// Auto reply on a phone-opened link; remembered in /var/opt/aa/spp-model), car-opened links are never read or written:
+// Auto reply on a phone-opened link; remembered in <data dir>/spp-model), car-opened links are never read or written:
 // the car's A4AHandler keeps them. NBT_SPP_DIRECTION: 0 off, 1 always, 2 learn first (BMW/MINI default; Toyota 0).
-static const char* const kSppModelFile = "/var/opt/aa/spp-model";
+static const char* const kSppModelName = "spp-model";
 static bool g_sppSeen[kSppNodes];      // node existed at the last scan
 static bool g_sppPhone[kSppNodes];     // ... and the phone opened it
 static bool g_sppCarOwned[kSppNodes];  // ... the car opened it and the rule applies: leave it alone until it is gone
 
 static void saveSppModel(int model) {
-    mkdir("/var/opt/aa", 0755);
-    FILE* f = fopen(kSppModelFile, "w");
-    if (!f) { printf("[Wireless] could not save %s: %s\n", kSppModelFile, strerror(errno)); return; }
+    nbt::makeDataDir();
+    const nbt::FilePath path = nbt::dataFile(kSppModelName);
+    FILE* f = fopen(path.c_str(), "w");
+    if (!f) { printf("[Wireless] could not save %s: %s\n", path.c_str(), strerror(errno)); return; }
     fprintf(f, "%s\n", nbt::SppDirection::modelName((nbt::SppDirection::Model)model));
     fclose(f);
 }
@@ -578,7 +610,8 @@ static void configureSppDirection() {
     const char* w = getenv("NBT_SPP_DIRECTION_WINDOW_S");
     int win = (w && *w) ? atoi(w) : 15;
     int model = nbt::SppDirection::kUnknown;
-    FILE* f = fopen(kSppModelFile, "r");
+    const nbt::FilePath path = nbt::dataFile(kSppModelName);
+    FILE* f = fopen(path.c_str(), "r");
     if (f) {
         char buf[32] = { 0 };
         if (fgets(buf, sizeof(buf), f)) model = nbt::SppDirection::parseModel(buf);
@@ -589,7 +622,7 @@ static void configureSppDirection() {
     printf("[Wireless] Bluetooth link direction check %s (NBT_SPP_DIRECTION=%d, model '%s' from %s): Android Auto links "
            "are opened by the phone; links the car opens itself are its BMW Apps link (MyBMW / BMW Connected / "
            "AAIdrive)%s\n", mode == 1 ? "on" : "learning", mode, nbt::SppDirection::modelName((nbt::SppDirection::Model)model),
-           kSppModelFile, nbt::sppDirGate() ? " and are left to the car" : "; they are left to the car once Android Auto "
+           path.c_str(), nbt::sppDirGate() ? " and are left to the car" : "; they are left to the car once Android Auto "
            "has answered on a phone-opened link");
 }
 
@@ -604,7 +637,7 @@ static void noteSppDirection(const char* path, bool spoke) {
                "(its BMW Apps link: MyBMW / BMW Connected / AAIdrive) are left to the car\n");
     else
         printf("[Wireless] Android Auto answered on a link the car opened: the direction check is switched off on this "
-               "car (delete %s to learn again)\n", kSppModelFile);
+               "car (delete %s to learn again)\n", nbt::dataFile(kSppModelName).c_str());
     saveSppModel(m);
 }
 
@@ -684,6 +717,17 @@ static bool cpLiveRetune() {
 static nbt::TcpServer* g_tcp = NULL;           // set once the listener runs (wireless recovery re-creates it)
 static nbt::UsbAccessory* g_usb = NULL;        // set while Android Auto over USB runs (NBT_USB=1)
 static const uint32_t kUsbByeWaitMs = 500;     // of the 3 s before the iDrive app sends SIGTERM after 'quit'
+// Full yield to CarPlay (v1.9.48, issue #156): when CarPlay takes the screen while an Android Auto session is still open,
+// nbt-aad ends the session and stops, instead of handing CarPlay its decoder context with CarPlay's settings. Once
+// Android Auto has run, CarPlay plays through OUR context, and CarPlay's video window was created inside our hidden
+// window group (vis 0): a black CarPlay until the head unit restarted (#156 log: "mm-renderer's video window joined our
+// group"). Stopping takes the session, the decoder context, our windows and the group with it, so CarPlay starts from
+// the state it has with no Android Auto. The Android Auto entry starts nbt-aad again.
+// Since v1.9.50-cpdetach the factory context is no longer destroyed - only detached while Android Auto has the decoder,
+// and re-attached when nbt-aad stops (VideoManager::detachFactoryContext / reattachFactoryContext).
+// v1.9.57-cpcompat: all of it only with the "CarPlay compatibility" Settings checkbox (nbt_env.hpp cpCompatEnabled());
+// NBT_CP_YIELD=1 / 0 in nbt-aad.env wins for the yield.
+static bool cpYieldEnabled() { return nbt::cpYieldOn(); }
 static nbt::BluetoothManager* g_btMgr = NULL;   // set once the AA Bluetooth service registration is under way
 
 static uint32_t monoSecs() {
@@ -712,7 +756,158 @@ static int ifaceHasIpv4(const char* ifn) {
 // Wi-Fi access point off and on again under a daemon that keeps running. Car reports 2026-10-29 (F31, Supra): after
 // that the phone takes the Wi-Fi details over Bluetooth but never connects, until Force Stop + Start, i.e. until
 // a new process runs 'pfctl -d' and opens a new listening socket. Redo both here.
+// DIRECT mode, nbt-aad's own passphrase (wfd_own.hpp): set once per daemon start through the car's connection
+// manager, and again after the car switched its Wi-Fi off and on under us (it may then run its own group again).
+static volatile bool g_wfdOwnApplied = false;   // also read by wfdWatchThread
+static volatile uint32_t g_wfdOwnAt = 0;        // when it was applied (monoSecs)
+static volatile bool g_wfdOwnLost = false;      // wfdWatchThread: the car took the group back -> set ours again
+static const int kWfdOwnMaxFailsWithFile = 3;   // NBT_WFD_OWN_PASS=1 on a car whose WFDPass.conf works: then stop
+static uint32_t g_wfdOwnTried = 0;     // last attempt (monoSecs), 0 = never
+static int g_wfdOwnFails = 0;
+static nbt::ApInfo g_wfdOwnAp;
+static std::string g_wfdOwnPath;
+static const int kWfdOwnRetrySec = 30;
+static int g_wfdMissing = nbt::WFD_MISSING_NOTHING;   // DIRECT: what the last link could not offer (logNoApConfig)
+
+static bool wfdOwnMode() {
+    return nbt::altWifiMode() == nbt::ALT_WIFI_DIRECT && nbt::wfdOwnPassMode() != nbt::WFD_OWN_NEVER;
+}
+
+// True when the group runs with our passphrase (g_wfdOwnAp). Once set it is used for the rest of the run (the car's
+// group then runs on it). Before that, NBT_WFD_OWN_PASS=auto leaves a car with a usable WFDPass.conf alone. Tries at
+// most every kWfdOwnRetrySec.
+static bool ensureWfdOwn() {
+    if (!wfdOwnMode()) return false;
+    if (g_wfdOwnLost) {
+        // Never while a session runs: the wireless thread only calls this between sessions.
+        g_wfdOwnLost = false;
+        g_wfdOwnApplied = false;
+        g_wfdOwnTried = 0;
+        printf("[WfdOwn] the car took the Wi-Fi Direct group back (see the watch line above): setting nbt-aad's "
+               "passphrase again\n");
+    }
+    if (g_wfdOwnApplied) return true;
+    bool carUsable = false;
+    {
+        nbt::ApInfo carAp;
+        std::string carPath;
+        carUsable = nbt::loadWfdAp(nbt::wfdPassPaths(), nbt::wfdPassPathCount(), carAp, carPath, true);
+        const nbt::WfdOwnPassMode om = nbt::wfdOwnPassMode();
+        static int s_logged = -1;   // once per decision, not on every 10 s check
+        const int decision = nbt::wfdOwnPassDecide(om, carUsable) ? 1 : 0;
+        if (s_logged != decision) {
+            s_logged = decision;
+            printf("[WfdOwn] NBT_WFD_OWN_PASS=%s, car's WFDPass.conf %s: %s\n", nbt::wfdOwnPassModeName(om),
+                   carUsable ? ("usable (" + carPath + ")").c_str() : "missing or unusable",
+                   decision ? "setting nbt-aad's own passphrase on the group"
+                            : "using the car's passphrase, the group is left alone");
+        }
+        if (!decision) return false;
+    }
+    if (carUsable && g_wfdOwnFails >= kWfdOwnMaxFailsWithFile) {
+        // Each try switches the car's working group off and on: with a usable file, stop after a few.
+        static bool s_capped = false;
+        if (!s_capped) {
+            s_capped = true;
+            printf("[WfdOwn] %d tries failed and the car's WFDPass.conf works: not trying again this run, the car's "
+                   "passphrase is used\n", g_wfdOwnFails);
+        }
+        return false;
+    }
+    uint32_t now = monoSecs();
+    if (g_wfdOwnTried && now - g_wfdOwnTried < (uint32_t)kWfdOwnRetrySec) return false;
+    g_wfdOwnTried = now ? now : 1;
+    nbt::ApInfo ap;
+    std::string path;
+    if (nbt::applyWfdOwnPass(ap, path)) {
+        g_wfdOwnAp = ap;
+        g_wfdOwnPath = "nbt-aad's own passphrase (" + path + ")";
+        g_wfdOwnApplied = true;
+        g_wfdOwnAt = monoSecs();
+        g_wfdOwnFails = 0;
+        printf("[WfdOwn] Wi-Fi Direct group '%s' runs with nbt-aad's passphrase: the phone is offered that\n",
+               ap.ssid.c_str());
+    } else {
+        ++g_wfdOwnFails;
+        printf("[WfdOwn] could not set nbt-aad's passphrase (try %d): %s, trying again in %d s "
+               "(NBT_WFD_OWN_PASS=0 = never)\n", g_wfdOwnFails,
+               nbt::loadWfdAp(nbt::wfdPassPaths(), nbt::wfdPassPathCount(), ap, path, true)
+                   ? "using the car's WFDPass.conf meanwhile" : "no usable WFDPass.conf either",
+               kWfdOwnRetrySec);
+    }
+    fflush(stdout);
+    return g_wfdOwnApplied;
+}
+
+// Does the car take nbt-aad's Wi-Fi Direct group back (CarPlay start, Wi-Fi off/on in the iDrive menu, its own timers)?
+// Runs beside everything else, also during a session: logs a baseline once the group is ours, then every change
+// (wfd_own.hpp wfdWatchVerdict), and a "still ours" line every 5 minutes. A change marks the group lost; the wireless
+// thread sets our passphrase again before the next phone link (never in the middle of a session).
+static void* wfdWatchThread(void*) {
+    const int every = nbt::wfdWatchSec();
+    printf("[WfdOwn] watching the Wi-Fi Direct group every %d s once nbt-aad's passphrase is set (NBT_WFD_WATCH_S, 0 = "
+           "off)\n", every);
+    nbt::WfdWatchState base;
+    bool haveBase = false;
+    uint32_t baseFor = 0, baseAt = 0, lastStill = 0;
+    bool failLogged = false;
+    unsigned tick = 0;
+    const unsigned kGcfEvery = 6;   // the connection manager every 6th check (~2 min at 20 s), pidin + stat every check
+    while (g_running) {
+        for (int i = 0; i < every && g_running; ++i) sleep(1);
+        if (!g_running) break;
+        if (!g_wfdOwnApplied) { haveBase = false; continue; }
+        const uint32_t appliedAt = g_wfdOwnAt;
+        if (monoSecs() - appliedAt < 15) continue;   // our own enable: dhcpd still settling
+        nbt::WfdWatchState st;
+        bool gcf = !haveBase || baseFor != appliedAt || (++tick % kGcfEvery) == 0;
+        if (!gcf && nbt::wfdOwnStatus(st, false) && !nbt::wfdWatchVerdict(base, st).empty())
+            gcf = true;   // something changed: ask the connection manager too, for the log line
+        if (gcf && !nbt::wfdOwnStatus(st, true)) {
+            if (!failLogged) printf("[WfdOwn] watch: the status check could not run (skipped until it does)\n");
+            failLogged = true;
+            continue;
+        }
+        failLogged = false;
+        const uint32_t now = monoSecs();
+        if (!haveBase || baseFor != appliedAt) {
+            base = st;
+            haveBase = true;
+            baseFor = appliedAt;
+            baseAt = lastStill = now;
+            printf("[WfdOwn] [%9.3f] watch: baseline: Wi-Fi Direct %s, group '%s', dhcpd on wfd0 pid %ld, %s\n", upSec(),
+                   st.on == 1 ? "on" : st.on == 0 ? "OFF" : "unknown", st.ssid.c_str(), st.dhcpdPid,
+                   st.carFile.empty() ? "no WFDPass.conf" : ("WFDPass.conf " + st.carFile).c_str());
+            fflush(stdout);
+            continue;
+        }
+        std::string why = nbt::wfdWatchVerdict(base, st);
+        if (!why.empty()) {
+            printf("[WfdOwn] [%9.3f] watch: %s, %u s after nbt-aad set its passphrase (session %s): the car may be "
+                   "running its own passphrase again%s\n", upSec(), why.c_str(), (unsigned)(now - appliedAt),
+                   g_sessionActive ? "running" : "not running",
+                   g_sessionActive ? "; ours is set again after this session" : "; ours is set again before the next link");
+            g_wfdOwnLost = true;
+            haveBase = false;
+        } else if (now - lastStill >= 300) {
+            lastStill = now;
+            printf("[WfdOwn] [%9.3f] watch: still nbt-aad's group for %u s (Wi-Fi Direct on, dhcpd pid %ld unchanged, "
+                   "session %s)\n", upSec(), (unsigned)(now - baseAt), st.dhcpdPid,
+                   g_sessionActive ? "running" : "not running");
+        }
+        fflush(stdout);
+    }
+    return NULL;
+}
+
 static void recoverWifiPath(const char* why) {
+    // The car may have started its own Wi-Fi Direct group again: set ours again at the next link. Not within 60 s of
+    // our own WFD_disable/enable, which can make wfd0 look switched off and on.
+    if (g_wfdOwnApplied && monoSecs() - g_wfdOwnAt > 60) {
+        g_wfdOwnApplied = false;
+        g_wfdOwnTried = 0;
+        printf("[WfdOwn] %s: nbt-aad's passphrase is set again before the next phone link\n", why);
+    }
     if (nbt::envFlag("NBT_KEEP_PF") != 1) {
         int rc = system("pfctl -d");
         printf("[Wireless] %s: 'pfctl -d' returned %d (%s)\n", why, rc,
@@ -727,10 +922,12 @@ static void recoverWifiPath(const char* why) {
 static const int kApCfgRecheckSec = 10;
 
 static bool apConfigPresent(const char* cfg) {
-    // NBT_ALT_WIFI=DIRECT/BOTH: the Wi-Fi Direct group counts as a usable Wi-Fi even when the car has no CarPlay
+    // DIRECT (checkbox or NBT_ALT_WIFI): the Wi-Fi Direct group counts as a usable Wi-Fi even when the car has no CarPlay
     // hotspot config at all (cars without the CarPlay licence). Quiet: this runs every kApCfgRecheckSec.
     nbt::AltWifiMode m = nbt::altWifiMode();
     if (m != nbt::ALT_WIFI_CARPLAY) {
+        // nbt-aad's own passphrase needs no WFDPass.conf at all (cars that never wrote one).
+        if (ensureWfdOwn()) return true;
         nbt::ApInfo wfd;
         std::string used;
         if (nbt::loadWfdAp(nbt::wfdPassPaths(), nbt::wfdPassPathCount(), wfd, used, true)) return true;
@@ -744,13 +941,16 @@ static bool apConfigPresent(const char* cfg) {
 }
 
 static void logNoApConfig(const char* cfg) {
-    if (nbt::altWifiMode() == nbt::ALT_WIFI_DIRECT)
-        printf("[Wireless] no usable Wi-Fi Direct passphrase (/var/opt/conn/WFDPass.conf, then "
-               "/fs/sda1/opt/conn/WFDPass.conf): NBT_ALT_WIFI=DIRECT has no CarPlay fallback, so wireless Android "
-               "Auto is unavailable, Bluetooth links are left alone; checking again every %d s\n", kApCfgRecheckSec);
-    else
+    if (nbt::altWifiMode() == nbt::ALT_WIFI_DIRECT) {
+        nbt::WfdMissing m = g_wfdMissing ? (nbt::WfdMissing)g_wfdMissing : nbt::WFD_MISSING_PASS;
+        printf("[Wireless] %s: NBT_ALT_WIFI=DIRECT has no CarPlay fallback, so wireless Android Auto is unavailable, "
+               "Bluetooth links are left alone; checking again every %d s\n",
+               nbt::wfdMissingText(m, g_wfdOwnFails > 0).c_str(), kApCfgRecheckSec);
+    } else
         printf("[Wireless] no Wi-Fi hotspot config (%s): wireless Android Auto is unavailable, Bluetooth links are "
-               "left alone; checking again every %d s\n", cfg ? cfg : "iap2.cfg / iap2_Wifi.cfg", kApCfgRecheckSec);
+               "left alone; checking again every %d s. A car without the CarPlay hotspot (no CarPlay licence) can use "
+               "its Wi-Fi Direct group: tick \"Use WiFi Direct Network\" in Settings\n",
+               cfg ? cfg : "iap2.cfg / iap2_Wifi.cfg", kApCfgRecheckSec);
 }
 
 // One Wi-Fi the phone may be offered. File-scope (not inside wirelessThread) because GCC 4.4.2 rejects a local
@@ -794,15 +994,15 @@ static void* wirelessThread(void*) {
     // NBT_ALT_WIFI: which Wi-Fi the phone is offered (see alt_wifi.hpp). CARPLAY unset = the behaviour of every
     // earlier build.
     const nbt::AltWifiMode altMode = nbt::altWifiMode();
-    printf("[Wireless] Wi-Fi source: %s (NBT_ALT_WIFI=%s): %s\n", nbt::altWifiName(altMode),
+    printf("[Wireless] Wi-Fi source: %s (%s; NBT_ALT_WIFI=%s): %s\n", nbt::altWifiName(altMode), nbt::altWifiSource(),
            getenv("NBT_ALT_WIFI") && *getenv("NBT_ALT_WIFI") ? getenv("NBT_ALT_WIFI") : "(unset)",
            altMode == nbt::ALT_WIFI_DIRECT
                ? "the car's Wi-Fi Direct group only, no CarPlay fallback"
-               : (altMode == nbt::ALT_WIFI_BOTH
-                      ? "the car's Wi-Fi Direct group first, the CarPlay hotspot after two tries without a connection"
-                      : "the CarPlay hotspot only"));
-    // Watch the interface of the source offered first (CARPLAY and BOTH: the hotspot; DIRECT: wfd0). The other one
-    // is covered by the "no IP on <if>, retry" path and by recoverWifiPath() when a BOTH try falls back.
+               : "the CarPlay hotspot only, no Wi-Fi Direct fallback");
+    if (nbt::altWifiRetiredBoth(getenv("NBT_ALT_WIFI")))
+        printf("[Wireless] NBT_ALT_WIFI=BOTH is no longer an option (v1.9.37): using the CarPlay hotspot. Tick \"Use "
+               "WiFi Direct Network\" (or NBT_ALT_WIFI=DIRECT) for the Wi-Fi Direct group\n");
+    // Watch the interface of the source offered (CARPLAY: the hotspot; DIRECT: wfd0).
     const char* pollIfn = altMode == nbt::ALT_WIFI_DIRECT ? wfdIfn : ifn;
 
     int apState = -1;           // ifn: -1 unknown, 0 no IP (access point off), 1 has an IP
@@ -811,12 +1011,18 @@ static void* wirelessThread(void*) {
     // cold start, and after the head unit slept): register the Bluetooth service again, as Restart does.
     nbt::SppReregTimer rereg;
     rereg.configure(nbt::sppReregBaseSec());
-    if (rereg.enabled())
+    if (rereg.enabled()) {
         printf("[Wireless] while no phone opens the Android Auto Bluetooth link, the Bluetooth service is registered "
                "again (like Restart does) every %d s for %d s, then every %d s (NBT_SPP_REREG_S=0 turns this off)\n",
                nbt::sppReregBaseSec(), nbt::kSppReregFastPhaseSec,
                nbt::sppReregIntervalSec(1 << 20, nbt::sppReregBaseSec()));
-    else
+        if (nbt::sppReregHoldSec() > 0)
+            printf("[Wireless] held for %d s after each SPP request from the phone (it retries by itself), with one "
+                   "re-registration per %d s of continuous hold (NBT_SPP_REREG_HOLD_S=0 = no hold)\n",
+                   nbt::sppReregHoldSec(), nbt::kSppHoldCapSec);
+        else
+            printf("[Wireless] no hold while the phone asks (NBT_SPP_REREG_HOLD_S=0)\n");
+    } else
         printf("[Wireless] automatic Bluetooth service re-registration off (NBT_SPP_REREG_S=0)\n");
     bool idleWait = false;      // waiting for a link; the re-registration timer runs from when this started
     uint32_t idleStart = 0;
@@ -877,7 +1083,33 @@ static void* wirelessThread(void*) {
                 printf("[Wireless] [%9.3f] waiting for %s (%s)\n", upSec(), dev, strerror(errno));
             uint32_t now = monoSecs();
             if (!idleWait) { idleWait = true; idleStart = now; rereg.reset(now); }
-            else if (g_btMgr && rereg.due(now)) {
+            else if (g_btMgr && rereg.enabled()) {
+                // Held while the phone asks for the link: checked BEFORE due(), so held time does not use up the
+                // 5 s steps of the schedule (the next round after the hold is still a short one).
+                unsigned ago = 0;
+                static uint32_t heldSince = 0;   // start of the current continuous hold (0 = not holding)
+                bool capRound = false;
+                if (nbt::sppPhoneAsking(&ago)) {
+                    if (!heldSince) heldSince = now ? now : 1;
+                    if (!nbt::sppHoldCapDue(heldSince, now)) {
+                        static unsigned held = 0;
+                        static uint32_t lastNote = 0;
+                        if (held++ == 0 || now - lastNote >= 30) {
+                            lastNote = now;
+                            printf("[Wireless] [%9.3f] the phone asked for the Android Auto Bluetooth link %u s ago: not "
+                                   "re-registering the service under it (it retries by itself)\n", upSec(), ago);
+                        }
+                        usleep(500000);
+                        continue;
+                    }
+                    heldSince = now ? now : 1;   // the next capped round after another kSppHoldCapSec
+                    capRound = true;
+                    printf("[Wireless] [%9.3f] held for %d s while the phone keeps asking: one re-registration anyway\n",
+                           upSec(), nbt::kSppHoldCapSec);
+                } else {
+                    heldSince = 0;
+                }
+                if (!capRound && !rereg.due(now)) { usleep(500000); continue; }
                 char why[96];
                 snprintf(why, sizeof(why), "no Android Auto Bluetooth link for %u s (try %d)",
                          (unsigned)(now - idleStart), rereg.attempts());
@@ -891,19 +1123,36 @@ static void* wirelessThread(void*) {
         }
         idleWait = false;
         // Which Wi-Fi this link is offered (NBT_ALT_WIFI, alt_wifi.hpp):
-        //   CARPLAY  the car's hotspot from iap2.cfg, unchanged
-        //   DIRECT   the car's Wi-Fi Direct group only, no fallback
-        //   BOTH     the hotspot first (the car-verified path), the DIRECT group after two tries without a
-        //            connection; cars that have no CarPlay config have no hotspot at all, so BOTH is DIRECT there
+        //   CARPLAY  the car's hotspot from iap2.cfg (iap2_Wifi.cfg as a second passphrase), no DIRECT fallback
+        //   DIRECT   the car's Wi-Fi Direct group only, no hotspot fallback
         std::vector<ApChoice> directChoices;   // the Wi-Fi Direct group (wfd0)
         std::vector<ApChoice> cpChoices;       // the CarPlay hotspot (iap2.cfg / iap2_Wifi.cfg)
         if (altMode != nbt::ALT_WIFI_CARPLAY) {
             nbt::ApInfo wfd;
             std::string used;
+            // DIRECT: nbt-aad's own passphrase first (wfd_own.hpp); the car's WFDPass.conf only when that failed.
+            bool ownUsed = altMode == nbt::ALT_WIFI_DIRECT && ensureWfdOwn();
+            if (ownUsed) {
+                ApChoice c;
+                c.ap = g_wfdOwnAp;
+                c.path = g_wfdOwnPath;
+                c.ifn = wfdIfn;
+                c.direct = true;
+                directChoices.push_back(c);
+            }
             // Quiet here: logWfdAp() prints the passphrase once per value, not on every link attempt.
-            bool havePass = nbt::loadWfdAp(nbt::wfdPassPaths(), nbt::wfdPassPathCount(), wfd, used, true);
-            std::string wfdSsid;
-            if (havePass && nbt::resolveWfdSsid(wfdIfn, wfdSsid)) {
+            bool havePass = !ownUsed && nbt::loadWfdAp(nbt::wfdPassPaths(), nbt::wfdPassPathCount(), wfd, used, true);
+            std::string wfdSsid, ladderSsid, cmSsid, ssidFrom;
+            bool haveSsid = false;
+            if (!ownUsed && havePass) {
+                const bool ladderOk = nbt::resolveWfdSsid(wfdIfn, ladderSsid);
+                if (!ladderOk) nbt::wfdSsidFromConnMngr(cmSsid);
+                haveSsid = nbt::wfdPickSsid(ladderOk, ladderSsid, cmSsid, wfdSsid, ssidFrom);
+            }
+            g_wfdMissing = ownUsed ? nbt::WFD_MISSING_NOTHING : nbt::wfdMissing(havePass, havePass && haveSsid);
+            if (ownUsed) {
+                // the group is in directChoices already
+            } else if (havePass && haveSsid) {
                 wfd.ssid = wfdSsid;
                 ApChoice c;
                 c.ap = wfd;
@@ -912,8 +1161,8 @@ static void* wirelessThread(void*) {
                 c.direct = true;
                 directChoices.push_back(c);
             } else if (havePass) {
-                printf("[Wireless] Wi-Fi Direct: no SSID for %s, skipping the DIRECT group on this link (NBT_WFD_SSID "
-                       "pins one)\n", wfdIfn);
+                printf("[Wireless] Wi-Fi Direct: no SSID for %s (head unit and the car's connection manager), skipping "
+                       "the DIRECT group on this link (NBT_WFD_SSID pins one)\n", wfdIfn);
             } else {
                 printf("[Wireless] Wi-Fi Direct: no usable passphrase file (%s), skipping the DIRECT group on this "
                        "link\n", nbt::wfdPassPaths()[0]);
@@ -958,14 +1207,8 @@ static void* wirelessThread(void*) {
                 }
             }
         }
-        // Order: CARPLAY and BOTH put the car's hotspot first, so a car that has CarPlay keeps the path that is
-        // verified there; the DIRECT group is only reached when there is no hotspot config, or BOTH falls back to
-        // it after two tries the phone took but never connected with (apNoJoin below).
-        const bool cpFirst = nbt::altWifiPrefersCarplay();
-        std::vector<ApChoice>& vFirst = cpFirst ? cpChoices : directChoices;
-        std::vector<ApChoice>& vSecond = cpFirst ? directChoices : cpChoices;
-        std::vector<ApChoice> choices = vFirst;
-        if (altMode == nbt::ALT_WIFI_BOTH) choices.insert(choices.end(), vSecond.begin(), vSecond.end());
+        // One source per run: the hotspot candidates (CARPLAY) or the DIRECT group (DIRECT), never the other.
+        std::vector<ApChoice> choices = nbt::altWifiPrefersCarplay() ? cpChoices : directChoices;
         if (choices.empty()) {
             close(fd);
             logNoApConfig(cfg);
@@ -1128,7 +1371,8 @@ static void onMicData(const uint8_t* pcm_data, size_t size, void* user_data) {
     nbt::micLevelMeter(pcm_data, size);
 }
 
-static void onVideoFrame(uint32_t frame_index, const uint8_t* nal_data, size_t nal_len, uint64_t pts, void* user_data) {
+static void onVideoFrame(uint32_t frame_index, std::vector<uint8_t>& frame_data, size_t data_offset,
+                         size_t nal_len, uint64_t pts, void* user_data) {
     // [VideoRate] (PR #66): phone video frames counted at the AA callback boundary, before queueing; one average every
     // five seconds, next to what the phone was asked for (NBT_VID_FPS, default 30) and the decoder rate.
     struct VideoRateProbe {
@@ -1158,7 +1402,7 @@ static void onVideoFrame(uint32_t frame_index, const uint8_t* nal_data, size_t n
     nbt::VideoManager* video = reinterpret_cast<nbt::VideoManager*>(user_data);
     if (video) {
         // Feed raw H.264 slice straight into the car's hardware video decoder (/dev/name/local/mdev)
-        video->postVideoFrame(nal_data, nal_len, pts);
+        video->postVideoFrame(frame_data, data_offset, nal_len, pts);
         video->onVideoFrameReceived(frame_index, nal_len);
     }
 }
@@ -1217,6 +1461,7 @@ static void onSessionEnded(void* user_data) {
     // Browser: mixer stopped, source released. Bluetooth: queued audioconn requests dropped, NBT_BT_RELEASE.
     if (g_audioBackend) g_audioBackend->onSessionEnded();
     g_kombiNav.onSessionEnded();   // the worker clears a cluster/HUD arrow
+    resetMedia("session ended");   // the iDrive app must not show the last track of a session that is over
 }
 
 // UsbAccessory: no new USB session (and no accessory switch) while a phone is already connected, and a USB bridge
@@ -1230,6 +1475,15 @@ static nbt::Transport sessionOwner(void*) {
 static void startSession(int client_fd, nbt::TcpServer* server, nbt::Transport t) {
     pthread_mutex_lock(&g_connectMutex);
     nbt::Transport cur = g_owner.get();
+    // "Android Auto over USB" closes the wireless path: the Bluetooth advert is off and this refuses the TCP
+    // connection, so a phone that was paired for Wi-Fi cannot take the session instead of the cable.
+    if (t == nbt::kTransportTcp && nbt::usbEnabled()) {
+        printf("[Main] [%9.3f] refusing the wireless connection on fd %d: Android Auto over USB is selected "
+               "(untick it to use Wi-Fi)\n", upSec(), client_fd);
+        close(client_fd);
+        pthread_mutex_unlock(&g_connectMutex);
+        return;
+    }
     if (!nbt::mayStart(cur, t)) {
         printf("[Main] [%9.3f] %s Android Auto session running: refusing the %s connection on fd %d\n", upSec(),
                nbt::transportName(cur), nbt::transportName(t), client_fd);
@@ -1245,6 +1499,7 @@ static void startSession(int client_fd, nbt::TcpServer* server, nbt::Transport t
     printf("[Main] [%9.3f] Android Auto client connected over %s on fd %d. Initializing aasdk session...\n",
            g_sessionStartS, nbt::transportName(t), client_fd);
     g_sessionActive = true;
+    resetMedia("new session");
     if (server) server->markSessionActive();
     if (g_video && nbt::VideoManager::cpHandoff()) g_video->prepareForSession();   // decoder ready before frames
     if (!g_session.start(client_fd)) {
@@ -1374,12 +1629,27 @@ static void onCarInput(const char* what, void*) {
 // the overlay. This is the value the amplifier actually applied, so the pill always matches what the driver hears.
 // From g_carVolume on the DSI callback thread.
 static void onCarVolume(int level, int max, void*) {
+    const int pct = nbt::car::VolumeLevel::percent(level, max);
+    struct timespec ts;   // 64-bit ms, same base as SpeechOut (monoMs() wraps at 32 bit)
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const uint64_t now = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    if (nbt::focusVolumeQuiet().quiet(now)) {   // level change caused by the nav prompt focus, not the driver
+        printf("[Volume] %d%% (nav prompt focus, pill not shown)\n", pct);
+        return;
+    }
     g_carInputMs = monoMs() | 1u;   // iDrive draws its own volume bar: that is the driver, not the car
-    volumeApply(nbt::car::VolumeLevel::percent(level, max), false);
+    volumeApply(pct, false);
 }
 
 static uint32_t g_idrWaitMs = 0;   // decoder rebuilt on the way back: waiting for the phone's keyframe since
 static unsigned g_idrAsks = 0;
+// A dropped video frame: ask the phone for a keyframe (keyframe_ask.hpp). On unless NBT_DROP_IDR=0.
+static nbt::KeyframeAsk g_keyframeAsk;   // main loop only
+static bool dropIdrEnabled() {
+    static int s = -1;
+    if (s < 0) s = nbt::envFlag("NBT_DROP_IDR") != 0 ? 1 : 0;
+    return s == 1;
+}
 // Take the pill's surface out of the Android Auto layer's order first, then remove its window: the order never names a
 // surface whose window is gone.
 static void volOsdDown(nbt::VideoManager& vm) {
@@ -1439,6 +1709,112 @@ static uint32_t monoMs() {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint32_t)ts.tv_sec * 1000u + (uint32_t)(ts.tv_nsec / 1000000);
 }
+// ---- now playing (audio/media_state.hpp) -----------------------------------------------------------------------
+// The phone's media playback channel (12) carries 0x8001 status about once a second and 0x8003 metadata per track. The
+// merge lives in media_state.hpp; here it is published for the iDrive app as /dev/shmem/nbt-aad-media (a line record,
+// written in place like the menu-entry state) and served on the control port:
+//   "media"               -> the record, as a UDP reply (the app polls this while its Now Playing page is up)
+//   "media next" / "prev" / "playpause" / "play" / "pause" -> the Android media key to the phone (input channel 7)
+// The keys also come from the steering wheel (car/mfl.hpp, NBT_MFL_*). Both are only forwarded when the audio mode is not
+// Bluetooth, where the phone already plays over A2DP and the car's own AVRCP handling owns those keys.
+static const char* const kMediaFile = "/dev/shmem/nbt-aad-media";
+static nbt::MediaState g_media;
+static pthread_mutex_t g_mediaMutex = PTHREAD_MUTEX_INITIALIZER;
+static bool g_mediaKeysToPhone = false;   // set at start-up from the audio mode
+static bool g_wheelMediaKeys = false;     // "Media Controls for LCI Steering Wheels" (nbt_env.hpp lciMediaKeysEnabled())
+static uint32_t g_mediaWriteMs = 0;       // monoMs() of the last record write
+
+// Caller holds g_mediaMutex. One fixed record written over the old bytes before the file is shortened (QNX /dev/shmem
+// has no rename, and the app must never read a half-written line).
+static void writeMediaRecordLocked() {
+    const std::string rec = nbt::mediaRecord(g_media);
+    int fd = open(kMediaFile, O_WRONLY | O_CREAT, 0666);
+    static bool s_warned = false;
+    if (fd < 0) {
+        if (!s_warned) { printf("[Media] cannot write %s: %s\n", kMediaFile, strerror(errno)); s_warned = true; }
+        return;
+    }
+    fchmod(fd, 0666);
+    ssize_t w = write(fd, rec.data(), rec.size());
+    if (w == (ssize_t)rec.size()) ftruncate(fd, (off_t)rec.size());
+    else if (!s_warned) { printf("[Media] short write to %s\n", kMediaFile); s_warned = true; }
+    close(fd);
+}
+
+static void resetMedia(const char* why) {
+    pthread_mutex_lock(&g_mediaMutex);
+    g_media.clear();
+    writeMediaRecordLocked();
+    pthread_mutex_unlock(&g_mediaMutex);
+    printf("[Media] cleared (%s)\n", why);
+}
+
+// Session thread, never blocks: merge, log a change, rewrite the record (at most 5 times a second).
+static void onMediaStatus(uint16_t msg_id, const uint8_t* body, size_t len, void* user_data) {
+    (void)user_data;
+    pthread_mutex_lock(&g_mediaMutex);
+    const bool changed = nbt::mediaMerge(g_media, msg_id, body, len);
+    const uint32_t now = monoMs();
+    g_media.updatedMs = now;
+    if (changed) {
+        printf("[Media] %s\n", nbt::mediaLine(g_media).c_str());
+        if (g_mediaWriteMs == 0 || (uint32_t)(now - g_mediaWriteMs) >= 200) {
+            g_mediaWriteMs = now;
+            writeMediaRecordLocked();
+        }
+    }
+    pthread_mutex_unlock(&g_mediaMutex);
+}
+
+// One press: a media key acts on the down edge, and the phone expects the release too.
+static void sendMediaKey(uint32_t key, const char* what) {
+    if (!g_mediaKeysToPhone) { printf("[Media] %s ignored: audio mode is Bluetooth\n", what); return; }
+    if (!g_sessionActive) { printf("[Media] %s ignored: no Android Auto session\n", what); return; }
+    printf("[Media] %s -> AA key %u\n", what, key);
+    g_session.postKeyEvent(key, true);
+    g_session.postKeyEvent(key, false);
+}
+
+static bool mediaCtlPrepare(const char* cmd, std::string& reply) {
+    while (*cmd == ' ' || *cmd == '\n' || *cmd == '\r') ++cmd;
+    char word[16];
+    size_t n = 0;
+    while (cmd[n] && cmd[n] != ' ' && cmd[n] != '\n' && cmd[n] != '\r' && n + 1 < sizeof(word)) { word[n] = cmd[n]; ++n; }
+    word[n] = 0;
+    if (!word[0]) {                                   // bare "media": the record as it stands (the app's poll)
+        pthread_mutex_lock(&g_mediaMutex);
+        reply = nbt::mediaRecord(g_media);
+        pthread_mutex_unlock(&g_mediaMutex);
+        return true;
+    }
+    if (!strcmp(word, "next")) sendMediaKey(nbt::AAK_MEDIA_NEXT, "next");
+    else if (!strcmp(word, "prev")) sendMediaKey(nbt::AAK_MEDIA_PREVIOUS, "prev");
+    else if (!strcmp(word, "playpause")) sendMediaKey(nbt::AAK_MEDIA_PLAY_PAUSE, "play/pause");
+    else if (!strcmp(word, "play")) sendMediaKey(nbt::AAK_MEDIA_PLAY, "play");
+    else if (!strcmp(word, "pause")) sendMediaKey(nbt::AAK_MEDIA_PAUSE, "pause");
+    else printf("[Media] unknown command '%s'\n", word);
+    return false;
+}
+
+// Shell test path: `echo next > /dev/shmem/nbt-aad-media.cmd` (the daemon removes the file). Same words as the control
+// port, so the media keys can be tried from the unit's shell without the iDrive app or a mapped steering wheel.
+static void* mediaMailThread(void*) {
+    const char* path = "/dev/shmem/nbt-aad-media.cmd";
+    while (g_running) {
+        if (access(path, F_OK) == 0) {
+            char cmd[64] = "";
+            FILE* f = fopen(path, "r");
+            if (f) { if (!fgets(cmd, sizeof(cmd), f)) cmd[0] = 0; fclose(f); }
+            unlink(path);
+            printf("[Media] command from %s: '%s'\n", path, cmd);
+            std::string reply;
+            mediaCtlPrepare(cmd, reply);
+        }
+        usleep(250000);
+    }
+    return NULL;
+}
+
 static uint32_t backHoldMs() {
     static int v = -1;
     if (v < 0) {
@@ -1455,10 +1831,9 @@ static uint32_t backHoldMs() {
 // (overlay 3 for 3 s) and the iDrive app puts iDrive straight back on the blank state instead of treating it as a hard
 // key. "MENU key opens iDrive" (iDrive menu checkbox, flag file below): MENU is not sent to the phone and Android Auto
 // minimizes at once, like MENU leaving native CarPlay.
-static const char* const kMenuIdriveFlag   = "/var/opt/aa/menu-idrive";
-static const char* const kMenuIdriveManual = "/opt/aa/menu-idrive";
+static const char* const kMenuIdriveFlag   = "menu-idrive";   // nbt_paths.hpp flagSet()
 static volatile uint32_t g_keyToPhoneMs = 0;   // monoMs() of the last MENU / COM / MEDIA / NAV / MAP press sent to the phone
-static bool menuOpensIdrive() { return access(kMenuIdriveFlag, F_OK) == 0 || access(kMenuIdriveManual, F_OK) == 0; }
+static bool menuOpensIdrive() { return nbt::flagSet(kMenuIdriveFlag); }
 
 // The car's GPS fix (DSI callback thread, about 1 Hz) -> AA LOCATION sensor. Kept between sessions, age-checked at sending.
 static void onCarLocation(const nbt::LocationFix& fix, void* user) {
@@ -1468,6 +1843,26 @@ static void onCarLocation(const nbt::LocationFix& fix, void* user) {
 // The car's satellite count (DSI callback thread) -> AA GPS_SATELLITE sensor. The session sends it on its own timer.
 static void onCarSatellites(const nbt::SatelliteStatus& status, void* user) {
     static_cast<nbt::AASession*>(user)->postCarSatellites(status);
+}
+
+// The car's heading (DSI callback thread, about 1 Hz) -> AA COMPASS sensor. Kept between sessions.
+static void onCarCompass(int32_t bearing_e6, void* user) {
+    static_cast<nbt::AASession*>(user)->postCarCompass(bearing_e6);
+}
+
+// The car's wheel speed (DSI callback thread, about 2 Hz while moving) -> AA CAR_SPEED sensor.
+static void onCarSpeed(const nbt::CarSpeedSample& speed, void* user) {
+    static_cast<nbt::AASession*>(user)->postCarSpeed(speed);
+}
+
+// The car's gear when it changes (DSI callback thread, or the control thread from the iDrive app) -> AA GEAR sensor.
+static void onCarGear(int aaGear, void* user) {
+    static_cast<nbt::AASession*>(user)->postCarGear(aaGear);
+}
+
+// The car's parking brake when it changes (DSI callback thread) -> AA PARKING_BRAKE sensor.
+static void onCarParkingBrake(bool on, void* user) {
+    static_cast<nbt::AASession*>(user)->postCarParkingBrake(on);
 }
 
 static void onKnobEvent(const nbt::car::CcsEvent& ev, void* user) {
@@ -1489,6 +1884,15 @@ static void onKnobEvent(const nbt::car::CcsEvent& ev, void* user) {
             s->postKeyEvent(ev.keycode, false);
         }
         return;                                   // st == 2: the hold already minimized AA, swallow the release
+    }
+    if (ev.what && (!strcmp(ev.what, "MFL_NEXT") || !strcmp(ev.what, "MFL_PREV") ||
+                    !strcmp(ev.what, "MFL_PLAYPAUSE"))) {   // steering-wheel media keys (car/mfl.hpp)
+        if (!g_wheelMediaKeys) {
+            if (ev.down) printf("[Media] %s ignored: Media Controls for LCI Steering Wheels is off\n", ev.what);
+            return;
+        }
+        if (ev.down) sendMediaKey(ev.keycode, ev.what);
+        return;   // iDrive's copy of the key is its own business: nothing here acts on it in a non-Bluetooth mode
     }
     if (ev.what && !strcmp(ev.what, "PTT")) {     // steering-wheel voice button (NBT_PTT_ASSISTANT=1), any screen
         printf("[PTT] Assistant key %s -> phone\n", ev.down ? "down" : "up");
@@ -1542,12 +1946,15 @@ static void onKnobEvent(const nbt::car::CcsEvent& ev, void* user) {
     }
 }
 
-#define NBT_AAD_BUILD "v1.9.33-usbset"
+#define NBT_AAD_BUILD "v1.9.94-wfdssid"
 
+// Marker the RHMI app scans for (scanFileFor) to show the daemon version without spawning it:
+// keep the prefix exact.
+extern "C" __attribute__((used)) const char kNbtAadVersionTag[] = "NBT-AAD-VERSION=" NBT_AAD_BUILD;
 // ---- log destination ------------------------------------------------------------------------------------------
 // Default: no USB file; stdout (which the iDrive app sends to /dev/null) goes to the RAM log /dev/shmem/nbt-aad.log
 // (5 MB cap, see stdoutToRamOrNull); from a shell it stays on the terminal / the user's redirect. NBT_LOG_FILE=<path> forces a file. The iDrive app's "Save logs to USB" checkbox (flag
-// /var/opt/aa/usblog, usb_log.hpp) makes us append to <stick>/nbt-aad.log on the first writable /mnt/umass* stick;
+// usblog in the data dir, usb_log.hpp) makes us append to <stick>/nbt-aad.log on the first writable /mnt/umass* stick;
 // checked at start and every 5 s, so a stick plugged in later is picked up and a removed one is let go.
 static bool g_logForced = false;
 static char g_usbLogPath[192] = "";
@@ -1561,7 +1968,8 @@ static bool g_ramLog = false;      // stdout is the RAM log now
 static bool g_ramUsed = false;     // the RAM log was opened this run (later opens append)
 static bool g_ramFull = false;     // cap reached: no more RAM logging this run
 
-static bool ramLogWanted() { return nbt::envFlag("NBT_RAM_LOG") != 0 && !g_ramFull; }
+static bool g_noLog = false;   // "Disable logging (performance test)": every sink off, stdout to /dev/null
+static bool ramLogWanted() { return !g_noLog && nbt::envFlag("NBT_RAM_LOG") != 0 && !g_ramFull; }
 
 static bool stdoutIsNull() {
     struct stat a, b;
@@ -1607,7 +2015,7 @@ static void printHuVersion() {
 
 static void serviceUsbLog(bool atStart) {
     if (g_logForced) return;
-    const bool on = nbt::usblog::enabled();
+    const bool on = !g_noLog && nbt::usblog::enabled();
     if (g_usbLogPath[0]) {
         char dir[192];
         snprintf(dir, sizeof(dir), "%s", g_usbLogPath);
@@ -1641,6 +2049,47 @@ static void serviceUsbLog(bool atStart) {
 }
 
 int main(int argc, char* argv[]) {
+    // Hand install or NBTApps package (nbt_paths.hpp): from where we were started, before anything reads a setting.
+    nbt::initPaths(argc > 0 ? argv[0] : NULL);
+    // "Disable logging (performance test)": set before the log redirection below, so the printf traces too cost
+    // only a write to /dev/null. Not on the one-shot --pf-* / --license paths: the app reads their output.
+    if (argc <= 1) {
+        g_noLog = nbt::noLogWanted(getenv("NBT_NO_LOG"), nbt::flagSet(nbt::kNoLogFlagName));
+        if (g_noLog) stdoutToNull();
+    }
+    // pf_aa built in (src/pf_aa_embed.cpp): nbt-aad --pf-install | --pf-check | --pf-uninstall [--pf/--env/--backup f].
+    // Before any of the daemon's start-up (log redirection, control port), so it never starts a second daemon.
+    if (argc > 1 && !strncmp(argv[1], "--pf-", 5)) {
+        static char mode[32];
+        snprintf(mode, sizeof(mode), "--%s", argv[1] + 5);
+        // nbt-aad.env and pf.bak live in the conf dir (nbt_paths.hpp): handed to pf_aa ahead of the caller's own
+        // options, so a --env / --backup given here still wins (pf_aa takes the last one). On a hand install they are
+        // pf_aa's own defaults, /opt/aa/nbt-aad.env and /opt/aa/pf.bak.
+        static char envPath[160], bakPath[160];
+        snprintf(envPath, sizeof(envPath), "%s", nbt::confFile(nbt::kDaemonEnvName).c_str());
+        snprintf(bakPath, sizeof(bakPath), "%s", nbt::confFile(nbt::kPfBackupName).c_str());
+        if (nbt::packaged()) nbt::makeDataDir();      // the conf dir is the data dir there
+        static char optEnv[] = "--env", optBak[] = "--backup";
+        char* pfArgv[64];
+        int pfArgc = 0;
+        pfArgv[pfArgc++] = argv[0];
+        pfArgv[pfArgc++] = mode;
+        pfArgv[pfArgc++] = optEnv;
+        pfArgv[pfArgc++] = envPath;
+        pfArgv[pfArgc++] = optBak;
+        pfArgv[pfArgc++] = bakPath;
+        for (int i = 2; i < argc && pfArgc < 63; ++i) pfArgv[pfArgc++] = argv[i];
+        pfArgv[pfArgc] = NULL;
+        int rc = nbt::pfaa::run(pfArgc, pfArgv);
+        // Last line for the iDrive app: it cannot wait for us (the HMI ignores SIGCHLD), so it reads the result here.
+        printf("pf_aa-exit: %d\n", rc);
+        fflush(stdout);
+        return rc;
+    }
+    // One-shot child of DIRECT mode (wfd_own.cpp): sets nbt-aad's passphrase on the car's Wi-Fi Direct group through
+    // the car's connection manager. Started by the daemon with LD_LIBRARY_PATH=/opt/conn/lib; prints its own result.
+    if (argc > 1 && !strcmp(argv[1], "--wfd-own")) return nbt::runWfdOwnCommand(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "--wfd-own-status")) return nbt::runWfdStatusCommand();
     if (argc > 1 && (!strcmp(argv[1], "--license") || !strcmp(argv[1], "--licence"))) {
         nbt::printNbtAadLicense();
         return 0;
@@ -1659,6 +2108,8 @@ int main(int argc, char* argv[]) {
     printf("  OS: QNX Neutrino RTOS (ARMv7LE)                   \n");
     printf("  Build: " NBT_AAD_BUILD " (%s %s)\n", __DATE__, __TIME__);
     printHuVersion();
+    printf("  Files: %s (app %s, settings %s, nbt-aad.env %s)\n", nbt::installName(), nbt::appDir(), nbt::dataDir(),
+           nbt::confDir());
     if (g_ramLog) printf("  Log: RAM %s (fresh per run, 5 MB cap; NBT_RAM_LOG=0 = off)\n", nbt::ramlog::kDaemonPath);
     nbt::printNbtAadBannerNotice();
     printf("====================================================\n");
@@ -1669,14 +2120,15 @@ int main(int argc, char* argv[]) {
     // Child processes (audioconn, LayerManagerControl, pfctl, arp, ifconfig) inherit our environment, which comes from
     // the HMI. The bootloop log showed `ldd:FATAL: Could not preload library libEGL_X.gpp.so` from audioconn and
     // every LayerManagerControl run prints `unknown symbol: kdMain referenced from libKD.so.1`, i.e. each child loads
-    // the graphics stack it does not use. NBT_CHILD_NO_PRELOAD=1 (experiment, not car-verified) removes LD_PRELOAD
-    // for all children; the daemon itself is already loaded and keeps its libraries.
+    // the graphics stack it does not use. LD_PRELOAD is removed for all children by default since v1.9.69
+    // (nbt_env.hpp childNoPreload); NBT_CHILD_NO_PRELOAD=0 keeps it. The daemon itself is already loaded and keeps
+    // its libraries either way.
     {
         const char* pre = getenv("LD_PRELOAD");
-        const char* np = getenv("NBT_CHILD_NO_PRELOAD");
-        bool strip = np && np[0] == '1';
+        const bool strip = nbt::childNoPreload();
         printf("[Main] LD_PRELOAD=%s%s\n", pre ? pre : "(unset)",
-               pre && strip ? " -> removed for child processes (NBT_CHILD_NO_PRELOAD=1)" : "");
+               !pre ? "" : strip ? " -> removed for child processes (default; NBT_CHILD_NO_PRELOAD=0 keeps it)"
+                                 : " -> kept for child processes (NBT_CHILD_NO_PRELOAD=0)");
         if (pre && strip) unsetenv("LD_PRELOAD");
     }
 
@@ -1692,7 +2144,8 @@ int main(int argc, char* argv[]) {
     signal(SIGINT,  signalHandler);
     signal(SIGTERM, signalHandler);
 
-    // Vehicle + panel profile (NBT_VEHICLE / NBT_SCREEN, else the car's carplay.ini, else Toyota 1280x480).
+    // Vehicle + panel profile (NBT_VEHICLE / NBT_SCREEN, else the car's carplay.ini, else the display's own size for
+    // the screen, else Toyota 1280x480).
     // Parsed here, before any thread starts.
     const nbt::CarConfig& car = nbt::carConfig();
     printf("[Car] vehicle %s (%s; Manufacturer=%s, logo %s), screen %dx%d (%s), carplay.ini %s%s%s%s\n",
@@ -1723,7 +2176,27 @@ int main(int argc, char* argv[]) {
     nbt::BrowserAudio browser;
     nbt::BtAudio bt;
     const nbt::AudioMode audio_mode = nbt::audioMode();
-    printf("[Main] audio mode: %s (NBT_AUDIO_MODE=bt|browser|a2i)\n", nbt::audioModeName(audio_mode));
+    {
+        const char* am = getenv("NBT_AUDIO_MODE");
+        const bool set = (am && *am) || nbt::envFlag("NBT_AUDIO_BT") >= 0;
+        printf("[Main] audio mode: %s (NBT_AUDIO_MODE=bt|browser|a2i%s)\n", nbt::audioModeName(audio_mode),
+               set ? " from nbt-aad.env" : nbt::nativeAudioFlagSet() ? "; Use Native Audio instead of Bluetooth is on"
+                                                                     : "; Use Native Audio instead of Bluetooth is off");
+    }
+    // Steering-wheel / control-port media keys go to the phone only when its media does not come over A2DP: in Bluetooth
+    // mode the car's own AVRCP handling already owns those keys (audio/media_state.hpp, car/mfl.hpp).
+    g_mediaKeysToPhone = audio_mode != nbt::AUDIO_MODE_BT;
+    g_wheelMediaKeys = nbt::lciMediaKeysEnabled();
+    printf("[Media] steering-wheel media keys: %s\n",
+           g_wheelMediaKeys ? "on (Media Controls for LCI Steering Wheels)"
+                            : "off (tick Media Controls for LCI Steering Wheels, or NBT_LCI_MEDIA=1)");
+    printf("[CarPlay] CarPlay compatibility: %s - yield when CarPlay takes the screen: %s, factory CarPlay decoder "
+           "context: %s, CarPlay window after a hand-over: %s\n",
+           nbt::cpCompatEnabled() ? "on" : "off (tick CarPlay compatibility, or NBT_CP_COMPAT=1)",
+           nbt::cpYieldOn() ? "on" : "off", nbt::cpPurgeOn() ? "destroyed (as before)" : "detached, re-attached afterwards",
+           nbt::cpWinGroupOn() ? "in our window group (as before)" : "top-level");
+    printf("[Media] now playing on %s, media keys to the phone: %s\n", kMediaFile,
+           g_mediaKeysToPhone ? "on (audio mode is not Bluetooth)" : "off (audio mode is Bluetooth)");
     if (audio_mode == nbt::AUDIO_MODE_BROWSER) {
         // Media sink (ch 9) and GUIDANCE sink (ch 8) stay in the ServiceDiscovery and a SYSTEM_AUDIO sink (ch 16) is
         // added, so the phone sends all three streams here instead of to A2DP. The A2I pipeline is not opened; the
@@ -1759,6 +2232,8 @@ int main(int argc, char* argv[]) {
     // 3. Input: the iDrive controller (ZBE) is read observe-only over MOSTSubSystem.DSYSMOSTServer by
     //    g_most and g_ccs (started below); iDrive keeps receiving every knob event itself.
 
+    if (!dropIdrEnabled())
+        printf("[Main] NBT_DROP_IDR=0: no keyframe request after a dropped video frame\n");
     // 3b. Volume overlay (NBT_VOL_OSD=1). Off by default: it creates an extra Screen window, so it is opt-in until the
     //     compositing is confirmed on the car. It mirrors the car's own volume (AudioMaster 0x20/0x0C08); there is no
     //     synthetic sweep and no env var for one.
@@ -1790,13 +2265,19 @@ int main(int argc, char* argv[]) {
     g_session.setVideoFocusCallback(&onVideoFocusRequest, NULL);
     g_session.setMicRequestCallback(&onMicRequest, NULL);
     g_session.setNavStatusCallback(&nbt::kombinav::KombiNav::navStatusCallback, &g_kombiNav);
+    g_session.setMediaStatusCallback(&onMediaStatus, NULL);
 
     if (!tcp_server.start()) {
         printf("[Main] Fatal: Failed to start TCP server on port %u\n", (unsigned)g_aaPort);
         return 1;
     }
     g_tcp = &tcp_server;
-    g_kombiNav.start();            // idle until "Turn arrows in cluster/HUD" (or NBT_KOMBI_NAV=1) is on
+    g_kombiNav.start(&g_most);     // idle until "Turn arrows in cluster/HUD" (or NBT_KOMBI_NAV=1) is on; before
+                                   // g_most starts: NBT_CLUSTER=6wa attaches to it
+    {
+        pthread_t t;
+        if (pthread_create(&t, NULL, &mediaMailThread, NULL) == 0) pthread_detach(t);
+    }
     nbt::g_fatal_hook = &nbt::kombinav::KombiNav::onFatalSignal;
 
     // 4b. Android Auto over USB (NBT_USB=1, experimental). Same user data as the TCP server, so its "session
@@ -1804,15 +2285,16 @@ int main(int argc, char* argv[]) {
     nbt::UsbAccessory usb(&onUsbConnected, &tcp_server, &sessionOwner, NULL);
     if (nbt::usbEnabled()) {
         const char* usbEnv = getenv("NBT_USB");
-        printf("[Main] Android Auto over USB: on (%s)\n", usbEnv && *usbEnv ? "NBT_USB" : "Settings checkbox");
+        printf("[Main] Android Auto over USB: on (%s), through %s\n", usbEnv && *usbEnv ? "NBT_USB" : "Settings checkbox",
+               nbt::usbDirectEnabled() ? "io-usb" : "/dev/oap* (NBT_USB_DIRECT=0)");
         if (usb.start()) g_usb = &usb;
         else printf("[Main] Android Auto over USB failed to start.\n");
     }
 
     // 5. Initialize Bluetooth SDP Subsystem (Advertise Wireless AA UUID)
     nbt::BluetoothManager bluetooth;
-    if (nbt::wirelessEnabled()) configureSppDirection();   // before the Bluetooth client attaches (it reads the mode)
-    if (nbt::wirelessEnabled() && bluetooth.init()) {
+    if (nbt::wirelessEnabledForTransport()) configureSppDirection();   // before the Bluetooth client attaches (it reads the mode)
+    if (nbt::wirelessEnabledForTransport() && bluetooth.init()) {
         if (bluetooth.registerAndroidAutoSdp()) g_btMgr = &bluetooth;
     }
 
@@ -1839,10 +2321,25 @@ int main(int argc, char* argv[]) {
     // The car's volume is followed whether or not the knob is: it drives the overlay, not the phone.
     if (!g_carVolume.attach(g_most, &onCarVolume, NULL))
         printf("[Main] car volume input failed to start.\n");
-    if (!nbt::carGpsEnabled())
+    if (nbt::phoneGpsEnabled()) {
+        const char* pg = getenv("NBT_PHONE_GPS");
+        printf("[Main] Use Phone GPS on (%s): the car's GPS and heading are not read; the phone uses its own GPS, "
+               "compass and motion sensors.\n", pg && *pg ? "NBT_PHONE_GPS" : "Settings checkbox");
+    } else if (!nbt::carGpsEnabled())
         printf("[Main] car GPS -> Android Auto off (NBT_CAR_GPS=0).\n");
-    else if (!g_gps.attach(g_most, nbt::car::readGpsAccuracyOverrideE3(), &onCarLocation, &onCarSatellites, &g_session))
+    else if (!g_gps.attach(g_most, nbt::car::readGpsAccuracyOverrideE3(), &onCarLocation, &onCarSatellites, &onCarCompass,
+                           &g_session))
         printf("[Main] car GPS failed to start.\n");
+    nbt::car::CarVehicleCallbacks vehicle;
+    vehicle.user = &g_session;
+    if (nbt::carSpeedEnabled()) vehicle.speed = &onCarSpeed;
+    else printf("[Main] car speed -> Android Auto off (NBT_CAR_SPEED=0).\n");
+    if (nbt::carGearEnabled()) vehicle.gear = &onCarGear;
+    else printf("[Main] car gear -> Android Auto off (NBT_CAR_GEAR=0).\n");
+    if (nbt::carParkingBrakeEnabled()) vehicle.parkingBrake = &onCarParkingBrake;
+    else printf("[Main] car parking brake -> Android Auto off (NBT_CAR_PARKING_BRAKE=0).\n");
+    if (!g_vehicle.attach(g_most, vehicle))
+        printf("[Main] car speed, gear and parking brake failed to start.\n");
     // NBT_CCS_DEBUG / NBT_CCS_ALL were the control-message loggers of the old ccs_input.cpp; the MOST client has one
     // logger for everything it sees now, so they turn that on.
     const bool ccsLogCompat = nbt::envFlag("NBT_CCS_DEBUG") == 1 || nbt::envFlag("NBT_CCS_ALL") == 1;
@@ -1852,16 +2349,21 @@ int main(int argc, char* argv[]) {
         printf("[Main] NBT_MOST_LOG: could not attach to the MOST client.\n");
     g_most.setRawLog(getenv("NBT_KNOB_RAW") != NULL);
     if (!g_most.start("NBTAAD_MOST"))
-        printf("[Main] MOST client failed to start: knob/keys and car GPS disabled.\n");
+        printf("[Main] MOST client failed to start: knob/keys, car GPS, car speed and parking brake disabled.\n");
 
-    if (nbt::wirelessEnabled()) {
+    if (nbt::wirelessEnabledForTransport()) {
         pthread_t wt;
         if (pthread_create(&wt, NULL, &wirelessThread, NULL) == 0) {
             pthread_detach(wt);
             printf("[Main] Wireless bring-up thread started (port %u)\n", (unsigned)g_aaPort);
         }
+        if (wfdOwnMode() && nbt::wfdWatchSec() > 0) {
+            pthread_t ww;
+            if (pthread_create(&ww, NULL, &wfdWatchThread, NULL) == 0) pthread_detach(ww);
+        }
     } else {
-        printf("[Main] Wireless off (NBT_WIRELESS=0): outbound phone scanner mode.\n");
+        printf("[Main] Wireless off (%s): outbound phone scanner mode.\n",
+               nbt::usbEnabled() ? "Android Auto over USB is selected, so Wi-Fi is not offered" : "NBT_WIRELESS=0");
     }
 
     printf("[Main] Daemon running. Press Ctrl+C to terminate.\n");
@@ -1883,6 +2385,8 @@ int main(int argc, char* argv[]) {
     readDayNightFile();
     const bool pdc_action = nbt::envFlag("NBT_PDC_ACTION") != 0;       // default on; NBT_PDC_ACTION=0 ignores park assist
     bool was_park = false;
+    bool was_camera = false;
+    bool camera_dismissed = false; // iDrive Android Auto entry chosen over a camera view: AA until that view closes
     bool park_dismissed = false;   // iDrive Android Auto entry chosen while park assist is active: AA until it ends
     // Manual gearbox (feature request 2026-10-31): reverse -> neutral + handbrake leaves park assist (and with it
     // iDrive's parking view) up, since only P or driving off ends it. NBT_NEUTRAL_RESUME_S=<s> (default 5, 0 = off)
@@ -1909,7 +2413,8 @@ int main(int argc, char* argv[]) {
     nbt::MicUplink mic(&onMicData, NULL);   // the standalone uplink (every mode but A2I, which has its own)
     bool mic_live = false;
     unsigned log_sync_ticks = 0;
-    printf("[Mic] car microphone for the Assistant: %s\n", mic_on ? "on" : "off (NBT_MIC=0 or /opt/aa/mic.disable)");
+    printf("[Mic] car microphone for the Assistant: %s%s%s\n", mic_on ? "on" : "off (NBT_MIC=0 or ",
+           mic_on ? "" : nbt::appFile(nbt::kMicDisableName).c_str(), mic_on ? "" : ")");
     g_audioBackend->setMicCallback(&onMicData, NULL);
     nbt::VoiceScenario voice;   // default on (NBT_VOICE_SCENARIO=0 disables): AudioMatrix mic scenario while the phone has the mic open
     if (mic_on) voice.init();
@@ -1930,6 +2435,7 @@ int main(int argc, char* argv[]) {
         if (monoMs() - most_health_ms >= 60000u) {
             most_health_ms = monoMs();
             g_most.logHealth();
+            g_kombiNav.logHealth();
         }
         bool act = g_session.isActive();
         if (act || g_sessionActive) cp_idle_ticks = 0;
@@ -1989,7 +2495,8 @@ int main(int argc, char* argv[]) {
             mic_live = false;
         }
         ++log_sync_ticks;
-        if (log_sync_ticks == 2400 && unlink(kBootGuardFile) == 0)   // 10 min up: not part of a bootloop
+        // 10 min up: not part of a bootloop
+        if (log_sync_ticks == 2400 && unlink(nbt::dataFile(kBootGuardName).c_str()) == 0)
             printf("[Main] running for 10 min: autostart bootloop guard cleared\n");
         if ((log_sync_ticks % 20) == 0) serviceUsbLog(false);   // every 5 s: stick plugged in / removed, checkbox
         checkRamLogCap();                                         // every tick: RAM log 5 MB cap
@@ -2027,6 +2534,7 @@ int main(int argc, char* argv[]) {
             printf("[Focus] iDrive entry selected: back to Android Auto%s\n", act ? "" : " (no phone session yet)");
             force_show = true;                           // re-assert even if we think it is up (HMI may have reordered layers)
             if (was_park) { park_dismissed = true; printf("[Park] Android Auto chosen during park assist: kept until it ends\n"); }
+            if (was_camera) { camera_dismissed = true; printf("[Camera] Android Auto chosen over the camera view: kept until it closes\n"); }
         }
         bool reverse = gear_action && g_gear == gear_reverse;
         if (reverse != was_reverse) {
@@ -2064,6 +2572,15 @@ int main(int argc, char* argv[]) {
             if (reverse_focus && act && !g_userExit) g_session.postVideoFocus(!park && !reverse);
             was_park = park;
         }
+        const bool camera_raw = g_camera > 0;
+        if (!camera_raw) camera_dismissed = false;
+        const bool camera = camera_raw && !camera_dismissed;
+        if (camera != was_camera) {
+            printf("[Camera] %s\n", camera ? "iDrive camera view up: overlay down for the camera"
+                                            : "camera view closed: restoring");
+            if (reverse_focus && act && !g_userExit) g_session.postVideoFocus(!camera && !park && !reverse);
+            was_camera = camera;
+        }
         // CarPlay taking the screen while an Android Auto session is still open (iPhone joins while the Android phone
         // stays connected, MINI tester 2026-10-29): CarPlay plays through our decoder context, so without its factory
         // settings it opens zoomed (the hand-off retune used to run only after the AA session ended). While Android
@@ -2078,7 +2595,16 @@ int main(int argc, char* argv[]) {
             cp_shows = v == 1 && (nbt::VideoManager::sharesCarPlaySurface() || cp_1280_last == 0);
             cp_1280_last = v;
         }
-        if (cp_shows) {
+        if (cp_shows && cpYieldEnabled()) {
+            printf("[Main] CarPlay took the screen while Android Auto is still connected: Android Auto yields to CarPlay "
+                   "completely (session ended, decoder context and windows released, nbt-aad stops; the Android Auto "
+                   "entry starts it again; CarPlay compatibility / NBT_CP_YIELD)\n");
+            g_userExit = 1;
+            g_carExit = 1;                               // nothing may cover CarPlay on the way out
+            g_session.postVideoFocus(false);             // phone stops streaming at once
+            g_cpYielded = 1;
+            g_running = 0;                               // the clean shutdown below releases everything
+        } else if (cp_shows) {
             printf("[Main] CarPlay took the screen while Android Auto is still connected: giving the decoder CarPlay's "
                    "settings (the Android Auto entry brings Android Auto back)\n");
             g_userExit = 1;
@@ -2117,13 +2643,29 @@ int main(int argc, char* argv[]) {
                 ++g_idrAsks;
             }
         }
-        bool want = (hide_idle ? act : true) && !g_userExit && !reverse && !park && !dm_peek;
+        bool want = (hide_idle ? act : true) && !g_userExit && !reverse && !park && !camera && !dm_peek;
         if (want && act && !overlay_on && (video.decoderInCarPlayMode() || video.decoderParked())) {
             printf("[Main] back to Android Auto after %s: rebuilding the decoder context\n",
                    video.decoderParked() ? "iDrive (overlay had surface 1280)" : "CarPlay");
             if (video.decoderParked()) { g_idrWaitMs = monoMs() | 1u; g_idrAsks = 0; }
             video.prepareForSession();
             g_session.postVideoFocus(true);
+        }
+        // A video frame was lost (queue full, or mdev did not take it): everything up to the phone's next keyframe
+        // decodes against the missing one. Ask for a keyframe the way the decoder rebuild above does (video focus off,
+        // on again 500 ms later): at most once in 10 s, not in a session's first 5 s, not while iDrive has the screen.
+        {
+            const bool settled = act && overlay_on && !g_idrWaitMs && upSec() - g_sessionStartS >= 5.0;
+            const nbt::KeyframeAsk::Action ka =
+                g_keyframeAsk.step(monoMs(), dropIdrEnabled() && video.keyframeWanted(), want && settled, want && act, act);
+            if (ka == nbt::KeyframeAsk::kFocusOff) {
+                printf("[Main] [%9.3f] a video frame was dropped: asking the phone for a keyframe (video focus off/on)\n",
+                       upSec());
+                video.clearKeyframeWanted();
+                g_session.postVideoFocus(false);
+            } else if (ka == nbt::KeyframeAsk::kFocusOn) {
+                g_session.postVideoFocus(true);
+            }
         }
         g_inputToPhone = (want && act) ? 1 : 0;
         nbt::setTouchOwned(g_inputToPhone != 0);      // UDP 30567 goes back to the HMI whenever iDrive has the screen
@@ -2196,10 +2738,11 @@ int main(int argc, char* argv[]) {
     tcp_server.stop();         // no more onClientConnected -> no session can start behind our back
     printf("[Main] [+%.2f s] listener stopped\n", upSec() - t0);
     // Before usb.stop(), which takes the link away. A phone that isn't told keeps streaming into the void and ignores
-    // the next daemon's session. Wireless phones just reconnect, so they are not told to quit.
-    if (g_owner.get() == nbt::kTransportUsb) {
+    // the next daemon's session. Wireless phones just reconnect, so they are not told to quit - except when yielding to
+    // CarPlay: then the Android phone is told the session is over, so it does not keep trying for the screen.
+    if (g_owner.get() == nbt::kTransportUsb || (g_cpYielded && g_session.isActive())) {
         const bool answered = g_session.byeAndWait(kUsbByeWaitMs);
-        printf("[Main] [+%.2f s] USB session: %s\n", upSec() - t0,
+        printf("[Main] [+%.2f s] %s session: %s\n", upSec() - t0, g_owner.get() == nbt::kTransportUsb ? "USB" : "wireless",
                answered ? "ended by the phone" : "no answer to the ByeByeRequest");
     }
     g_usb = NULL;              // the wireless thread stops asking it
@@ -2216,8 +2759,9 @@ int main(int argc, char* argv[]) {
 
     if (g_ctlFd >= 0) close(g_ctlFd);
     unlink(kUiStateFile);   // plugin falls back to the plain "Android Auto" entry
-    unlink(kBootGuardFile); // clean exit: the iDrive app's autostart bootloop guard starts from zero
-    printf("[Main] [%9.3f] nbt-aad shutdown complete (%.2f s).\n", upSec(), upSec() - t0);
+    unlink(nbt::dataFile(kBootGuardName).c_str());   // clean exit: the app's autostart bootloop guard starts from zero
+    printf("[Main] [%9.3f] nbt-aad shutdown complete (%.2f s)%s.\n", upSec(), upSec() - t0,
+           g_cpYielded ? ": yielded to CarPlay (decoder context, windows and window group released)" : "");
     fflush(stdout);
     // Leave without running static destructors: detached threads (DSI sender loops, wireless bring-up) may still
     // be running, and tearing globals down under them crashed at exit (nbt-aad-21: SIGSEGV after "shutdown complete").

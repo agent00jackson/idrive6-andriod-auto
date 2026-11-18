@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 namespace nbt {
 
@@ -32,15 +33,32 @@ namespace nbt {
 //   a2i      the old staged A2I pipeline (a2i_audio.cpp, NBT_AUDIO_STAGE); not audible on the car
 enum AudioMode { AUDIO_MODE_BT = 0, AUDIO_MODE_BROWSER = 1, AUDIO_MODE_A2I = 2 };
 
-inline AudioMode audioMode() {
-    const char* m = getenv("NBT_AUDIO_MODE");
-    if (m && *m) {
-        if (strcmp(m, "browser") == 0) return AUDIO_MODE_BROWSER;
-        if (strcmp(m, "a2i") == 0) return AUDIO_MODE_A2I;
-        if (strcmp(m, "bt") == 0) return AUDIO_MODE_BT;
+// "Use Native Audio instead of Bluetooth" (iDrive Settings checkbox, rhmiapp-45; flag kNativeAudioFlagName, a
+// hand-made one also counts, nbt_paths.hpp): browser mode, i.e. Android Auto sound over the Android Auto connection
+// through the car's own audio instead of Bluetooth A2DP. Only when neither NBT_AUDIO_MODE nor NBT_AUDIO_BT is set in
+// nbt-aad.env (those win). Read once per daemon run, so a change applies at the next Start / Restart.
+static const char* const kNativeAudioFlagName = "native-audio";
+
+// Pure part (host-tested): NBT_AUDIO_MODE's value (NULL = unset), envFlag("NBT_AUDIO_BT") (-1 = unset) and the flag file.
+inline AudioMode audioModeSetting(const char* mode, int bt, bool nativeFlag) {
+    if (mode && *mode) {
+        if (strcmp(mode, "browser") == 0) return AUDIO_MODE_BROWSER;
+        if (strcmp(mode, "a2i") == 0) return AUDIO_MODE_A2I;
+        if (strcmp(mode, "bt") == 0) return AUDIO_MODE_BT;
     }
-    int bt = envFlag("NBT_AUDIO_BT");
-    return bt == 0 ? AUDIO_MODE_A2I : AUDIO_MODE_BT;
+    if (bt >= 0) return bt == 0 ? AUDIO_MODE_A2I : AUDIO_MODE_BT;
+    return nativeFlag ? AUDIO_MODE_BROWSER : AUDIO_MODE_BT;
+}
+
+// The checkbox is read once: every audioMode() caller in a run must see the same mode, even if the box is flipped.
+inline bool nativeAudioFlagSet() {
+    static int s = -1;
+    if (s < 0) s = flagSet(kNativeAudioFlagName) ? 1 : 0;
+    return s == 1;
+}
+
+inline AudioMode audioMode() {
+    return audioModeSetting(getenv("NBT_AUDIO_MODE"), envFlag("NBT_AUDIO_BT"), nativeAudioFlagSet());
 }
 
 inline const char* audioModeName(AudioMode m) {
@@ -54,6 +72,20 @@ inline bool btAudioEnabled() {
 inline bool browserAudioEnabled() {
     return audioMode() == AUDIO_MODE_BROWSER;
 }
+
+// The car's nav prompter and its focus source (eSRC_NAV_AUTO): browser mode's NBT_SPEECH_EP / NBT_SPEECH_SRC defaults.
+const char* const kNavPromptEndpoint = "/input_mono_0";
+const uint32_t kNavPromptSrc = 0x1a;
+
+// NBT_SPEECH (both audio modes, speech_out.hpp).
+struct SpeechConfig {
+    bool enabled;               // NBT_SPEECH (browser: on unless 0/off/no/false; BT: only "1" turns it on)
+    const char* endpoint;       // NBT_SPEECH_EP (browser kNavPromptEndpoint; BT NULL = the factory alternate nav endpoint)
+    uint32_t src;               // NBT_SPEECH_SRC (browser kNavPromptSrc; BT 0; 0 = no audioconn request)
+    uint32_t sink;              // NBT_SPEECH_SINK (0x1)
+    int hold_ms;                // NBT_SPEECH_HOLD_MS (500, 0..5000)
+    SpeechConfig();
+};
 
 // Browser audio mode (browser_audio.hpp has what each setting does).
 struct BrowserConfig {
@@ -84,18 +116,12 @@ struct BrowserConfig {
     int system_gain_db;         // NBT_SYSTEM_GAIN_DB (0)
     bool defer_acks;            // NBT_AA_DEFER_ACKS: ack AA audio once played (on)
     bool underflow_reports;     // NBT_AA_UNDERFLOW_REPORT: AudioUnderflowNotification to the phone (on)
+    SpeechConfig speech;
     BrowserConfig();            // the defaults
 };
 BrowserConfig readBrowserConfig();
-
-// NBT_SPEECH (Bluetooth mode only, speech_out.hpp).
-struct SpeechConfig {
-    bool enabled;               // NBT_SPEECH=1
-    const char* endpoint;       // NBT_SPEECH_EP (NULL / empty = the factory alternate nav endpoint)
-    uint32_t src;               // NBT_SPEECH_SRC (0 = no audioconn request)
-    uint32_t sink;              // NBT_SPEECH_SINK (0x1)
-    SpeechConfig();
-};
+// Unset, empty or unparsable NBT_SPEECH / NBT_SPEECH_EP / NBT_SPEECH_SRC take the given defaults.
+SpeechConfig readSpeechConfig(bool def_enabled, const char* def_endpoint, uint32_t def_src);
 
 // Bluetooth audio mode (bt_audio.hpp).
 struct BtConfig {

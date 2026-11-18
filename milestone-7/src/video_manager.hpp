@@ -5,6 +5,8 @@
 
 #include "screen_video.h"
 #include "mmr_launch.hpp"
+#include "mmr_pps.hpp"
+#include "frame_queue.hpp"
 #include <stdint.h>
 #include <stddef.h>
 #include <pthread.h>
@@ -36,6 +38,8 @@ public:
     // Auto session starts (creates or rebuilds the decoder context). retuneForCarPlay(): main thread, a while after a
     // session ended. fixCarPlayLayer(): LayerManager layer 0x800d0000 visible and full screen (setVisible(true)).
     static bool cpHandoff();
+    // NBT_CP_PURGE=1: destroy the factory CarPlay context (cpvideoctx) as before v1.9.50 instead of detaching it.
+    static bool cpPurge();
     bool prepareForSession();
     bool retuneForCarPlay();
     bool decoderInCarPlayMode();
@@ -48,6 +52,10 @@ public:
     // jittery, wrong-colour garbage (G30, v1.9.15). Frames are dropped until the first IDR. releaseKeyframeWait()
     // gives up waiting (the phone never sent one).
     bool waitingForKeyframe();
+    // A frame was lost on the way to the decoder (queue full, or mdev did not take it) and no keyframe has been queued
+    // since: the picture stays damaged until one comes. The main loop asks the phone for it (keyframe_ask.hpp).
+    bool keyframeWanted();
+    void clearKeyframeWanted();
     // NBT_MMR_WIN_HIDE=1 (experiment): mm-renderer's winid=1280 window joins our window group, so our context gets a
     // SCREEN_EVENT_CREATE with its handle. pollScreenEvents() (main loop) records it; hideVideoWindow() sets it
     // VISIBLE 0 at the background z-order with the decoder left open, setVisible(true) restores what was read.
@@ -92,21 +100,13 @@ public:
     screen_context_t screenContext() const { return sink_.ctx; }
     screen_window_t  screenWindow()  const { return sink_.win; }
 
-    // Push raw H.264 NAL units from aasdk
-    bool postVideoFrame(const uint8_t* data, size_t length, uint64_t pts = 0);
+    // Queue the H.264 payload within an AA frame. Takes ownership of frame_data on a successful enqueue
+    bool postVideoFrame(std::vector<uint8_t>& frame_data, size_t offset, size_t length, uint64_t pts = 0);
     bool postCodecConfig(const uint8_t* data, size_t length);
     void onVideoFrameReceived(uint32_t frame_index, size_t byte_len);
 
 private:
-    struct VideoQueueItem {
-        std::vector<uint8_t> data;
-        uint64_t pts;
-        bool is_config;
-        bool is_idr;
-        bool has_inline_config;
-        size_t raw_size;
-        size_t inline_config_size;
-    };
+    // VideoQueueItem and the queue itself: frame_queue.hpp.
 
     static void* workerThreadStub(void* arg);
     void workerLoop();
@@ -118,6 +118,9 @@ private:
     bool createDecoder();     // decoder_mutex_ held
     void destroyDecoder();    // decoder_mutex_ held
     void quiesceWorker();
+    bool detachFactoryContext(const char* name);   // decoder_mutex_ held
+    bool reattachFactoryContext(const char* why);  // decoder_mutex_ held; our own context already gone
+    void* makeDict(const std::vector<PpsAttr>& attrs);
     bool sendMdevSync();
     bool sendMdevFormat(uint32_t width, uint32_t height, uint32_t fps);
     bool sendMdevConfig(const uint8_t* data, size_t length);
@@ -153,6 +156,7 @@ private:
     int mmr_saved_vis_, mmr_saved_z_;
     int screen_events_logged_;
     uint32_t idr_dropped_;          // guarded by queue_mutex_
+    bool idr_wanted_;               // guarded by queue_mutex_: a frame was lost and no keyframe was queued since
     volatile uint32_t decoder_gen_;     // +1 per decoder context created
     volatile uint32_t frames_in_gen_;   // frames sent to mdev since the current context was created
     volatile bool window_ready_;    // createWindow() finished (setVisible() is a no-op before)
@@ -162,8 +166,12 @@ private:
     bool aa_surface_seen_;          // main thread only: LayerManager has surface aaSurface() (it persists for the boot)
     bool aa_surface_logged_;        // ... and its state + the layer's render order were logged once while shown
     unsigned aa_surface_ticks_;     // serviceAaSurface() calls since the window was created
+    void* cp_ctx_;                  // decoder_mutex_: our handle on the factory cpvideoctx<pid> (never destroyed)
+    bool cp_detached_;              // decoder_mutex_: its input/outputs are detached while Android Auto has mdev
+    std::string cp_name_;           // decoder_mutex_: its name
+    MmrCtxSnapshot cp_snap_;        // decoder_mutex_: what it had attached (PPS) before we detached it
     void verifyOverlayOrder();
-    std::vector<VideoQueueItem> frame_queue_;
+    FrameQueue frame_queue_;            // guarded by queue_mutex_
     std::vector<uint8_t> cached_codec_config_;
 };
 

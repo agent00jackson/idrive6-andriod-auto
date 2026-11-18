@@ -29,7 +29,8 @@ public:
     // Optional, before open(). Gets the user pointer given to setCallbacks. Which vtable slot is detach is inferred.
     void setDetachCallback(DetachedCb d) { detachedCb_ = d; }
 
-    // Valid only from within callbacks (connection thread).
+    // Valid only from within callbacks (connection thread). False when not attached or the stream's send returned
+    // anything but 0.
     bool sendRequest(uint32_t requestId, const std::vector<uint8_t>& payload);
     bool setNotification(uint32_t attr);
 
@@ -45,6 +46,9 @@ public:
     bool attached() const { return attached_; }
     // Quiet: do not hex-dump every received event (busy interfaces such as the MOST server).
     void setQuiet(bool q) { quiet_ = q; }
+    // Quiet sends: no line per sendRequest (a client that sends often, such as the MOST client with the cluster display).
+    // A failed send is logged anyway.
+    void setQuietTx(bool q) { quietTx_ = q; }
 
 private:
     static void* threadMain(void* arg);
@@ -54,6 +58,7 @@ private:
     char* cli_;
     volatile bool attached_;
     bool quiet_;
+    bool quietTx_;
     AttachedCb attachedCb_;
     DataCb dataCb_;
     DetachedCb detachedCb_;
