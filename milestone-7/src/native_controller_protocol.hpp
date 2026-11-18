@@ -11,6 +11,9 @@ constexpr size_t kBytes = 64;
 constexpr uint32_t kRouteSession = 1024u;
 constexpr uint32_t kCompletedRearm = 512u;
 constexpr uint32_t kRunningReadyOwner = 7u;
+constexpr uint32_t kPreflightReset = 32u;
+constexpr uint32_t kPreflightFresh = 64u;
+constexpr uint32_t kPreflightEligible = 128u;
 
 enum Operation { kProbe, kArm, kHeartbeat, kStop, kReset, kRearm };
 enum Phase { kIdle, kArmed, kSelected, kEmptyReturned, kYielded, kRefused };

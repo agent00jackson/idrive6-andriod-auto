@@ -164,6 +164,16 @@ class ControllerRoute {
             if (reply.nonce == nonce_) return false;
         }
         if (reply.phase != controller::kIdle || reply.epoch) return false;
+        if (reply.flags & controller::kPreflightReset) {
+            if (!(reply.flags & controller::kPreflightFresh)) {
+                puts("[Native model] Controller owner preflight is stale");
+                return false;
+            }
+            if (!(reply.flags & controller::kPreflightEligible)) {
+                puts("[Native model] Controller owner preflight refused route selection");
+                return false;
+            }
+        }
         nonce_ = reply.nonce;
         fullPid_ = fullPid;
         sequence_ = 1;

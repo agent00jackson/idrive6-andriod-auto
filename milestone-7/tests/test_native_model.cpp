@@ -34,7 +34,8 @@ static NavView phone(int type, const std::vector<TLane> &lanes, int64_t metres) 
 }
 int main(int argc, char** argv) {
     const bool typed = argc == 2 && !strcmp(argv[1], "--typed");
-    const bool routeSession = typed || (argc == 2 && !strcmp(argv[1], "--controller"));
+    const bool controllerPreflight = argc == 2 && !strcmp(argv[1], "--controller-preflight");
+    const bool routeSession = typed || controllerPreflight || (argc == 2 && !strcmp(argv[1], "--controller"));
     if (routeSession) assert(!setenv("NBT_NATIVE_ROUTE_SESSION", "1", 1));
     else assert(!unsetenv("NBT_NATIVE_ROUTE_SESSION"));
     std::vector<TLane> lanes;
@@ -222,6 +223,7 @@ int main(int argc, char** argv) {
     }
     std::atomic<unsigned> begins(0), updates(0), stops(0), probes(0), beats(0);
     std::atomic<unsigned> controllerArms(0), controllerStops(0), controllerRearms(0), controllerPulses(0);
+    std::atomic<uint32_t> preflightFlags(0);
     std::atomic<bool> closerTurn(false), followingTurn(false), repeatedTurn(false), lateLanes(false);
     std::atomic<bool> done(false);
     std::thread server([&] {
@@ -296,6 +298,7 @@ int main(int argc, char** argv) {
                 write64(reply + 24, controllerEpoch);
                 wr32(reply + 32, commandSequence);
                 uint32_t flags = kRunningReadyOwner | kRouteSession;
+                if (op == kProbe) flags |= preflightFlags.load();
                 if (controllerPhase == kEmptyReturned) flags |= kCompletedRearm;
                 wr32(reply + 36, flags);
                 write64(reply + 40, read64(data + 48) + 60000);
@@ -390,6 +393,22 @@ int main(int argc, char** argv) {
                 break;
         }
     });
+    if (controllerPreflight) {
+        using namespace controller;
+        for (uint32_t flags : {kPreflightReset, kPreflightReset | kPreflightFresh}) {
+            preflightFlags = flags;
+            Backend refusedController(dir, true);
+            assert(refusedController.start() && refusedController.arm(UINT64_MAX));
+            NavView first = phone(8, lanes, 46);
+            Message message;
+            assert(fromNav(first, message) && refusedController.submit(first, message, true));
+            for (int i=0; i<200 && refusedController.busy(); ++i) usleep(10000);
+            assert(refusedController.failed() && !refusedController.busy());
+            assert(begins == 0 && controllerArms == 0);
+            refusedController.stop();
+        }
+        preflightFlags = kPreflightReset | kPreflightFresh | kPreflightEligible;
+    }
     {
         NativeDisplay display(dir);
         assert(display.start());
@@ -399,7 +418,7 @@ int main(int argc, char** argv) {
         auto first = phone(8, lanes, 46);
         core.step(&first, 1.0);
         for (int i=0; i<200 && !beats; ++i) usleep(10000);
-        assert(probes == 1 && begins == 1 && beats > 0);
+        assert(probes == (controllerPreflight ? 3 : 1) && begins == 1 && beats > 0);
         // The separate Full lease must keep the initial semantic version stable.
         for (int i=0; i<600 && beats < 3; ++i) usleep(10000);
         assert(beats >= 3 && updates == 0);
