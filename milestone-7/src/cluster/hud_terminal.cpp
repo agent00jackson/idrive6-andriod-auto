@@ -2,6 +2,12 @@
 // Required Notice: Copyright (c) 2026 nanaisu - NBT-AAD (https://github.com/Sq00ky/Supra-iDrive6-Android-Auto)
 #include "cluster/hud_terminal.hpp"
 
+#ifdef NBT_LLVM_QNX_SDK
+extern "C" int pthread_condattr_init(pthread_condattr_t*);
+extern "C" int pthread_condattr_setclock(pthread_condattr_t*, clockid_t);
+extern "C" int pthread_condattr_destroy(pthread_condattr_t*);
+#endif
+
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -399,11 +405,15 @@ HudTerminal::HudTerminal(const Config& cfg)
       stop_(false) {
     memset(&lastHealth_, 0, sizeof(lastHealth_));
     pthread_mutex_init(&lock_, NULL);
+#if defined(__APPLE__)
+    pthread_cond_init(&cond_, NULL);
+#else
     pthread_condattr_t a;
     pthread_condattr_init(&a);
     pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
     pthread_cond_init(&cond_, &a);
     pthread_condattr_destroy(&a);
+#endif
 }
 
 HudTerminal::~HudTerminal() {
@@ -604,7 +614,11 @@ void HudTerminal::run() {
         uint32_t wait = core_.msUntilDeadline(now);
         if (wait > 1000) wait = 1000;
         struct timespec ts;
+#if defined(__APPLE__)
+        clock_gettime(CLOCK_REALTIME, &ts);
+#else
         clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
         uint64_t ns = (uint64_t)ts.tv_nsec + (uint64_t)(wait + 1) * 1000000ull;
         ts.tv_sec += (time_t)(ns / 1000000000ull);
         ts.tv_nsec = (long)(ns % 1000000000ull);

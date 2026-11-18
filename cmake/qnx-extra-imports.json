@@ -1,0 +1,66 @@
+{
+  "libc.so.3": [
+    {
+      "name": "srand",
+      "kind": "function",
+      "size": 0
+    },
+    {
+      "name": "rand",
+      "kind": "function",
+      "size": 0
+    },
+    {
+      "name": "chmod",
+      "kind": "function",
+      "size": 0
+    },
+    {
+      "name": "strcasecmp",
+      "kind": "function",
+      "size": 0
+    },
+    {
+      "name": "pthread_condattr_init",
+      "kind": "function",
+      "size": 0
+    },
+    {
+      "name": "pthread_condattr_setclock",
+      "kind": "function",
+      "size": 0
+    },
+    {
+      "name": "pthread_condattr_destroy",
+      "kind": "function",
+      "size": 0
+    }
+  ],
+  "libstdc++.so.6": [
+    {
+      "name": "_ZNKSs5rfindEPKcjj",
+      "kind": "function",
+      "size": 0
+    },
+    {
+      "name": "_ZNSs6resizeEjc",
+      "kind": "function",
+      "size": 0
+    },
+    {
+      "name": "_ZNKSs17find_first_not_ofEcj",
+      "kind": "function",
+      "size": 0
+    },
+    {
+      "name": "_ZNKSs16find_last_not_ofEcj",
+      "kind": "function",
+      "size": 0
+    },
+    {
+      "name": "_ZTVN10__cxxabiv121__vmi_class_type_infoE",
+      "kind": "object",
+      "size": 44
+    }
+  ]
+}

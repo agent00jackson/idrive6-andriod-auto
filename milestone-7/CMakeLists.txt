@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 # Required Notice: Copyright (c) 2026 nanaisu - NBT-AAD (https://github.com/Sq00ky/Supra-iDrive6-Android-Auto)
 # This is the authoritative target source list; no qcc/project files are read.
+link_libraries(${aa_runtime_interfaces})
 add_executable(nbt-aad
   src/main.cpp
   src/pf_aa_embed.cpp
@@ -49,11 +50,15 @@ add_executable(nbt-aad
   src/cluster/j29_client.cpp
   src/cluster/j29_display.cpp
   src/cluster/nav_core.cpp
+  src/cluster/native_display.cpp
+  src/native_model.cpp
+  src/native_model_wire.cpp
   src/cluster/hud_terminal.cpp
   src/cluster/hud6wa_display.cpp
   src/volume_osd.cpp
   src/audio/speex.c
 )
+target_compile_definitions(nbt-aad PRIVATE NBT_LLVM_QNX_SDK=1)
 target_link_libraries(nbt-aad PRIVATE NBT::a2i_client QNX::socket QNX::ssl QNX::crypto QNX::screen QNX::usbdi)
 add_executable(test_display test_display.cpp)
 target_link_libraries(test_display PRIVATE QNX::screen)

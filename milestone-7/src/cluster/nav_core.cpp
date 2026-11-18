@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Required Notice: Copyright (c) 2026 nanaisu - NBT-AAD (https://github.com/Sq00ky/Supra-iDrive6-Android-Auto)
 #include "cluster/nav_core.hpp"
+#include "cluster/native_display.hpp"
 #include "nbt_env.hpp"
 
 #include <errno.h>
@@ -400,6 +401,19 @@ void KombiNav::logLine(const char* line, void* /*user*/) {
 
 // The place to add a cluster: its driver, what it needs, and how the log names it.
 bool KombiNav::createDisplay(const char* id, most::Client* most) {
+    if (!strcmp(id, "native")) {
+        NativeDisplay* native = new NativeDisplay;
+        if (!native->start()) {
+            delete native;
+            return false;
+        }
+        display_ = native;
+        native_display_ = true;
+        yield_enabled_ = true;
+        target_ = "local native guidance adapter";
+        stopHint_ = "native adapter unavailable or unqualified";
+        return true;
+    }
     if (!strcmp(id, "j29")) {
         graph_ = new Graph(handle_, settings_.hide_bar ? 255 : -1);
         client_ = new KombiClient(host_, port_);
@@ -548,7 +562,10 @@ void KombiNav::start(most::Client* most) {
     e = getenv("NBT_CLUSTER");
     if (!createDisplay(e && *e ? e : "j29", most)) return;
     core_ = new Core(*display_, settings_, &KombiNav::logLine, this);
-    if (client_)
+    if (native_display_) {
+        printf("[KombiNav] BMW native guidance %s, approach %s, factory-route yield on\n",
+               enabledNow() ? "ON" : "off", approachText().c_str());
+    } else if (client_)
         printf("[KombiNav] cluster/HUD arrows %s (%s); KOMBI %s:%u handle 0x%X, approach %s, bar %s, iDrive-route "
                "yield %s, lanes %s, in-place %d\n", enabledNow() ? "ON" : "off",
                forced_ >= 0 ? "NBT_KOMBI_NAV" : "iDrive menu / flag file", host_.c_str(), (unsigned)port_, handle_,
@@ -600,7 +617,7 @@ void KombiNav::onFatalSignal() {
 // cancel (or a yield: the factory graph owns the models then), so the next start retries a cancel that failed.
 // The shadow mode draws nothing and never touches it: a file a live run left stays for the next live run to clear.
 void KombiNav::markShown(bool on, bool force) {
-    if (shadow_ || on == marked_) return;
+    if (native_display_ || shadow_ || on == marked_) return;
     if (on) {
         int fd = open(kShownFile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) close(fd);
@@ -624,7 +641,7 @@ void KombiNav::worker() {
     if (access(kShownFile, F_OK) == 0 && !client_ && shadow_)
         printf("[KombiNav] a picture may be left by an earlier live run: the shadow mode leaves it for the next live "
                "run to clear\n");
-    else if (access(kShownFile, F_OK) == 0 && !client_)
+    else if (!native_display_ && access(kShownFile, F_OK) == 0 && !client_)
         stale_shown_ = true;
     if (access(kShownFile, F_OK) == 0 && client_) {
         std::string detail;
@@ -704,7 +721,7 @@ void KombiNav::tick(double now) {
     if (yield_enabled_) {
         pthread_mutex_lock(&watch_mu_);
         factory = watch_.active();
-        if (factory && guidance && m.has_status && !prev_guidance_) {
+        if (!native_display_ && factory && guidance && m.has_status && !prev_guidance_) {
             watch_.release();
             factory = false;
             printf("[KombiNav] iDrive-route yield released: new Android Auto route\n");

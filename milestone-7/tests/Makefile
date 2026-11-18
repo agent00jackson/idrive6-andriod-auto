@@ -21,7 +21,7 @@ LDLIBS   := -lpthread -lssl -lcrypto -lm
 SPEEX := $(ROOT)/src/audio/speex.c
 
 # The guidance runtime with both cluster drivers (KombiNav creates either).
-SRC_KOMBI_NAV := src/cluster/j29_client.cpp src/cluster/j29_display.cpp src/cluster/nav_core.cpp \
+SRC_KOMBI_NAV := src/cluster/j29_client.cpp src/cluster/j29_display.cpp src/cluster/nav_core.cpp src/cluster/native_display.cpp src/native_model.cpp src/native_model_wire.cpp \
                  src/cluster/hud6wa_display.cpp src/cluster/hud_terminal.cpp src/most/client.cpp tests/fake_dsi_client.cpp
 
 # Each test and the daemon sources it links (beyond its own .cpp).
@@ -57,6 +57,7 @@ SRC_test_frame_queue       :=
 SRC_test_input_activity    := src/car/input_activity.cpp src/car/ccs_input.cpp src/most/client.cpp tests/fake_dsi_client.cpp
 SRC_test_kombi_graph       :=
 SRC_test_kombi_nav         := $(SRC_KOMBI_NAV)
+SRC_test_native_model      := $(SRC_KOMBI_NAV)
 SRC_test_kombi_nav_msg     :=
 SRC_test_lm_geometry       :=
 SRC_test_media_ack         :=

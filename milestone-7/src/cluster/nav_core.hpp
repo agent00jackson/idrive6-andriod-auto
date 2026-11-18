@@ -245,6 +245,7 @@ private:
     std::string target_;             // for the log: what the driver talks to
     const char* stopHint_;           // for the log: why a driver may stop for the session
     bool stale_shown_;               // a picture a killed daemon left: cleared once the transport is ready
+    bool native_display_ = false;
     ClusterDisplay* display_;
     Core* core_;
     static KombiClient::Result linkSend(void* self, const std::vector<Frame>& frames, std::string* detail);

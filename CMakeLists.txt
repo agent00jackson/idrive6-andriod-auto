@@ -10,6 +10,7 @@ set(CMAKE_C_FLAGS_RELEASE "-O2")
 set(CMAKE_CXX_FLAGS_RELEASE "-O2")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(QnxSdk CONFIG REQUIRED)
+include(cmake/ExtendQnxImports.cmake)
 set(CMAKE_INSTALL_RPATH "/opt/mm/lib:/lib:/usr/lib:/fs/sda0/repository/istep/lib:/opt/hmi/ID5/lib")
 set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 qnx_import_manifest("${CMAKE_CURRENT_SOURCE_DIR}/cmake/nbt-evo-imports.json"

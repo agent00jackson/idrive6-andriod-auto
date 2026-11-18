@@ -62,6 +62,9 @@ SRCS = src/main.cpp \
        src/cluster/j29_client.cpp \
        src/cluster/j29_display.cpp \
        src/cluster/nav_core.cpp \
+       src/cluster/native_display.cpp \
+       src/native_model.cpp \
+       src/native_model_wire.cpp \
        src/cluster/hud_terminal.cpp \
        src/cluster/hud6wa_display.cpp \
        src/volume_osd.cpp

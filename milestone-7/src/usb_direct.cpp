@@ -9,6 +9,7 @@
 #include <time.h>
 
 #ifdef __QNX__
+#include <dlfcn.h>
 #include <sys/usbdi.h>
 #include <sys/procfs.h>
 #include <sys/iofunc.h>
@@ -337,7 +338,9 @@ bool UsbDirect::resetDevice(const std::string& key) {
         aoap::usbLog("[UsbDirect] %s: not reset: usbd_attach failed: %s\n", key.c_str(), strerror(r));
         return false;
     }
-    r = usbd_reset_device(dev);
+    typedef int (*ResetDevice)(struct usbd_device*);
+    static ResetDevice reset = reinterpret_cast<ResetDevice>(dlsym(RTLD_DEFAULT, "usbd_reset_device"));
+    r = reset ? reset(dev) : ENOSYS;
     usbd_detach(dev);
     if (r != EOK) {
         aoap::usbLog("[UsbDirect] %s: usbd_reset_device failed: %s\n", key.c_str(), strerror(r));

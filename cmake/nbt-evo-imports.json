@@ -149,6 +149,11 @@
           "name": "_ZN3bmw9PluginAppC1ERNS_11IDispatcherENS_11BasicStringIcEEjjNS_20RHMIInterfaceVersionERKNS_6BundleES8_",
           "kind": "function",
           "size": 0
+        },
+        {
+          "name": "_ZN3bmw9PluginApp11updateModelEjRKNS_11BasicStringIcEE",
+          "kind": "function",
+          "size": 0
         }
       ]
     },
