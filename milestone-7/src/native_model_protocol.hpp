@@ -131,6 +131,10 @@ inline bool adaptToCapabilities(Message& message, unsigned capabilities) {
     if ((message.aaType == 25 || message.aaType == 26) &&
         (capabilities & forkCapabilities) != forkCapabilities)
         return false;
+    const unsigned arrivalCapabilities = NG_CAP_EXTENDED_FIELDS | NG_CAP_ARRIVAL;
+    if (message.aaType >= 39 && message.aaType <= 42 &&
+        (capabilities & arrivalCapabilities) != arrivalCapabilities)
+        return false;
     if (!(capabilities & NG_CAP_EXTENDED_FIELDS)) {
         if ((message.aaType>=32&&message.aaType<=35)||(message.aaType>=43&&message.aaType<=46))
             return false;
@@ -181,6 +185,9 @@ inline bool turnDirection(int type, uint32_t& turn, uint16_t& angle) {
         case 2: case 36: turn = NG_STRAIGHT; angle = 0; return true; // NAME_CHANGE or STRAIGHT
         case 32: case 33: case 43: case 44: turn = NG_RIGHT; angle = 19200; return true;
         case 34: case 35: case 45: case 46: turn = NG_LEFT; angle = 6400; return true;
+        case 39: case 40: turn = NG_STRAIGHT; angle = 0; return true; // destination or straight arrival
+        case 41: turn = NG_LEFT; angle = 6400; return true;
+        case 42: turn = NG_RIGHT; angle = 19200; return true;
         default: return false;
     }
 }

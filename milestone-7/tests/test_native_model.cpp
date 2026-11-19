@@ -49,7 +49,8 @@ int main(int argc, char** argv) {
     for(int type=-1;type<=256;++type) {
         const bool roundabout=(type>=32&&type<=35)||(type>=43&&type<=46);
         const bool offRampOrFork=type>=21&&type<=26;
-        if((type<2||type>12)&&type!=36&&!roundabout&&!offRampOrFork){
+        const bool arrival=type>=39&&type<=42;
+        if((type<2||type>12)&&type!=36&&!roundabout&&!offRampOrFork&&!arrival){
             assert(!turnDirection(type,selectedTurn,selectedDirection));
             assert(selectedTurn==77&&selectedDirection==55);
         }
@@ -86,6 +87,21 @@ int main(int argc, char** argv) {
         fork.operation=Begin;fork.sequence=1;fork.session=1;fork.maneuver=1;
         uint8_t wire[kMaxFrameBytes];
         assert(encode(fork,wire) && decode(wire,frameSize(fork),decoded) && samePayload(fork,decoded));
+    }
+    const uint32_t arrivalTurns[] = {NG_STRAIGHT, NG_STRAIGHT, NG_LEFT, NG_RIGHT};
+    const uint16_t arrivalAngles[] = {0, 0, 6400, 19200};
+    for (int type = 39; type <= 42; ++type) {
+        const NavView destination = phone(type, {}, 0);
+        Message arrival, decoded;
+        assert(fromNav(destination, arrival, NG_CAP_SUPPORTED));
+        assert(arrival.aaType == type && arrival.turn == arrivalTurns[type - 39] &&
+               arrival.direction == arrivalAngles[type - 39] && arrival.distanceMm == 0);
+        assert(!adaptToCapabilities(arrival, NG_CAP_BASE));
+        assert(!fromNav(destination, rejected, NG_CAP_BASE));
+        assert(!fromNav(destination, rejected, NG_CAP_SUPPORTED & ~NG_CAP_EXTENDED_FIELDS));
+        arrival.operation=Begin;arrival.sequence=1;arrival.session=1;arrival.maneuver=1;
+        uint8_t wire[kMaxFrameBytes];
+        assert(encode(arrival,wire) && decode(wire,frameSize(arrival),decoded) && samePayload(arrival,decoded));
     }
     assert(fromNav(phone(8, lanes, 46), rejected) && rejected.laneCount == 0);
     Message keep, slight;
