@@ -127,6 +127,10 @@ inline bool adaptToCapabilities(Message& message, unsigned capabilities) {
     if (message.aaType >= 21 && message.aaType <= 24 &&
         (capabilities & offRampCapabilities) != offRampCapabilities)
         return false;
+    const unsigned forkCapabilities = NG_CAP_EXTENDED_FIELDS | NG_CAP_FORKS;
+    if ((message.aaType == 25 || message.aaType == 26) &&
+        (capabilities & forkCapabilities) != forkCapabilities)
+        return false;
     if (!(capabilities & NG_CAP_EXTENDED_FIELDS)) {
         if ((message.aaType>=32&&message.aaType<=35)||(message.aaType>=43&&message.aaType<=46))
             return false;
@@ -172,6 +176,8 @@ inline bool turnDirection(int type, uint32_t& turn, uint16_t& angle) {
         case 22: turn = NG_RIGHT; angle = 22400; return true;
         case 23: turn = NG_LEFT; angle = 6400; return true;   // normal highway exit
         case 24: turn = NG_RIGHT; angle = 19200; return true;
+        case 25: turn = NG_LEFT; angle = 6400; return true;   // selected fork branch
+        case 26: turn = NG_RIGHT; angle = 19200; return true;
         case 2: case 36: turn = NG_STRAIGHT; angle = 0; return true; // NAME_CHANGE or STRAIGHT
         case 32: case 33: case 43: case 44: turn = NG_RIGHT; angle = 19200; return true;
         case 34: case 35: case 45: case 46: turn = NG_LEFT; angle = 6400; return true;
