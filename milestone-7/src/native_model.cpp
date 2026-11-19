@@ -702,7 +702,9 @@ void Backend::run() {
                     dirty = false;
                     printf("[Native model] AA model accepted distance_mm=%u lanes=%u (HUD unqualified)\n",
                            active.distanceMm, unsigned(active.laneCount));
-                    nextUpdate = nextHeartbeat = millis() + 2000;
+                    nextUpdate = millis() + 2000;
+                    // A slow receipt already used some of the heartbeat interval.
+                    nextHeartbeat = now + 2000;
                 }
             } else if (keepAlive && !revoked()) {
                 receiptSource = "Full liveness";
@@ -711,7 +713,7 @@ void Backend::run() {
                     receiptSource = "Controller heartbeat";
                     ok = route.pulse(accepted);
                 }
-                nextHeartbeat = millis() + 2000;
+                nextHeartbeat = now + 2000;
             }
             if (!ok) {
                 if (!revoked()) {
