@@ -32,7 +32,7 @@
             grep -q 'EXEC (Executable file)' elf.txt
             grep -q '/usr/lib/ldqnx.so.2' elf.txt
           done
-          for plugin in milestone-7/plugin/libhmiaad.so milestone-7/rhmiapp/libNbtAad.so; do
+          for plugin in milestone-7/plugin/libhmiaad.so milestone-7/rhmiapp/libNbtAad.so tools/native-semantic-addon/libnative_semantic_basic.so tools/native-semantic-addon/libnative_semantic_controller.so; do
             llvm-readelf -h "$plugin" | grep -q 'DYN (Shared object file)'
           done
           runHook postCheck

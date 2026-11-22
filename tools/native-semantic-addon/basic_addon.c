@@ -1,0 +1,1045 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+/* Production NavigationBasic semantic guidance addon (exact X20511I ARM QNX).
+ * Speaks NGV1..5 + NGC1 (NG_CAP_SUPPORTED) + ng_alive on NG_SOCKET_ROOT so
+ * nbt-aad's Semantic Navigation Mode drives untouched NavigationFully and
+ * untouched NavNBTEvoController (6WB / 6WA / HUD / J29 RIC / CID).
+ * Emulator-only mapless NDS stubs are intentionally excluded. */
+
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "fixture-provider.h"
+#include "native_model_wire/alive_wire.h"
+#include "native_model_wire/capabilities.h"
+#include "native_model_wire/protocol.h"
+#include "semantic_cue_map.h"
+#include "semantic_handoff.h"
+
+#if !defined(__QNXNTO__) || !defined(__arm__)
+#error basic_addon.c targets ARM QNX NavigationBasic
+#endif
+
+#define FN(a, result, ...) ((result (*)(__VA_ARGS__))(uintptr_t)(a))
+
+struct qnx_sockaddr_un {
+    uint8_t sun_len;
+    uint8_t sun_family;
+    char sun_path[104];
+};
+
+static int qnx_chmod(const char *path, mode_t mode) {
+    static int (*fn)(const char *, mode_t);
+    if (!fn) {
+        void *h = dlopen("libc.so.3", RTLD_NOW | RTLD_LOCAL);
+        if (h) fn = (int (*)(const char *, mode_t))dlsym(h, "chmod");
+    }
+    return fn ? fn(path, mode) : -1;
+}
+
+static uint64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000L);
+}
+
+enum {
+    ADMINISTRATOR = 0x011cd4cc,
+    DATA_ACCESS_READY = 0x02520904,
+    COMPONENT_VPTR = 0x00f86c30,
+    STUB_VPTR = 0x00f87d40,
+    CALC_VPTR = 0x00f87420,
+    RESOLVER_VPTR = 0x00f872a0,
+    ROUTE_DATA_VPTR = 0x00f872f8,
+    MUX_VPTR = 0x00ee1690,
+    MUX9_ADDR = 0x02795d88,
+    RG_VPTR = 0x00f44450,
+    MILCA_VPTR = 0x00f3f3c8,
+};
+
+enum {
+    PHASE_INSTALL_RESOLVER = 1,
+    PHASE_CALC_ROUTE = 2,
+    PHASE_ACTIVATE_GUIDANCE = 5,
+    PHASE_PUBLISH_CUE = 6,
+    PHASE_CLEAR_GUIDANCE = 8,
+};
+
+struct owner_event {
+    void **vtable;
+    uint32_t native_prefix[5];
+    uint32_t component;
+    uint32_t stub;
+    uint16_t thread;
+    uint16_t phase;
+    uint32_t arg0;
+};
+_Static_assert(offsetof(struct owner_event, component) == 24, "CHBEvent prefix");
+
+static volatile uint32_t owner_dispatch_state;
+static volatile uint32_t hud_dispatch_state;
+static volatile uint32_t resolver_wrapper_state;
+static volatile uint32_t resolver_intercept_kind;
+static volatile uint32_t resolver_armed_flag;
+static volatile uint32_t active_route_id;
+static volatile uint32_t created_route_id;
+static volatile uint32_t tour_high_cached;
+static volatile uint32_t tour_low_cached;
+static uint32_t resolver_vtable_copy[10];
+static uint32_t wrapped_resolver_addr;
+static uint32_t wrapped_stub_addr;
+static uint32_t fixture_source_handle;
+static uint32_t fixture_factory_calls;
+
+/* Pending cue passed from worker thread to ctx 9 (CRouteGuidance/CMiLCa). */
+static struct semantic_basic_cue g_pending_cue;
+static uint32_t g_pending_dtm_only;
+static uint32_t g_next_man_id = 1u;
+static uint32_t g_active_man_id = 0u;
+static uint32_t g_sort_counter = 1u;
+
+struct fixture_uuid { _Alignas(8) uint32_t word[4]; };
+static const struct fixture_uuid routing_implementation = {
+    {0x36424449, 0x454c5846, 0x41504341, 0x01000001}
+};
+static const uint32_t routing_interface_expected[4] = {
+    0x931e4541, 0x526d541e, 0x6d785403, 0x8578f2ad
+};
+
+struct routing_factory;
+struct routing_factory_vtable {
+    void (*reserved[3])(void);
+    const struct basic_fixture_routing *(*create)(struct routing_factory *, const uint32_t *);
+};
+struct routing_factory { const struct routing_factory_vtable *vtable; };
+
+static const struct basic_fixture_routing *create_routing(
+    struct routing_factory *factory, const uint32_t *parameters) {
+    (void)factory;
+    if (!fixture_source_handle || (parameters[2] & 0xffffu) != 1u)
+        return NULL;
+    ++fixture_factory_calls;
+    return &basic_fixture_routing;
+}
+
+static const struct routing_factory_vtable routing_factory_methods = {
+    .create = create_routing,
+};
+static struct routing_factory routing_factory = { .vtable = &routing_factory_methods };
+
+static uint32_t register_fixture_source(void) {
+    const uint32_t *iface = (const uint32_t *)(uintptr_t)0x11ceb20;
+    if (memcmp(iface, routing_interface_expected, sizeof(routing_interface_expected)) != 0)
+        return 0;
+    if (fixture_source_handle)
+        return fixture_source_handle;
+    static _Alignas(8) uint8_t descriptor[0x80];
+    static const char name[] = "FixtureRouting";
+    uint32_t data_access = *(uint32_t *)(uintptr_t)0x25200b8;
+    if (data_access < 0x10000u)
+        return 0;
+    FN(0x68587c, void, void *, const char *, uint32_t, uint32_t, uint32_t)(
+        descriptor, name, 1, 1, 1);
+    FN(0x580788, void, void *, const void *, const void *)(
+        descriptor, iface, &routing_implementation);
+    uint32_t handle = FN(0x687134, uint32_t, void *, void *, uint32_t, uint32_t)(
+        (void *)(uintptr_t)data_access, descriptor, 0, 0);
+    if (!handle || handle == UINT32_MAX)
+        return 0;
+    fixture_source_handle = handle;
+    FN(0x71fed4, void, const void *, void *)(&routing_implementation, &routing_factory);
+    uint8_t request[0x40];
+    memset(request, 0, sizeof(request));
+    FN(0x681488, void, void *, void *, uint32_t, const void *, uint32_t, uint32_t)(
+        request, NULL, 0, iface, handle, 0);
+    const void *accessor = FN(0x26648c, const void *, const void *, const void *)(
+        &routing_implementation, request + 4);
+    if (*(uint32_t *)(request + 0x30) != 1u ||
+        accessor != &basic_fixture_routing || fixture_factory_calls != 1u)
+        return 0;
+    return handle;
+}
+
+static int read_at(int fd, uint32_t address, void *value, size_t size) {
+    return address >= 0x10000u && address <= 0x7fffffffu && size <= 4096u &&
+           size <= 0x80000000u - address &&
+           lseek(fd, (off_t)address, SEEK_SET) == (off_t)address &&
+           read(fd, value, size) == (ssize_t)size;
+}
+
+static int word(int fd, uint32_t address, uint32_t *value) {
+    return read_at(fd, address, value, sizeof(*value));
+}
+
+static int verify_identity(int fd, const void *administrator) {
+    uint32_t observed = 0;
+    const struct { uint32_t address, opcode; } pins[] = {
+        {0x56c334, 0xe92d4037}, {0x57bb80, 0xe92d40f7},
+        {0x57bf34, 0xe59fc268}, {0x85c82c, 0xe92d40f0},
+    };
+    if (!administrator || !word(fd, ADMINISTRATOR, &observed) ||
+        observed != (uintptr_t)administrator)
+        return 0;
+    for (size_t i = 0; i < sizeof(pins) / sizeof(pins[0]); ++i) {
+        if (!word(fd, pins[i].address, &observed) || observed != pins[i].opcode)
+            return 0;
+    }
+    return 1;
+}
+
+static int component_valid(int fd, uint32_t candidate) {
+    uint32_t observed = 0;
+    const struct { uint32_t offset, expected; } fields[] = {
+        {0, COMPONENT_VPTR}, {0xac, STUB_VPTR},
+        {0x2b0, CALC_VPTR}, {0x464, ROUTE_DATA_VPTR},
+        {0x1d8, candidate}, {0x31c, candidate}, {0x488, candidate},
+    };
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+        if (!word(fd, candidate + fields[i].offset, &observed) ||
+            observed != fields[i].expected)
+            return 0;
+    }
+    return 1;
+}
+
+static int find_owner(int fd, uint32_t *component, uint16_t *thread) {
+    uint32_t found_component = 0, start = 0, end = 0, limit = 0, raw_thread = 0;
+    unsigned components = 0;
+    const uint32_t mux = 0x02795e98u;
+    uint32_t vptr = 0;
+    if (!word(fd, mux, &vptr) || vptr != MUX_VPTR ||
+        !word(fd, mux + 0x1c, &start) || !word(fd, mux + 0x20, &end) ||
+        !word(fd, mux + 0x24, &limit) || !word(fd, mux + 0x70, &raw_thread) ||
+        start < 0x10000u || start > end || end > limit ||
+        (end - start) % 4u != 0 || (end - start) / 4u > 64u ||
+        (raw_thread & 0xffffu) == 0u || (raw_thread & 0xffffu) >= 0x7fffu)
+        return 0;
+    for (uint32_t at = start; at < end; at += 4u) {
+        uint32_t entry = 0, ev = 0;
+        if (!word(fd, at, &entry) || entry < 0x10000u + 0xacu ||
+            !word(fd, entry, &ev) || ev != STUB_VPTR)
+            continue;
+        uint32_t cand = entry - 0xacu;
+        if (component_valid(fd, cand)) {
+            found_component = cand;
+            ++components;
+        }
+    }
+    if (components != 1u)
+        return 0;
+    *component = found_component;
+    *thread = (uint16_t)raw_thread;
+    return 1;
+}
+
+static int find_rg_and_milca(int fd, uint32_t *out_rg, uint32_t *out_milca,
+                             uint16_t *out_thread) {
+    uint32_t vptr = 0, start = 0, end = 0, raw_tid = 0;
+    uint32_t rg = 0, milca = 0;
+    unsigned rg_count = 0, milca_count = 0;
+    if (!word(fd, MUX9_ADDR, &vptr) || vptr != MUX_VPTR ||
+        !word(fd, MUX9_ADDR + 0x1c, &start) || !word(fd, MUX9_ADDR + 0x20, &end) ||
+        !word(fd, MUX9_ADDR + 0x70, &raw_tid) ||
+        start < 0x10000u || end < start || end - start > 64u * 4u ||
+        (raw_tid & 0xffffu) == 0u || (raw_tid & 0xffffu) >= 0x7fffu)
+        return 0;
+    for (uint32_t at = start; at < end; at += 4u) {
+        uint32_t ent = 0, ev = 0;
+        if (!word(fd, at, &ent) || ent < 0x10000u || !word(fd, ent, &ev))
+            continue;
+        if (ev == RG_VPTR) { rg = ent; ++rg_count; }
+        else if (ev == MILCA_VPTR) { milca = ent; ++milca_count; }
+    }
+    if (rg_count != 1u || milca_count != 1u)
+        return 0;
+    *out_rg = rg;
+    *out_milca = milca;
+    *out_thread = (uint16_t)raw_tid;
+    return 1;
+}
+
+static void destroy_ev(void *raw) { FN(0x1457f8, void, void *)(raw); }
+static void delete_ev(void *raw) { destroy_ev(raw); free(raw); }
+static void *cast_ev(void *raw, const void *type) { (void)raw; (void)type; return NULL; }
+static void send_self(void *raw) {
+    struct owner_event *event = raw;
+    FN(0x145788, void, void *, unsigned, unsigned)(raw, event->thread, 0);
+}
+
+static int deliver_fixture_resolution(void *resolver) {
+    uint8_t *resolved = calloc(1, 256);
+    uint8_t *location = calloc(1, 256);
+    if (!resolved || !location) {
+        free(resolved);
+        free(location);
+        return 0;
+    }
+    FN(0x793c30, void, void *)(resolved);
+    *(uint32_t *)(location + 0x40) = 0;
+    *(uint32_t *)(location + 0x44) = 0;
+    *(uint32_t *)(location + 0x48) = 4823;
+    *(uint32_t *)(location + 0x4c) = 4823;
+    FN(0x793250, void, void *, unsigned, unsigned, unsigned, void *, void *, void *)(
+        location, 0, 4, 0, location + 0x40, location + 0x44, location + 0x48);
+    *(uint32_t *)(resolved + 4) = (uint32_t)(uintptr_t)location;
+    *(uint32_t *)(resolved + 8) = (uint32_t)(uintptr_t)(location + 32);
+    *(uint32_t *)(resolved + 12) = (uint32_t)(uintptr_t)(location + 32);
+    FN(0x56f970, void, void *, void *)(resolver, resolved);
+    return 1;
+}
+
+static int try_fixture_resolve(void *resolver, uint32_t kind) {
+    if ((uint32_t)(uintptr_t)resolver != wrapped_resolver_addr ||
+        !__atomic_load_n(&resolver_armed_flag, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&resolver_intercept_kind, __ATOMIC_ACQUIRE) != 0u)
+        return 0;
+    uint32_t start = *(uint32_t *)(uintptr_t)(wrapped_stub_addr + 0x14c);
+    uint32_t end = *(uint32_t *)(uintptr_t)(wrapped_stub_addr + 0x150);
+    uint32_t work_start = *(uint32_t *)((uint8_t *)resolver + 0x2c);
+    uint32_t work_end = *(uint32_t *)((uint8_t *)resolver + 0x30);
+    uint32_t token = *(uint32_t *)((uint8_t *)resolver + 0x20);
+    if (start != end || work_end < work_start ||
+        work_end - work_start != 156u || !token)
+        return 0;
+    *(uint32_t *)resolver = RESOLVER_VPTR;
+    if (!deliver_fixture_resolution(resolver))
+        return 0;
+    __atomic_store_n(&resolver_intercept_kind, kind, __ATOMIC_RELEASE);
+    return 1;
+}
+
+static void wrapped_resolve_failed(void *resolver) {
+    if (try_fixture_resolve(resolver, 2u))
+        return;
+    FN(0x56f5e0, void, void *)(resolver);
+}
+
+static void wrapped_resolve_ok(void *resolver, void *resolved) {
+    const uint32_t *res = (const uint32_t *)resolved;
+    int empty = (!res || !res[1] || res[2] < res[1] || ((res[2] - res[1]) >> 5) == 0);
+    if (empty && try_fixture_resolve(resolver, 1u))
+        return;
+    FN(0x56f970, void, void *, void *)(resolver, resolved);
+}
+
+static int calculate_fixture_route(struct owner_event *event,
+                                   uint32_t tour_high, uint32_t tour_low) {
+    uint32_t source_handle = register_fixture_source();
+    if (!source_handle)
+        return 0;
+    uint8_t *calculate = calloc(1, 4096);
+    if (!calculate)
+        return 0;
+    *(uint32_t *)(calculate + 0x30) = 0x100;
+    *(uint32_t *)(calculate + 0x34) = 17;
+    *(uint32_t *)(calculate + 0x38) = 2;
+    *(uint32_t *)(calculate + 0x50) = 1;
+    *(uint32_t *)(calculate + 0x58) = 1;
+    *(uint32_t *)(calculate + 0x5c) = tour_high;
+    *(uint32_t *)(calculate + 0x60) = tour_low;
+    uint32_t calc_before = *(uint32_t *)(uintptr_t)(event->stub + 0x44);
+    FN(0x85c82c, void, void *, void *)((void *)(uintptr_t)event->stub, calculate);
+    uint32_t calc_after = *(uint32_t *)(uintptr_t)(event->stub + 0x44);
+    uint32_t pending_begin = *(uint32_t *)(uintptr_t)(event->component + 0x2b0 + 0x74);
+    uint32_t pending_end = *(uint32_t *)(uintptr_t)(event->component + 0x2b0 + 0x78);
+    if (calc_after != calc_before + 1u ||
+        pending_end < pending_begin || pending_end - pending_begin != 0x2e8u ||
+        *(uint32_t *)(uintptr_t)(pending_begin + 4) != calc_after ||
+        *(uint32_t *)(uintptr_t)(pending_begin + 0x10) != tour_high ||
+        *(uint32_t *)(uintptr_t)(pending_begin + 0x14) != tour_low ||
+        *(uint32_t *)(uintptr_t)(pending_begin + 0x2e4) != event->stub + 0x120u)
+        return 0;
+
+    uint8_t *route_result = calloc(1, 256);
+    if (!route_result)
+        return 0;
+    FN(0x56c728, void, void *)(route_result);
+    FN(0x7116f0, void, void *, uint32_t, uint32_t, uint32_t,
+       uint32_t, uint32_t, uint32_t, uint32_t)(route_result + 8, 3, 1, 0, 0, 0, 2, 1);
+    uint32_t container = *(uint32_t *)(route_result + 0x18);
+    if (container < 0x10000u)
+        return 0;
+    *(uint32_t *)(uintptr_t)(container + 0x50) = source_handle;
+    uint32_t point[2] = {0, 0};
+    FN(0x711428, void, void *, const uint32_t *, uint64_t,
+       uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t)(
+        (void *)(uintptr_t)container, point, 2, 0, 0, 0, 0, 0, 0);
+    point[0] = 4823;
+    FN(0x711428, void, void *, const uint32_t *, uint64_t,
+       uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t)(
+        (void *)(uintptr_t)container, point, 4, 0, 0, 0, 0, 0, 0);
+    point[1] = 4823;
+    FN(0x711318, void, void *, const uint32_t *, uint32_t)(
+        (void *)(uintptr_t)container, point, 0);
+    if (*(uint32_t *)(uintptr_t)container != 6u)
+        return 0;
+
+    uint32_t route_data = event->component + 0x464u;
+    FN(0x577fe0, void, void *, void *, uint32_t, void *, void *, void *)(
+        (void *)(uintptr_t)(event->stub + 0x120u),
+        (void *)(uintptr_t)(pending_begin + 0xcu), calc_after,
+        (void *)(uintptr_t)(pending_begin + 0x1e0u),
+        (void *)(uintptr_t)(pending_begin + 0x288u), route_result);
+    /* Disarm stale Hermes1WorkerHighPrio callback so CHBStubBase::restoreContext
+     * (CHBStubBase.cpp:173) is never double-called when the background task expires. */
+    *(uint32_t *)(uintptr_t)(pending_begin + 0x2e4u) = 0;
+
+    uint32_t work_begin = *(uint32_t *)(uintptr_t)(route_data + 0x2c);
+    uint32_t work_end = *(uint32_t *)(uintptr_t)(route_data + 0x30);
+    uint32_t route_peer = *(uint32_t *)(uintptr_t)(route_data + 0x1c);
+    uint32_t peer_request = route_peer >= 0x10000u ? *(uint32_t *)(uintptr_t)(route_peer + 0x10) : 0;
+    uint32_t work_token = (work_end >= work_begin && work_end - work_begin == 0xf0u)
+                              ? *(uint32_t *)(uintptr_t)(work_begin + 4) : 0;
+    uint32_t cb_owner = (work_end >= work_begin && work_end - work_begin == 0xf0u)
+                            ? *(uint32_t *)(uintptr_t)(work_begin + 0xec) : 0;
+    if (!work_token || work_token != peer_request || cb_owner != event->stub + 0x124u)
+        return 0;
+
+    uint32_t *source_result = calloc(16, sizeof(*source_result));
+    if (!source_result)
+        return 0;
+    source_result[0] = source_handle;
+    *(uint32_t *)(uintptr_t)(route_data + 0x20) = work_token;
+    FN(0x570b1c, void, void *, void *)((void *)(uintptr_t)route_data, source_result);
+
+    uint32_t rb = *(uint32_t *)(uintptr_t)(event->stub + 0x15c);
+    uint32_t re = *(uint32_t *)(uintptr_t)(event->stub + 0x160);
+    uint32_t live_route_id = 0;
+    if (rb >= 0x10000u && re >= rb + 4u) {
+        uint32_t route_obj = *(uint32_t *)(uintptr_t)(re - 4u);
+        if (route_obj >= 0x10000u && route_obj < 0x80000000u)
+            live_route_id = *(uint32_t *)(uintptr_t)(route_obj + 0x18);
+    }
+    if (!live_route_id)
+        return 0;
+    __atomic_store_n(&created_route_id, live_route_id, __ATOMIC_RELEASE);
+    return 1;
+}
+
+static uint32_t find_milca_list_for_route(uint32_t milca, uint32_t route_id) {
+    uint32_t begin = *(const uint32_t *)(uintptr_t)(milca + 0x370);
+    uint32_t end = *(const uint32_t *)(uintptr_t)(milca + 0x374);
+    if (begin < 0x10000u || end < begin || (end - begin) % 24u != 0)
+        return 0;
+    uint32_t rows = (end - begin) / 24u;
+    for (uint32_t i = 0; i < rows; ++i) {
+        uint32_t row = begin + i * 24u;
+        if (*(const uint32_t *)(uintptr_t)row == route_id) {
+            uint32_t holder = *(const uint32_t *)(uintptr_t)(row + 0x14);
+            if (holder >= 0x10000u && holder < 0x80000000u)
+                return *(const uint32_t *)(uintptr_t)(holder + 4);
+        }
+    }
+    return 0;
+}
+
+static void publish_dtm(uint32_t rg, uint32_t route_id, uint32_t man_id,
+                        uint32_t dist_dm, uint32_t norm_m, const void *locale) {
+    _Alignas(8) uint8_t dtm[0x2c];
+    memset(dtm, 0, sizeof(dtm));
+    *(uint32_t *)(dtm + 0x00) = route_id;
+    *(uint32_t *)(dtm + 0x04) = man_id;
+    *(uint32_t *)(dtm + 0x08) = dist_dm;
+    *(uint32_t *)(dtm + 0x0c) = 1u; /* BG_ENABLED */
+    FN(0x16c5f4, void, void *)(dtm + 0x14);
+    FN(0x16ce4c, void, void *, const void *)(dtm + 0x14, locale);
+    *(uint32_t *)(dtm + 0x24) = norm_m;
+    *(uint32_t *)(dtm + 0x28) = 0u; /* UNIT_METERS */
+    FN(0x86d0b8, void, void *, const void *)((void *)(uintptr_t)rg, dtm);
+    FN(0x16cf50, void, void *)(dtm + 0x14);
+}
+
+static void reset_milca_active_ids(uint32_t list) {
+    uint32_t id_beg = *(const uint32_t *)(uintptr_t)(list + 0x64);
+    *(uint32_t *)(uintptr_t)(list + 0x68) = id_beg;
+}
+
+static void append_neutral_lane_boundary(uint8_t *point) {
+    _Alignas(8) uint8_t lane[28];
+    memset(lane, 0, sizeof(lane));
+    FN(0x1d6580, void, void *)(lane);
+    FN(0xcc59e0, void, void *, const void *)(point + 0x14c, lane);
+    FN(0x1d57f8, void, void *)(lane);
+}
+
+static int insert_milca_maneuver(uint32_t list, uint32_t id, uint32_t sort_pos_dm,
+                                 const struct semantic_basic_cue *cue) {
+    uint8_t *rec = FN(0x11ad54, uint8_t *, unsigned)(0x188);
+    if (!rec)
+        return 0;
+    FN(0x3edad4, void, void *)(rec);
+    *(uint32_t *)(rec + 0x00) = id;
+    *(uint32_t *)(rec + 0x04) = cue->action;
+    *(uint32_t *)(rec + 0x08) = cue->direction;
+    *(uint32_t *)(rec + 0xa4) = sort_pos_dm;
+
+    if (cue->road[0]) {
+        uint32_t entry[2] = {0, 0};
+        FN(0x1185f8, void *, void *, const char *, unsigned)(
+            &entry[0], cue->road, (unsigned)strlen(cue->road));
+        FN(0x4a9730, void, void *, const void *)(rec + 0xe4, entry);
+        FN(0x117710, void, void *)(&entry[0]);
+
+        uint32_t country = 0;
+        FN(0x1185f8, void *, void *, const char *, unsigned)(&country, "USA", 3u);
+        FN(0x10dd20, void *, void *, const void *)(rec + 0x114, &country);
+        FN(0x117710, void, void *)(&country);
+    }
+
+    _Alignas(8) uint8_t point[0x1a8];
+    FN(0x3ed28c, void, void *)(point);
+    *(uint32_t *)(point + 0x80) = 1u;
+    *(uint32_t *)(point + 0x144) = 4u; /* NOW */
+    *(uint32_t *)(point + 0x18c) = cue->dist_dm;
+
+    _Alignas(8) uint8_t elem[24];
+    FN(0x792cb8, void, void *)(elem);
+    *(uint32_t *)(elem + 0x00) = cue->elem_type;
+    memcpy(elem + 0x14, &cue->angle_deg, sizeof(cue->angle_deg));
+    uint32_t usage = 0;
+    FN(0x8e6a6c, void, void *, const uint32_t *)(elem + 0x04, &usage);
+    FN(0xcded58, void, void *, const void *)(point + 0x84, elem);
+    FN(0x7928b0, void, void *)(elem);
+
+    if (cue->lane_count > 0u) {
+        append_neutral_lane_boundary(point);
+        for (uint32_t i = cue->lane_count; i > 0u; --i) {
+            const struct ng_lane data = cue->lanes[i - 1u];
+            _Alignas(8) uint8_t lane[28];
+            memset(lane, 0, sizeof(lane));
+            FN(0x1d6580, void, void *)(lane);
+            for (uint16_t bit = 1u; bit <= NG_LANE_UTURN_RIGHT; bit <<= 1) {
+                if (!(data.arrows & bit))
+                    continue;
+                float deg = semantic_lane_degrees(bit);
+                uint32_t status = (data.recommended & bit) ? 0u : 2u;
+                _Alignas(4) uint8_t arrow[8];
+                memcpy(arrow, &deg, 4);
+                memcpy(arrow + 4, &status, 4);
+                FN(0xcc5d00, void, void *, const void *)(lane, arrow);
+            }
+            *(uint32_t *)(lane + 16) = 1u; /* ARROWS */
+            *(uint32_t *)(lane + 20) = 0u;
+            FN(0xcc59e0, void, void *, const void *)(point + 0x14c, lane);
+            FN(0x1d57f8, void, void *)(lane);
+            append_neutral_lane_boundary(point);
+        }
+        *(uint32_t *)(point + 0x148) = 1u;
+    }
+
+    FN(0x3ed82c, void, void *, unsigned, const void *)(rec + 0x134, 1, point);
+    FN(0x3ec444, void, void *)(point);
+
+    uint32_t holder = 0;
+    FN(0x8baba4, void *, void *, void *)(&holder, rec);
+    if (!holder) {
+        FN(0x3ec508, void, void *)(rec);
+        FN(0x11ad44, void, void *)(rec);
+        return 0;
+    }
+    FN(0x3ff604, void, void *, void *)((void *)(uintptr_t)list, &holder);
+    FN(0x3f2ca4, void, void *)(&holder);
+    return 1;
+}
+
+static void execute_hud_phase(const struct owner_event *event, unsigned context) {
+    uint32_t rg = event->component;
+    uint32_t milca = event->stub;
+    uint32_t route_id = event->arg0;
+    if (context != event->thread ||
+        *(uint32_t *)(uintptr_t)rg != RG_VPTR ||
+        *(uint32_t *)(uintptr_t)milca != MILCA_VPTR) {
+        __atomic_store_n(&hud_dispatch_state, 2u, __ATOMIC_RELEASE);
+        return;
+    }
+    if (event->phase == PHASE_ACTIVATE_GUIDANCE) {
+        uint32_t gs = 2u; /* GUIDANCE_NORMAL_ACTIVE */
+        _Alignas(8) uint8_t ts[0xd0];
+        FN(0x402a6c, void, void *, const uint32_t *)((void *)(uintptr_t)rg, &gs);
+        FN(0x1d2b14, void *, void *, const void *)(ts, (const void *)(uintptr_t)(rg + 0x838));
+        *(uint32_t *)(ts + 0x10) = 1u; /* ROLE_GUIDED_ROUTE */
+        *(uint32_t *)(ts + 0xb8) = 0u;
+        *(uint32_t *)(ts + 0xbc) = UINT32_MAX;
+        *(uint32_t *)(ts + 0xc0) = 1u; /* GUIDANCE_ROUTE_STATUS_GUIDED */
+        FN(0x4029cc, void, void *, const void *)((void *)(uintptr_t)rg, ts);
+        FN(0x1d2b00, void, void *)(ts);
+        __atomic_store_n(&hud_dispatch_state, 1u, __ATOMIC_RELEASE);
+        return;
+    }
+    if (event->phase == PHASE_PUBLISH_CUE) {
+        uint32_t list = find_milca_list_for_route(milca, route_id);
+        if (list < 0x10000u || list >= 0x80000000u) {
+            __atomic_store_n(&hud_dispatch_state, 2u, __ATOMIC_RELEASE);
+            return;
+        }
+        const struct semantic_basic_cue *cue = &g_pending_cue;
+        if (g_pending_dtm_only && g_active_man_id != 0u) {
+            publish_dtm(rg, route_id, g_active_man_id, cue->dist_dm, cue->norm_m,
+                        (const void *)(uintptr_t)(list + 0x50));
+            __atomic_store_n(&hud_dispatch_state, 1u, __ATOMIC_RELEASE);
+            return;
+        }
+        reset_milca_active_ids(list);
+        uint32_t id = g_next_man_id;
+        g_next_man_id += 2u;
+        g_active_man_id = id;
+        uint32_t sort_pos_dm = (g_sort_counter++) * 10000u + cue->dist_dm;
+        if (!insert_milca_maneuver(list, id, sort_pos_dm, cue)) {
+            __atomic_store_n(&hud_dispatch_state, 2u, __ATOMIC_RELEASE);
+            return;
+        }
+        if (!cue->is_arrival) {
+            struct semantic_basic_cue trailing;
+            memset(&trailing, 0, sizeof(trailing));
+            trailing.action = 18u;
+            trailing.direction = 3u;
+            trailing.elem_type = 1u;
+            trailing.dist_dm = cue->dist_dm + 2000u;
+            trailing.norm_m = (cue->dist_dm + 2000u) / 10u;
+            trailing.is_arrival = 1u;
+            if (!insert_milca_maneuver(list, id + 1u, sort_pos_dm + 2000u, &trailing)) {
+                __atomic_store_n(&hud_dispatch_state, 2u, __ATOMIC_RELEASE);
+                return;
+            }
+        }
+        FN(0x3f652c, void, void *, void *, void *, void *)(
+            (void *)(uintptr_t)milca,
+            (void *)(uintptr_t)(list + 0x70),
+            (void *)(uintptr_t)(list + 0x50),
+            (void *)(uintptr_t)(list + 0x60));
+        FN(0x3f1fe8, void, void *, void *)((void *)(uintptr_t)milca,
+                                           (void *)(uintptr_t)list);
+
+        _Alignas(8) uint8_t drp[0x1c];
+        memset(drp, 0, sizeof(drp));
+        *(uint32_t *)(drp + 0x00) = route_id;
+        *(uint32_t *)(drp + 0x04) = id;
+        FN(0x16c5f4, void, void *)(drp + 0x0c);
+        FN(0x16ce4c, void, void *, const void *)(drp + 0x0c,
+                                                 (const void *)(uintptr_t)(list + 0x50));
+        FN(0x1d28f0, void, void *, const void *)((void *)(uintptr_t)(rg + 0x54), drp);
+        FN(0x86cf6c, void, void *, uint32_t)((void *)(uintptr_t)rg, 0xc0000000u);
+        FN(0x16cf50, void, void *)(drp + 0x0c);
+
+        publish_dtm(rg, route_id, id, cue->dist_dm, cue->norm_m,
+                    (const void *)(uintptr_t)(list + 0x50));
+        __atomic_store_n(&hud_dispatch_state, 1u, __ATOMIC_RELEASE);
+        return;
+    }
+    if (event->phase == PHASE_CLEAR_GUIDANCE) {
+        uint32_t gs = 5u; /* GUIDANCE_STOPPED_BY_USER_REQUEST */
+        _Alignas(8) uint8_t ts[0xd0];
+        FN(0x402a6c, void, void *, const uint32_t *)((void *)(uintptr_t)rg, &gs);
+        FN(0x1d2b14, void *, void *, const void *)(ts, (const void *)(uintptr_t)(rg + 0x838));
+        *(uint32_t *)(ts + 0x00) = 0;
+        *(uint32_t *)(ts + 0x04) = 0;
+        *(uint32_t *)(ts + 0x08) = 0;
+        *(uint32_t *)(ts + 0x10) = 0;
+        *(uint32_t *)(ts + 0xb8) = UINT32_MAX;
+        *(uint32_t *)(ts + 0xbc) = UINT32_MAX;
+        *(uint32_t *)(ts + 0xc0) = 0;
+        FN(0x4029cc, void, void *, const void *)((void *)(uintptr_t)rg, ts);
+        FN(0x1d2b00, void, void *)(ts);
+        g_active_man_id = 0u;
+        __atomic_store_n(&hud_dispatch_state, 1u, __ATOMIC_RELEASE);
+        return;
+    }
+}
+
+static void execute_event(void *raw, void *dispatcher) {
+    struct owner_event *event = raw;
+    (void)dispatcher;
+    const unsigned context = FN(0x148d78, unsigned, void)();
+    if (event->phase >= PHASE_ACTIVATE_GUIDANCE) {
+        execute_hud_phase(event, context);
+        return;
+    }
+    if (context != event->thread ||
+        *(uint32_t *)(uintptr_t)event->component != COMPONENT_VPTR ||
+        *(uint32_t *)(uintptr_t)event->stub != STUB_VPTR) {
+        if (event->phase == PHASE_INSTALL_RESOLVER)
+            __atomic_store_n(&resolver_wrapper_state, 2u, __ATOMIC_RELEASE);
+        else
+            __atomic_store_n(&owner_dispatch_state, 2u, __ATOMIC_RELEASE);
+        return;
+    }
+    if (event->phase == PHASE_INSTALL_RESOLVER) {
+        uint32_t resolver = event->component + 0x428u;
+        if (*(uint32_t *)(uintptr_t)resolver != RESOLVER_VPTR) {
+            __atomic_store_n(&resolver_wrapper_state, 2u, __ATOMIC_RELEASE);
+            return;
+        }
+        memcpy(resolver_vtable_copy, (const void *)(uintptr_t)RESOLVER_VPTR,
+               sizeof(resolver_vtable_copy));
+        if (resolver_vtable_copy[3] != 0x56f5e0u || resolver_vtable_copy[4] != 0x56f970u) {
+            __atomic_store_n(&resolver_wrapper_state, 2u, __ATOMIC_RELEASE);
+            return;
+        }
+        resolver_vtable_copy[3] = (uint32_t)(uintptr_t)&wrapped_resolve_failed;
+        resolver_vtable_copy[4] = (uint32_t)(uintptr_t)&wrapped_resolve_ok;
+        wrapped_resolver_addr = resolver;
+        wrapped_stub_addr = event->stub;
+        *(uint32_t *)(uintptr_t)resolver = (uint32_t)(uintptr_t)resolver_vtable_copy;
+        __atomic_store_n(&resolver_wrapper_state, 1u, __ATOMIC_RELEASE);
+        return;
+    }
+    if (event->phase == PHASE_CALC_ROUTE) {
+        uint32_t start = *(uint32_t *)(uintptr_t)(event->stub + 0x14c);
+        uint32_t end = *(uint32_t *)(uintptr_t)(event->stub + 0x150);
+        if (start < 0x10000u || end < start + 4u) {
+            __atomic_store_n(&owner_dispatch_state, 2u, __ATOMIC_RELEASE);
+            return;
+        }
+        uint32_t tour = *(uint32_t *)(uintptr_t)(end - 4u);
+        if (tour < 0x10000u) {
+            __atomic_store_n(&owner_dispatch_state, 2u, __ATOMIC_RELEASE);
+            return;
+        }
+        uint32_t th = *(uint32_t *)(uintptr_t)(tour + 4u);
+        uint32_t tl = *(uint32_t *)(uintptr_t)(tour + 8u);
+        tour_high_cached = th;
+        tour_low_cached = tl;
+        int ok = calculate_fixture_route(event, th, tl);
+        __atomic_store_n(&owner_dispatch_state, ok ? 1u : 2u, __ATOMIC_RELEASE);
+    }
+}
+
+static void *event_vtable[5] = {
+    destroy_ev, delete_ev, cast_ev, send_self, execute_event
+};
+
+static uint32_t dispatch_owner(uint32_t comp, uint32_t stub, uint16_t tid,
+                               uint16_t phase, uint32_t arg0, volatile uint32_t *state_var) {
+    __atomic_store_n(state_var, 0u, __ATOMIC_RELEASE);
+    struct owner_event *ev = calloc(1, sizeof(*ev));
+    if (!ev) return 2u;
+    FN(0x1458ac, void, void *)(ev);
+    ev->vtable = event_vtable;
+    ev->component = comp;
+    ev->stub = stub;
+    ev->thread = tid;
+    ev->phase = phase;
+    ev->arg0 = arg0;
+    send_self(ev);
+    for (unsigned i = 0; i < 150u; ++i) {
+        uint32_t st = __atomic_load_n(state_var, __ATOMIC_ACQUIRE);
+        if (st) return st;
+        struct timespec w = {0, 20000000};
+        nanosleep(&w, NULL);
+    }
+    return 0u;
+}
+
+static int open_dgram_socket(const char *path) {
+    unlink(path);
+    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    struct qnx_sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    size_t len = strlen(path);
+    if (len >= sizeof(addr.sun_path)) { close(fd); return -1; }
+    addr.sun_family = AF_UNIX;
+    addr.sun_len = (uint8_t)(offsetof(struct qnx_sockaddr_un, sun_path) + len + 1u);
+    memcpy(addr.sun_path, path, len + 1u);
+    if (bind(fd, (struct sockaddr *)&addr, addr.sun_len) != 0) {
+        close(fd);
+        return -1;
+    }
+    (void)qnx_chmod(path, 0600);
+    return fd;
+}
+
+static void write_ng_reply(int fd, const struct sockaddr *peer, socklen_t peer_len,
+                           uint32_t seq, uint32_t result) {
+    uint8_t rep[16];
+    memcpy(rep, "NGA1", 4);
+    for (unsigned i = 0; i < 4u; ++i) rep[4u + i] = (uint8_t)(seq >> (8u * i));
+    for (unsigned i = 0; i < 4u; ++i) rep[8u + i] = (uint8_t)(result >> (8u * i));
+    for (unsigned i = 0; i < 4u; ++i) rep[12u + i] = (uint8_t)(NG_CAP_MODEL_ID >> (8u * i));
+    (void)sendto(fd, rep, sizeof(rep), 0, peer, peer_len);
+}
+
+struct basic_runtime {
+    int mem_fd;
+    uint32_t component;
+    uint32_t stub;
+    uint16_t owner_tid;
+    uint32_t rg;
+    uint32_t milca;
+    uint16_t rg_tid;
+
+    int guidance_active;
+    int has_pending;
+    int has_published;
+    struct semantic_basic_cue pending_cue;
+    struct semantic_basic_cue published_cue;
+    uint64_t session;
+    uint64_t last_alive_ms;
+    uint32_t last_seq;
+};
+
+static int try_publish_pending(struct basic_runtime *rt) {
+    if (!rt->has_pending || !rt->guidance_active)
+        return 1;
+    uint32_t route_id = __atomic_load_n(&active_route_id, __ATOMIC_ACQUIRE);
+    if (!route_id)
+        return 0;
+    if (find_milca_list_for_route(rt->milca, route_id) == 0u)
+        return 0;
+    g_pending_cue = rt->pending_cue;
+    g_pending_dtm_only = (rt->has_published &&
+                          semantic_cue_is_distance_only(&rt->published_cue, &rt->pending_cue)) ? 1u : 0u;
+    if (dispatch_owner(rt->rg, rt->milca, rt->rg_tid, PHASE_PUBLISH_CUE, route_id, &hud_dispatch_state) != 1u)
+        return 0;
+    rt->published_cue = rt->pending_cue;
+    rt->has_published = 1;
+    rt->has_pending = 0;
+    return 1;
+}
+
+static void clear_session(struct basic_runtime *rt) {
+    uint32_t route_id = __atomic_load_n(&active_route_id, __ATOMIC_ACQUIRE);
+    if (rt->guidance_active && route_id) {
+        (void)dispatch_owner(rt->rg, rt->milca, rt->rg_tid, PHASE_CLEAR_GUIDANCE, route_id, &hud_dispatch_state);
+    }
+    rt->guidance_active = 0;
+    rt->has_pending = 0;
+    rt->has_published = 0;
+    rt->session = 0;
+    rt->last_seq = 0;
+    __atomic_store_n(&resolver_armed_flag, 0u, __ATOMIC_RELEASE);
+
+    struct semantic_handoff h;
+    memset(&h, 0, sizeof(h));
+    h.state = SH_CLEARED;
+    h.route_id = route_id;
+    (void)semantic_handoff_write(semantic_handoff_default_path(), &h);
+}
+
+static void progress_handoff(struct basic_runtime *rt) {
+    if (!rt->session || rt->guidance_active)
+        return;
+
+    uint32_t route_id = __atomic_load_n(&active_route_id, __ATOMIC_ACQUIRE);
+    if (!route_id) {
+        /* Wait for Controller's NewTrip to create a tour in Basic, then build 2-link route. */
+        uint32_t start = 0, end = 0;
+        if (word(rt->mem_fd, rt->stub + 0x14c, &start) &&
+            word(rt->mem_fd, rt->stub + 0x150, &end) && end >= start + 4u) {
+            if (dispatch_owner(rt->component, rt->stub, rt->owner_tid,
+                               PHASE_CALC_ROUTE, 0u, &owner_dispatch_state) == 1u) {
+                route_id = __atomic_load_n(&created_route_id, __ATOMIC_ACQUIRE);
+                if (route_id) {
+                    __atomic_store_n(&active_route_id, route_id, __ATOMIC_RELEASE);
+                    struct semantic_handoff h;
+                    memset(&h, 0, sizeof(h));
+                    h.state = SH_ROUTE_READY;
+                    h.route_id = route_id;
+                    h.session = rt->session;
+                    (void)semantic_handoff_write(semantic_handoff_default_path(), &h);
+                }
+            }
+        }
+        return;
+    }
+
+    /* Check if Controller finished AttachRoute + StartGuidance for this session. */
+    struct semantic_handoff h;
+    if (semantic_handoff_read(semantic_handoff_default_path(), &h) &&
+        h.session == rt->session && h.state == SH_GUIDANCE_ACTIVE && h.route_id == route_id) {
+        if (dispatch_owner(rt->rg, rt->milca, rt->rg_tid, PHASE_ACTIVATE_GUIDANCE,
+                           route_id, &hud_dispatch_state) == 1u) {
+            rt->guidance_active = 1;
+            (void)try_publish_pending(rt);
+        }
+    }
+}
+
+static void *worker_main(void *administrator) {
+    char proc[64];
+    snprintf(proc, sizeof(proc), "/proc/%d/as", getpid());
+    int mem_fd = open(proc, O_RDONLY);
+    if (mem_fd < 0)
+        return NULL;
+
+    if (!verify_identity(mem_fd, administrator)) {
+        fprintf(stderr, "SEMANTIC_BASIC refused identity\n");
+        close(mem_fd);
+        return NULL;
+    }
+
+    struct basic_runtime rt;
+    memset(&rt, 0, sizeof(rt));
+    rt.mem_fd = mem_fd;
+
+    /* Wait for NavigationBasic DataAccess + TourManager + CRouteGuidance + CMiLCa to initialize. */
+    for (unsigned i = 0; i < 600u; ++i) {
+        uint32_t ready = 0;
+        if (word(mem_fd, DATA_ACCESS_READY, &ready) && (ready & 1u) &&
+            find_owner(mem_fd, &rt.component, &rt.owner_tid) &&
+            find_rg_and_milca(mem_fd, &rt.rg, &rt.milca, &rt.rg_tid))
+            break;
+        struct timespec w = {0, 500000000};
+        nanosleep(&w, NULL);
+    }
+    if (!rt.component || !rt.rg || !rt.milca) {
+        fprintf(stderr, "SEMANTIC_BASIC refused owner_timeout\n");
+        close(mem_fd);
+        return NULL;
+    }
+    rt.stub = rt.component + 0xacu;
+
+    char main_path[96], alive_path[96];
+    snprintf(main_path, sizeof(main_path), "%s/native-guidance-%d.sock", NG_SOCKET_ROOT, getpid());
+    snprintf(alive_path, sizeof(alive_path), "%s/%s%d.sock", NG_SOCKET_ROOT, NG_ALIVE_ENDPOINT_PREFIX, getpid());
+    int main_fd = open_dgram_socket(main_path);
+    int alive_fd = open_dgram_socket(alive_path);
+    if (main_fd < 0 || alive_fd < 0) {
+        fprintf(stderr, "SEMANTIC_BASIC refused socket\n");
+        if (main_fd >= 0) close(main_fd);
+        if (alive_fd >= 0) close(alive_fd);
+        close(mem_fd);
+        return NULL;
+    }
+    fprintf(stderr, "SEMANTIC_BASIC ready pid=%d rg=%#x milca=%#x\n", getpid(), rt.rg, rt.milca);
+
+    struct pollfd pfds[2];
+    pfds[0].fd = main_fd;  pfds[0].events = POLLIN;
+    pfds[1].fd = alive_fd; pfds[1].events = POLLIN;
+
+    for (;;) {
+        (void)poll(pfds, 2, 50);
+        uint64_t now = mono_ms();
+
+        /* Handle liveness pings */
+        if (pfds[1].revents & POLLIN) {
+            uint8_t buf[NG_ALIVE_BYTES + 4u];
+            struct qnx_sockaddr_un peer;
+            socklen_t peer_len = sizeof(peer);
+            ssize_t n = recvfrom(alive_fd, buf, sizeof(buf), 0, (struct sockaddr *)&peer, &peer_len);
+            if (n > 0) {
+                struct ng_alive_message am;
+                unsigned res = ng_alive_decode(buf, (size_t)n, &am);
+                struct ng_alive_ack ack;
+                memset(&ack, 0, sizeof(ack));
+                ack.message = am;
+                if (res == NG_ALIVE_ACCEPTED && rt.session && am.session == rt.session) {
+                    rt.last_alive_ms = now;
+                    ack.result = NG_ALIVE_ACCEPTED;
+                    ack.flags = NG_ALIVE_ONLY;
+                    ack.accepted_ms = now >= am.created_ms ? now : am.created_ms;
+                } else {
+                    ack.result = (res == NG_ALIVE_ACCEPTED) ? NG_ALIVE_SESSION : res;
+                }
+                uint8_t out[NG_ALIVE_ACK_BYTES];
+                ng_alive_ack_encode(out, &ack);
+                (void)sendto(alive_fd, out, sizeof(out), 0, (struct sockaddr *)&peer, peer_len);
+            }
+        }
+
+        /* Handle NGV1..5 + NGC1 requests */
+        if (pfds[0].revents & POLLIN) {
+            uint8_t buf[NG_MAX_FRAME_BYTES + 8u];
+            struct qnx_sockaddr_un peer;
+            socklen_t peer_len = sizeof(peer);
+            ssize_t n = recvfrom(main_fd, buf, sizeof(buf), 0, (struct sockaddr *)&peer, &peer_len);
+            if (n > 0) {
+                uint32_t cap_seq = ng_cap_query(buf, (size_t)n);
+                if (cap_seq) {
+                    uint8_t crep[NG_CAP_BYTES];
+                    ng_cap_response(crep, cap_seq, NG_CAP_SUPPORTED);
+                    (void)sendto(main_fd, crep, sizeof(crep), 0, (struct sockaddr *)&peer, peer_len);
+                } else {
+                    struct ng_message msg;
+                    enum ng_result r = ng_decode(buf, (size_t)n, &msg);
+                    if (r != NG_OK) {
+                        write_ng_reply(main_fd, (struct sockaddr *)&peer, peer_len, 0u, (uint32_t)r);
+                    } else if (msg.operation == NG_PROBE) {
+                        write_ng_reply(main_fd, (struct sockaddr *)&peer, peer_len, msg.sequence, NG_OK);
+                    } else if (msg.operation == NG_STOP) {
+                        if (rt.session && msg.session == rt.session)
+                            clear_session(&rt);
+                        write_ng_reply(main_fd, (struct sockaddr *)&peer, peer_len, msg.sequence, NG_OK);
+                    } else if (msg.operation == NG_BEGIN || msg.operation == NG_UPDATE) {
+                        struct semantic_basic_cue cue;
+                        if (!semantic_map_ng_message(&msg, &cue)) {
+                            write_ng_reply(main_fd, (struct sockaddr *)&peer, peer_len,
+                                           msg.sequence, NG_BAD_VALUE);
+                        } else if (msg.operation == NG_BEGIN) {
+                            if (rt.session && rt.session != msg.session)
+                                clear_session(&rt);
+                            rt.session = msg.session;
+                            rt.last_seq = msg.sequence;
+                            rt.last_alive_ms = now;
+                            rt.pending_cue = cue;
+                            rt.has_pending = 1;
+                            rt.has_published = 0;
+
+                            uint32_t existing_route = __atomic_load_n(&active_route_id, __ATOMIC_ACQUIRE);
+                            if (!existing_route) {
+                                /* First route this boot: arm resolver wrapper for Controller's NewTrip. */
+                                __atomic_store_n(&resolver_intercept_kind, 0u, __ATOMIC_RELEASE);
+                                __atomic_store_n(&resolver_armed_flag, 1u, __ATOMIC_RELEASE);
+                                (void)dispatch_owner(rt.component, rt.stub, rt.owner_tid,
+                                                     PHASE_INSTALL_RESOLVER, 0u, &resolver_wrapper_state);
+                            }
+                            struct semantic_handoff h;
+                            memset(&h, 0, sizeof(h));
+                            h.state = existing_route ? SH_ROUTE_READY : SH_BASIC_ARMED;
+                            h.route_id = existing_route;
+                            h.session = rt.session;
+                            (void)semantic_handoff_write(semantic_handoff_default_path(), &h);
+                            write_ng_reply(main_fd, (struct sockaddr *)&peer, peer_len, msg.sequence, NG_OK);
+                        } else {
+                            /* NG_UPDATE */
+                            if (!rt.session || msg.session != rt.session) {
+                                write_ng_reply(main_fd, (struct sockaddr *)&peer, peer_len,
+                                               msg.sequence, NG_BAD_SESSION);
+                            } else {
+                                rt.last_seq = msg.sequence;
+                                rt.last_alive_ms = now;
+                                rt.pending_cue = cue;
+                                rt.has_pending = 1;
+                                (void)try_publish_pending(&rt);
+                                write_ng_reply(main_fd, (struct sockaddr *)&peer, peer_len, msg.sequence, NG_OK);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        progress_handoff(&rt);
+        if (rt.guidance_active && rt.has_pending)
+            (void)try_publish_pending(&rt);
+
+        /* Lease expiry: if nbt-aad disappears for >10 s, clear our owned guidance cleanly. */
+        if (rt.session && rt.last_alive_ms && now > rt.last_alive_ms + NG_ALIVE_LEASE_MS) {
+            fprintf(stderr, "SEMANTIC_BASIC lease expired; clearing owned guidance\n");
+            clear_session(&rt);
+        }
+    }
+    return NULL;
+}
+
+__attribute__((visibility("default"))) void registerCallbacks(void *administrator) {
+    static unsigned entered;
+    if (__atomic_exchange_n(&entered, 1u, __ATOMIC_ACQ_REL))
+        return;
+    pthread_t worker;
+    if (pthread_create(&worker, NULL, worker_main, administrator) == 0)
+        pthread_detach(worker);
+}

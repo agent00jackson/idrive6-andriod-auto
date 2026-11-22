@@ -62,6 +62,7 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include "../src/usb_log.hpp"
+#include "../src/nbt_env.hpp"
 #include "cds_parse.hpp"
 #include "boot_guard.hpp"
 #include "overlay_watch.hpp"
@@ -383,6 +384,18 @@ const unsigned    kActNoLog         = 173;   // "Disable logging (performance te
 const unsigned    kNoLogModel       = 175;   // raBoolModel
 const unsigned    kActSpeechBt      = 174;   // "Prompts on car radio (BT, beta)" checkbox
 const unsigned    kSpeechBtModel    = 177;   // raBoolModel
+// Navigation Mode sub-page (hmiState 16, parentId 14): Semantic / J29 / 6WA selector persisted to nav-mode.
+const unsigned    kNavModeState          = 16;
+const unsigned    kActNavModeSemantic    = 181;
+const unsigned    kActNavModeJ29         = 182;
+const unsigned    kActNavMode6wa         = 183;
+const unsigned    kNavModeBtnModel       = 182;   // textIdModel on Settings row ("Navigation Mode: ...")
+const unsigned    kNavModeSemanticModel  = 185;   // raBoolModel ("Semantic")
+const unsigned    kNavModeJ29Model       = 187;   // raBoolModel ("J29")
+const unsigned    kNavMode6waModel       = 189;   // raBoolModel ("6WA")
+const unsigned    kNavModeTextJ29        = 50;    // "Navigation Mode: J29"
+const unsigned    kNavModeTextSemantic   = 51;    // "Navigation Mode: Semantic"
+const unsigned    kNavModeText6wa        = 52;    // "Navigation Mode: 6WA"
 const char* const kSpeechBtFlag     = "speech-bt";
 const char* const kNoLogFlag        = "no-log";
 const unsigned    kPfRowButton[3]  = { 135, 140, 141 };
@@ -999,10 +1012,11 @@ DaemonState readDaemonState() {
 bool g_focusKnown = false;     // a focus notification for our menu arrived at least once
 bool g_menuFocused = false;    // focus notification of hmiState 10 (the menu itself)
 bool g_settingsFocused = false; // focus notification of hmiState 14 (the Settings page under it, rhmiapp-39)
-// "The driver is in our own UI" (menu or its Settings page). Used by the hold: coming back to either is not a car
-// screen taking over. g_menuFocused alone stays the answer to "is the menu itself on top", which is what the
+bool g_navModeFocused = false;  // focus notification of hmiState 16 (Settings -> Navigation Mode sub-page)
+// "The driver is in our own UI" (menu, Settings, or Navigation Mode). Used by the hold: coming back to any of them is
+// not a car screen taking over. g_menuFocused alone stays the answer to "is the menu itself on top", which is what the
 // connected-after-Start return to the main menu tests (a driver reading Settings must not be pulled out of it).
-bool inOurMenu() { return g_menuFocused || g_settingsFocused; }
+bool inOurMenu() { return g_menuFocused || g_settingsFocused || g_navModeFocused; }
 bool g_wantHome = false;       // Start was pressed: return to the main menu once the phone is connected
 bool g_entryStart = false;     // the Open Android Auto entry started nbt-aad: show it on connect if our menu is on top
 pid_t g_autostartPid = 0;     // automatic launch waiting for its first projection handoff
@@ -1432,7 +1446,7 @@ void serviceHold(bmw::PluginApp* app, const DaemonState& d) {
         // (state 14): both belong to the phone, put iDrive straight back on the blank state. Also during a call:
         // iDrive's own call screen never focuses our menu.
         fireHold(app, callActive() ? "BACK returned to our menu during a call"
-                                   : (g_settingsFocused ? "in our Settings page" : "BACK returned to our menu"));
+                                   : ((g_settingsFocused || g_navModeFocused) ? "in our Settings page" : "BACK returned to our menu"));
         return;
     }
     if (callActive()) {
@@ -1462,7 +1476,7 @@ void serviceHold(bmw::PluginApp* app, const DaemonState& d) {
         return;
     }
     if (inOurMenu()) {
-        fireHold(app, g_settingsFocused ? "back in our Settings page" : "BACK returned to our menu");  // BACK goes to the phone; keep iDrive on the blank state
+        fireHold(app, (g_settingsFocused || g_navModeFocused) ? "back in our Settings page" : "BACK returned to our menu");  // BACK goes to the phone; keep iDrive on the blank state
     } else {
         // Neither our blank state nor our menu: a hard key (MENU / MEDIA / NAV / COM / MAP / OPTION) took iDrive
         // elsewhere, the way MENU leaves native CarPlay. Android Auto steps aside; the iDrive entry brings it back.
@@ -1835,6 +1849,39 @@ bool onKombiNavToggle(void* /*app*/, const bmw::Parcel& /*args*/) {
     if (g_runApp) showKombiNav(g_runApp);
     return true;
 }
+
+// ---- Navigation Mode (Semantic / J29 / 6WA) -------------------------------------------------------------------------
+unsigned navModeButtonTextId(nbt::NavMode mode) {
+    switch (mode) {
+    case nbt::kNavModeSemantic: return kNavModeTextSemantic;
+    case nbt::kNavMode6wa:      return kNavModeText6wa;
+    case nbt::kNavModeJ29:
+    default:                    return kNavModeTextJ29;
+    }
+}
+
+void showNavMode(bmw::PluginApp* app) {
+    const nbt::NavMode cur = nbt::readNavModeFile();
+    app->updateModel(kNavModeBtnModel, bmw::TextID(navModeButtonTextId(cur)));
+    app->updateModel(kNavModeSemanticModel, cur == nbt::kNavModeSemantic);
+    app->updateModel(kNavModeJ29Model, cur == nbt::kNavModeJ29);
+    app->updateModel(kNavMode6waModel, cur == nbt::kNavMode6wa);
+}
+
+bool selectNavMode(nbt::NavMode next) {
+    const nbt::NavMode prev = nbt::readNavModeFile();
+    if (!nbt::writeNavModeFile(next))
+        alog("menu: Navigation Mode write failed (%s, errno %d)", nbt::navModeName(next), errno);
+    const nbt::NavMode now = nbt::readNavModeFile();
+    alog("menu: Navigation Mode %s -> %s (NBT_CLUSTER in nbt-aad.env wins)",
+         nbt::navModeName(prev), nbt::navModeName(now));
+    if (g_runApp) showNavMode(g_runApp);
+    return true;
+}
+
+bool onNavModeSemantic(void*, const bmw::Parcel&) { return selectNavMode(nbt::kNavModeSemantic); }
+bool onNavModeJ29(void*, const bmw::Parcel&)      { return selectNavMode(nbt::kNavModeJ29); }
+bool onNavMode6wa(void*, const bmw::Parcel&)      { return selectNavMode(nbt::kNavMode6wa); }
 
 // ---- Android Auto over USB (beta) -------------------------------------------------------------------------------
 bool g_usbAaShown = false;
@@ -2457,12 +2504,14 @@ const char* const kSettingsFlags[] = {
 const size_t kSettingsFlagCount = sizeof(kSettingsFlags) / sizeof(kSettingsFlags[0]);
 bool settingFlagSet(const char* name) { return nbt::flagSet(name); }
 std::string g_setSnap;
+std::string g_setNavModeSnap;
 bool g_setSnapPending = false;
 time_t g_setSnapTime = 0;
 
 void settingsPageEntered() {
     if (g_setSnapPending) return;                        // keep the snapshot of the first visit since the last check
     g_setSnap = nbt::settingsSnapshot(kSettingsFlags, kSettingsFlagCount, &settingFlagSet);
+    g_setNavModeSnap = nbt::navModeName(nbt::readNavModeFile());
     g_setSnapPending = true;
     g_setSnapTime = time(NULL);
 }
@@ -2471,7 +2520,10 @@ void settingsBackOnMainPage() {
     if (!g_setSnapPending) return;
     g_setSnapPending = false;
     const std::string now = nbt::settingsSnapshot(kSettingsFlags, kSettingsFlagCount, &settingFlagSet);
-    const std::string diff = nbt::settingsDiff(kSettingsFlags, kSettingsFlagCount, g_setSnap, now);
+    const std::string navNow = nbt::navModeName(nbt::readNavModeFile());
+    const std::string diff = nbt::settingsDiffMode(
+        nbt::settingsDiff(kSettingsFlags, kSettingsFlagCount, g_setSnap, now),
+        nbt::kNavModeFileName, g_setNavModeSnap, navNow);
     DaemonState d = readDaemonState();
     nbt::SettingsRestart r = nbt::settingsRestartDecide(
         !diff.empty(), envFlagOn("NBT_SETTINGS_RESTART", true), d.pid != 0,
@@ -2502,7 +2554,10 @@ bool onMenuFocus(void*, const bmw::Parcel& p) {
     p.readBool(f);
     g_focusKnown = true;
     g_menuFocused = f;
-    if (f) g_settingsFocused = false;   // the menu itself is on top: the Settings page is not (see onSettingsFocus)
+    if (f) {
+        g_settingsFocused = false;   // the menu itself is on top: Settings / Navigation Mode are not
+        g_navModeFocused = false;
+    }
     alog("menu state %u focus -> %d", kMenuState, (int)f);
     if (f) g_ow.onOwnState(nbt::OverlayWatch::kMenuState, nowMs());   // iDrive is on our menu (CDS: 50000)
     if (f) settingsBackOnMainPage();                     // back from Settings: restart if a checkbox changed
@@ -2544,6 +2599,9 @@ bool onSettingsFocus(void*, const bmw::Parcel& p) {
         showMenuIdrive(g_app);
         showDriveMode(g_app);
         showKombiNav(g_app);
+        showNavMode(g_app);
+        showAnyDist(g_app);
+        showNoLog(g_app);
         showWarnings(g_app);
         showUsbAa(g_app);
         showPhoneGps(g_app);
@@ -2552,8 +2610,21 @@ bool onSettingsFocus(void*, const bmw::Parcel& p) {
         showLciMedia(g_app);
         showCpCompat(g_app);
         showSpeechBt(g_app);
-        alog("settings: thirteen checkbox models refreshed");
+        alog("settings: checkbox models and Navigation Mode refreshed");
     }
+    return true;
+}
+
+bool onNavModeFocus(void*, const bmw::Parcel& p) {
+    bool f = false;
+    p.readBool(f);
+    g_focusKnown = true;
+    g_navModeFocused = f;
+    alog("nav-mode state %u focus -> %d", kNavModeState, (int)f);
+    if (!f) return true;
+    g_ow.onOwnState(nbt::OverlayWatch::kNavModeState, nowMs());
+    settingsPageEntered();
+    if (g_app) showNavMode(g_app);
     return true;
 }
 
@@ -2586,6 +2657,9 @@ bool appOnInit(bmw::PluginApp* self) {
     addAction(self, kActMenuIdrive, &onMenuIdriveToggle);
     addAction(self, kActDriveMode, &onDriveModeToggle);
     addAction(self, kActKombiNav, &onKombiNavToggle);
+    addAction(self, kActNavModeSemantic, &onNavModeSemantic);
+    addAction(self, kActNavModeJ29, &onNavModeJ29);
+    addAction(self, kActNavMode6wa, &onNavMode6wa);
     addAction(self, kActWarnings, &onWarningsToggle);
     addAction(self, kActUsbAa, &onUsbAaToggle);
     addAction(self, kActPhoneGps, &onPhoneGpsToggle);
@@ -2609,6 +2683,10 @@ bool appOnInit(bmw::PluginApp* self) {
         s.object = self;
         s.stub = &onSettingsFocus;
         self->addHandler(kSettingsState, kHandlerFocus, s);
+        bmw::ActionDelegate nm;                          // Navigation Mode sub-page: refresh radio choices, hold accounting
+        nm.object = self;
+        nm.stub = &onNavModeFocus;
+        self->addHandler(kNavModeState, kHandlerFocus, nm);
         bmw::ActionDelegate vp;                          // Version page: fill the two labels when shown
         vp.object = self;
         vp.stub = &onVersionFocus;

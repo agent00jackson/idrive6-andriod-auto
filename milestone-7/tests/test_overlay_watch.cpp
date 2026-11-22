@@ -209,6 +209,8 @@ int main() {
         w.onOwnState(OverlayWatch::kSettingsState, 3000);                  // driver went on into Settings
         assert(w.poll(4000, NO_AA, false, false) == OverlayWatch::NONE);
         assert(w.poll(5000, NO_AA, false, false) == OverlayWatch::COME_BACK);
+        w.onOwnState(OverlayWatch::kNavModeState, 6000);                   // Navigation Mode sub-page is also own UI
+        assert(!w.takeAside(6500));
     }
     // rhmiapp-51: GFXIDENTIFIER_INVALID with a title is a real iDrive screen (Max eDRIVE 'eDRIVE mode', 1534)
     assert(nbt::betweenScreens(1534, "GFXIDENTIFIER_INVALID", "") == true);

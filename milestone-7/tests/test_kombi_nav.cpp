@@ -1142,6 +1142,36 @@ int main() {
     testTimeApproach();
     testRenewedStep();
     testDepart();
+    {
+        // Navigation Mode parsing, file persistence, and NBT_CLUSTER precedence (default J29).
+        nbt::NavMode m = nbt::kNavModeJ29;
+        assert(nbt::parseNavMode("semantic\n", m) && m == nbt::kNavModeSemantic);
+        assert(nbt::parseNavMode("  Semantic  ", m) && m == nbt::kNavModeSemantic);
+        assert(nbt::parseNavMode("native", m) && m == nbt::kNavModeSemantic);
+        assert(nbt::parseNavMode("J29", m) && m == nbt::kNavModeJ29);
+        assert(nbt::parseNavMode("6WA\r\n", m) && m == nbt::kNavMode6wa);
+        assert(!nbt::parseNavMode("", m) && !nbt::parseNavMode("bogus", m));
+
+        assert(!strcmp(nbt::resolveNavCluster(NULL, nbt::kNavModeJ29), "j29"));
+        assert(!strcmp(nbt::resolveNavCluster("", nbt::kNavModeSemantic), "semantic"));
+        assert(!strcmp(nbt::resolveNavCluster(NULL, nbt::kNavMode6wa), "6wa"));
+        assert(!strcmp(nbt::resolveNavCluster("6wa", nbt::kNavModeSemantic), "6wa"));
+        assert(!strcmp(nbt::resolveNavCluster("j29", nbt::kNavModeSemantic), "j29"));
+        assert(!strcmp(nbt::resolveNavCluster("semantic", nbt::kNavModeJ29), "semantic"));
+        assert(!strcmp(nbt::resolveNavCluster("native", nbt::kNavModeJ29), "native"));
+
+        // Verify file read round-trip.
+        char tmpdir[] = "/tmp/nbt-navmode-XXXXXX";
+        assert(mkdtemp(tmpdir) != NULL);
+        std::string modePath = std::string(tmpdir) + "/nav-mode";
+        FILE* mf = fopen(modePath.c_str(), "w");
+        assert(mf != NULL);
+        fprintf(mf, "semantic\n");
+        fclose(mf);
+        assert(nbt::readNavModeFromPath(modePath.c_str(), m) && m == nbt::kNavModeSemantic);
+        unlink(modePath.c_str());
+        rmdir(tmpdir);
+    }
     printf("test_kombi_nav OK\n");
     return 0;
 }

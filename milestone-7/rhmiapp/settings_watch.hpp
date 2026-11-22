@@ -34,6 +34,20 @@ inline std::string settingsDiff(const char* const* names, size_t n, const std::s
     return d;
 }
 
+// Append a multi-choice setting (e.g. nav-mode: "j29" / "6wa" / "semantic") to a checkbox diff.
+inline std::string settingsDiffMode(const std::string& checkboxDiff, const char* key,
+                                    const std::string& beforeVal, const std::string& afterVal) {
+    if (beforeVal == afterVal) return checkboxDiff;
+    std::string d = checkboxDiff;
+    if (!d.empty()) d += ", ";
+    d += key;
+    d += " ";
+    d += beforeVal;
+    d += "->";
+    d += afterVal;
+    return d;
+}
+
 // Restart decision (pure): a change was made on this Settings visit, the feature is on, nbt-aad runs, it was not
 // (re)started after the visit began (then it already read the new state), and no stop/restart is under way.
 enum SettingsRestart { SR_NONE, SR_RESTART, SR_OFF, SR_NOT_RUNNING, SR_STARTED_SINCE, SR_BUSY };

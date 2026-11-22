@@ -5,7 +5,7 @@
 import os, zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 LANGS = {"de": "Deutsch", "en-UK": "English (UK)", "en-US": "English (US)", "es-ES": "Espanol", "es-US": "Espanol (US)",
-         "fr-FR": "Francais", "fr-CA": "Francais (CA)", "it": "Italiano", "pt": "Portugues", "ru": "Russian", "pl": "Polski"}}
+         "fr-FR": "Francais", "fr-CA": "Francais (CA)", "it": "Italiano", "pt": "Portugues", "ru": "Russian", "pl": "Polski"}
 ABOUT = ("NBT-AAD: native wireless Android Auto\\nDeveloped by nanaisu\\n"
          "Contributors: @houssems, @tom-pryor, @dn00, @sabifa,\\n"
          "@ryanriccio1, @pstryju, @owenashurst, @BobW5, @DreckSoft\\n"
@@ -39,6 +39,14 @@ TEXTS = {1: "Android Auto", 2: "Android Auto: Connecting...",   # 2 = entry text
          39: "Removing rules...", 40: "Rules successfully removed", 41: "Packet filter off, as before",
          42: "Done, not active - see log", 43: "Failed - see log",
          44: "CarPlay compatibility",   # 44 = CarPlay compatibility checkbox (rhmiapp-54-cpcompat)
+         # 49-55 = Navigation Mode sub-page (hmiState 16) and Settings button labels (Semantic / J29 / 6WA)
+         49: "Navigation Mode",
+         50: "Navigation Mode: J29",
+         51: "Navigation Mode: Semantic",
+         52: "Navigation Mode: 6WA",
+         53: "Semantic",
+         54: "J29",
+         55: "6WA",
          17: ABOUT}
 # Per-language overrides (ASCII only, like the language names above).
 LANG_TEXTS = {

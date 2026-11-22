@@ -232,6 +232,72 @@ inline bool noLogWanted(const char* envValue, bool flag) {
     return flag;
 }
 
+// "Navigation Mode" (Settings -> Navigation Mode -> Semantic / J29 / 6WA; file nav-mode in the data dir, hand-made
+// fallback in the app dir). Default is J29 when neither NBT_CLUSTER nor the file is set; NBT_CLUSTER still wins.
+// "native" is accepted as a compatibility alias for "semantic".
+static const char* const kNavModeFileName = "nav-mode";
+enum NavMode { kNavModeJ29 = 0, kNavMode6wa = 1, kNavModeSemantic = 2 };
+
+inline const char* navModeName(NavMode mode) {
+    switch (mode) {
+    case kNavModeSemantic: return "semantic";
+    case kNavMode6wa:      return "6wa";
+    case kNavModeJ29:
+    default:               return "j29";
+    }
+}
+
+inline bool parseNavMode(const char* raw, NavMode& out) {
+    if (!raw) return false;
+    while (*raw == ' ' || *raw == '\t' || *raw == '\r' || *raw == '\n') ++raw;
+    char buf[16];
+    size_t n = 0;
+    while (raw[n] && raw[n] != ' ' && raw[n] != '\t' && raw[n] != '\r' && raw[n] != '\n') {
+        if (n + 1 >= sizeof(buf)) return false;
+        char c = raw[n];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        buf[n++] = c;
+    }
+    buf[n] = '\0';
+    if (strcmp(buf, "semantic") == 0 || strcmp(buf, "native") == 0) { out = kNavModeSemantic; return true; }
+    if (strcmp(buf, "j29") == 0) { out = kNavModeJ29; return true; }
+    if (strcmp(buf, "6wa") == 0) { out = kNavMode6wa; return true; }
+    return false;
+}
+
+inline bool readNavModeFromPath(const char* path, NavMode& out) {
+    if (!path || !*path) return false;
+    FILE* f = fopen(path, "r");
+    if (!f) return false;
+    char line[32];
+    const bool ok = fgets(line, sizeof(line), f) != NULL && parseNavMode(line, out);
+    fclose(f);
+    return ok;
+}
+
+inline NavMode readNavModeFile() {
+    NavMode m = kNavModeJ29;
+    if (readNavModeFromPath(dataFile(kNavModeFileName).c_str(), m)) return m;
+    if (readNavModeFromPath(appFile(kNavModeFileName).c_str(), m)) return m;
+    return kNavModeJ29;
+}
+
+inline bool writeNavModeFile(NavMode mode) {
+    makeDataDir();
+    const FilePath dst = dataFile(kNavModeFileName);
+    FILE* f = fopen(dst.c_str(), "w");
+    if (!f) return false;
+    const int n = fprintf(f, "%s\n", navModeName(mode));
+    const int err = fclose(f);
+    return n > 0 && err == 0;
+}
+
+// Pure (host-tested): NBT_CLUSTER wins when non-empty; otherwise use the saved Navigation Mode (default J29).
+inline const char* resolveNavCluster(const char* envCluster, NavMode fileMode) {
+    if (envCluster && *envCluster) return envCluster;
+    return navModeName(fileMode);
+}
+
 } // namespace nbt
 
 #endif // NBT_ENV_HPP

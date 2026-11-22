@@ -401,7 +401,7 @@ void KombiNav::logLine(const char* line, void* /*user*/) {
 
 // The place to add a cluster: its driver, what it needs, and how the log names it.
 bool KombiNav::createDisplay(const char* id, most::Client* most) {
-    if (!strcmp(id, "native")) {
+    if (!strcmp(id, "semantic") || !strcmp(id, "native")) {
         NativeDisplay* native = new NativeDisplay(NG_SOCKET_ROOT, true);
         if (!native->start()) {
             delete native;
@@ -410,8 +410,8 @@ bool KombiNav::createDisplay(const char* id, most::Client* most) {
         display_ = native;
         native_display_ = true;
         yield_enabled_ = true;
-        target_ = "local native guidance adapter";
-        stopHint_ = "native adapter unavailable or unqualified";
+        target_ = "BMW native semantic guidance";
+        stopHint_ = "native semantic adapter unavailable or unqualified";
         return true;
     }
     if (!strcmp(id, "j29")) {
@@ -453,7 +453,7 @@ bool KombiNav::createDisplay(const char* id, most::Client* most) {
         stopHint_ = "a call failed, or this cluster is not laid out like the 6wa profile: see the [HudTerm] lines";
         return true;
     }
-    printf("[KombiNav] NBT_CLUSTER=%s unknown (j29, 6wa): cluster arrows disabled\n", id);
+    printf("[KombiNav] NBT_CLUSTER=%s unknown (semantic, j29, 6wa): cluster arrows disabled\n", id);
     return false;
 }
 
@@ -560,7 +560,8 @@ void KombiNav::start(most::Client* most) {
     e = getenv("NBT_KOMBI_NAV_INPLACE");
     if (e && *e && e[0] >= '0' && e[0] <= '2' && !e[1]) settings_.inplace = e[0] - '0';
     e = getenv("NBT_CLUSTER");
-    if (!createDisplay(e && *e ? e : "j29", most)) return;
+    const char* clusterId = nbt::resolveNavCluster(e, nbt::readNavModeFile());
+    if (!createDisplay(clusterId, most)) return;
     core_ = new Core(*display_, settings_, &KombiNav::logLine, this);
     if (native_display_) {
         printf("[KombiNav] BMW native guidance %s, approach %s, factory-route yield on\n",

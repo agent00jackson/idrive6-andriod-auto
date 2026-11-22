@@ -41,6 +41,12 @@ int main() {
     CHECK(!nbt::settingsDiff(names, n, "10", b).empty());
     CHECK(nbt::settingsDiff(names, n, "", "").empty());
 
+    // Navigation Mode diffing alongside checkboxes
+    CHECK(nbt::settingsDiffMode("", "nav-mode", "j29", "j29").empty());
+    CHECK(nbt::settingsDiffMode("", "nav-mode", "j29", "semantic") == "nav-mode j29->semantic");
+    CHECK(nbt::settingsDiffMode("autostart off", "nav-mode", "j29", "6wa") == "autostart off, nav-mode j29->6wa");
+    CHECK(nbt::settingsDiffMode("autostart off", "nav-mode", "semantic", "semantic") == "autostart off");
+
     // decision
     CHECK(nbt::settingsRestartDecide(false, true, true, false, false) == nbt::SR_NONE);
     CHECK(nbt::settingsRestartDecide(true, true, true, false, false) == nbt::SR_RESTART);

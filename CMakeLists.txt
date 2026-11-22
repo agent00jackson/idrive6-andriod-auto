@@ -16,5 +16,6 @@ set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 qnx_import_manifest("${CMAKE_CURRENT_SOURCE_DIR}/cmake/nbt-evo-imports.json"
   "${CMAKE_CURRENT_BINARY_DIR}/link-only-do-not-deploy" NBT nbt_interfaces)
 add_subdirectory(milestone-7)
+add_subdirectory(tools/native-semantic-addon)
 install(FILES LICENSE.md DESTINATION share/licenses/nbt-aad)
 install(DIRECTORY "${QNX_SDK}/share/licenses/qnx-sdk" DESTINATION share/licenses)
