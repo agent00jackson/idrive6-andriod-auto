@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 # Production NavigationBasic and NavNBTEvoController semantic guidance addons (ARM QNX).
+link_libraries(${aa_runtime_interfaces})
+
 add_library(native_semantic_basic SHARED
   basic_addon.c
   fixture-provider.c
@@ -28,5 +30,14 @@ target_include_directories(native_semantic_controller PRIVATE
 target_compile_options(native_semantic_controller PRIVATE -Wall -Wextra -Wno-unused-parameter -fvisibility=hidden)
 target_link_libraries(native_semantic_controller PRIVATE QNX::socket)
 
-install(TARGETS native_semantic_basic native_semantic_controller
-  LIBRARY DESTINATION share/nbt-aad/native-semantic)
+add_library(nav_addon_loader SHARED
+  nav_addon_loader.c
+)
+target_compile_options(nav_addon_loader PRIVATE -Wall -Wextra -Wno-unused-parameter -fvisibility=hidden)
+
+install(TARGETS nav_addon_loader
+  LIBRARY DESTINATION share/nbt-aad/nav-addons)
+install(TARGETS native_semantic_basic
+  LIBRARY DESTINATION share/nbt-aad/nav-addons/NavigationBasic.d)
+install(TARGETS native_semantic_controller
+  LIBRARY DESTINATION share/nbt-aad/nav-addons/NavNBTEvoController.d)

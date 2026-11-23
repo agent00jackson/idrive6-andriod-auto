@@ -34,6 +34,8 @@ extern "C" {
 #include "../../tools/native-semantic-addon/semantic_cue_map.c"
 #include "../../tools/native-semantic-addon/semantic_handoff.c"
 #include "../../tools/native-semantic-addon/semantic_xar_patch.c"
+#define NAV_ADDON_LOADER_HOST_TEST 1
+#include "../../tools/native-semantic-addon/nav_addon_loader.c"
 }
 
 static uint64_t nowMs() {
@@ -451,12 +453,53 @@ static void testXarInMemoryPatch() {
     assert(semantic_xar_patch_buffer(&buf[0], buf.size(), SEMANTIC_XAR_FLAG_ALL) == SEMANTIC_XAR_ALREADY_PATCHED);
 }
 
+static void testNavAddonLoader() {
+    char base[128];
+    assert(nav_addon_extract_basename("/opt/nav/eceusa/bin/NavigationBasic\n", base, sizeof(base)) == 1);
+    assert(strcmp(base, "NavigationBasic") == 0);
+    assert(nav_addon_extract_basename("./NavNBTEvoController", base, sizeof(base)) == 1);
+    assert(strcmp(base, "NavNBTEvoController") == 0);
+    assert(nav_addon_extract_basename("/opt/nav/bin/..", base, sizeof(base)) == 0);
+    assert(nav_addon_extract_basename("", base, sizeof(base)) == 0);
+
+    char dir[] = "/tmp/test_nav_addon_loader_XXXXXX";
+    assert(mkdtemp(dir) != nullptr);
+    std::string d(dir);
+    auto touch = [&](const std::string& name) {
+        FILE* f = fopen((d + "/" + name).c_str(), "wb");
+        assert(f != nullptr);
+        fclose(f);
+    };
+    touch("90-second.so");
+    touch("10-first.so");
+    touch(".hidden.so");
+    touch("readme.txt");
+    touch(".so");
+    assert(mkdir((d + "/subdir.so").c_str(), 0700) == 0);
+
+    char names[16][NAV_ADDON_MAX_NAME];
+    size_t n = nav_addon_collect_dir(d.c_str(), names, 16);
+    assert(n == 2);
+    assert(strcmp(names[0], "10-first.so") == 0);
+    assert(strcmp(names[1], "90-second.so") == 0);
+    assert(nav_addon_collect_dir("/tmp/does-not-exist-nav-addons-dir", names, 16) == 0);
+
+    unlink((d + "/90-second.so").c_str());
+    unlink((d + "/10-first.so").c_str());
+    unlink((d + "/.hidden.so").c_str());
+    unlink((d + "/readme.txt").c_str());
+    unlink((d + "/.so").c_str());
+    rmdir((d + "/subdir.so").c_str());
+    rmdir(d.c_str());
+}
+
 int main() {
     testCueMappings();
     testHandoff();
     testControllerStateMachine();
     testEndToEndLoopback();
     testXarInMemoryPatch();
+    testNavAddonLoader();
     printf("test_semantic_addon: all checks passed\n");
     return 0;
 }
