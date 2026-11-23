@@ -28,10 +28,12 @@
 #include "../../tools/native-semantic-addon/semantic_ctrl_wire.h"
 #include "../../tools/native-semantic-addon/semantic_cue_map.h"
 #include "../../tools/native-semantic-addon/semantic_handoff.h"
+#include "../../tools/native-semantic-addon/semantic_xar_patch.h"
 extern "C" {
 #include "../../tools/native-semantic-addon/semantic_ctrl_wire.c"
 #include "../../tools/native-semantic-addon/semantic_cue_map.c"
 #include "../../tools/native-semantic-addon/semantic_handoff.c"
+#include "../../tools/native-semantic-addon/semantic_xar_patch.c"
 }
 
 static uint64_t nowMs() {
@@ -404,11 +406,57 @@ static void testEndToEndLoopback() {
     rmdir(dir);
 }
 
+static void testXarInMemoryPatch() {
+    const char* shm = NULL;
+    assert(semantic_xar_match_target(
+        "/opt/nav/eceusa/bin/gvStyleDB_ID5_NBTEvo_BMW_USA_1025/GvID5VBU1025_GuidingDayStandard.xar", &shm) == 1);
+    assert(strcmp(shm, "/dev/shmem/aa-semantic-style-day.xar") == 0);
+    assert(semantic_xar_match_target(
+        "gvStyleDB_ID5_NBTEvo_BMW_USA_1025/GvID5VBU1025_GuidingNightStandard.xar", &shm) == 1);
+    assert(strcmp(shm, "/dev/shmem/aa-semantic-style-night.xar") == 0);
+    // Must never recurse on /dev/shmem/ or touch non-target styles
+    assert(semantic_xar_match_target("/dev/shmem/GvID5VBU1025_GuidingDayStandard.xar", &shm) == 0);
+    assert(semantic_xar_match_target("/opt/nav/eceusa/bin/GvID5VBU1025_IconDayStandard.xar", &shm) == 0);
+    assert(semantic_xar_match_target(NULL, &shm) == 0);
+
+    // Build synthetic buffer containing exact stock row signatures
+    std::vector<uint8_t> buf(146828, 0xA5);
+    put_le32(&buf[36720], 4u);
+    pack_row5(&buf[84436], 0x00000000u, 0x007400b0u, 18u, 0x00000000u, 3201u);
+    pack_row5(&buf[84456], 0x0000001du, 0x002000cdu, 20u, 0x00000000u, 1202u);
+    pack_row5(&buf[84496], 0x00000000u, 0x002000d0u, 28u, 0x00000000u, 3103u);
+    pack_row5(&buf[84516], 0x00000000u, 0x0024011eu, 35u, 0x00000000u, 3302u);
+    pack_row5(&buf[84804], 0x0000001du, 0x007400cdu, 20u, 0x00000000u, 1111u);
+    pack_row5(&buf[84824], 0x002200c1u, 0x007400cfu, 14u, 0x00000000u, 3105u);
+
+    // Truncated buffer must fail safely
+    assert(semantic_xar_patch_buffer(&buf[0], 1024, SEMANTIC_XAR_FLAG_ALL) == SEMANTIC_XAR_UNSUPPORTED);
+
+    // Single-byte mismatch must fail safely without mutating any byte
+    std::vector<uint8_t> bad = buf;
+    bad[84516] ^= 1u;
+    std::vector<uint8_t> badOrig = bad;
+    assert(semantic_xar_patch_buffer(&bad[0], bad.size(), SEMANTIC_XAR_FLAG_ALL) == SEMANTIC_XAR_UNSUPPORTED);
+    assert(bad == badOrig);
+
+    // Valid stock buffer must patch cleanly and be idempotent on second pass
+    assert(semantic_xar_patch_buffer(&buf[0], buf.size(), SEMANTIC_XAR_FLAG_ALL) == SEMANTIC_XAR_PATCHED);
+    assert(get_le32(&buf[36720]) == 12u);
+    assert(memcmp(&buf[84436], &buf[84804], 40) == 0);
+    assert(get_le32(&buf[84496 + 0]) == 0x002d0000u);
+    assert(get_le32(&buf[84496 + 4]) == 0x00c500d0u);
+    assert(get_le32(&buf[84496 + 12]) == 0x20000000u);
+    assert(get_le32(&buf[84516 + 8]) == 6u);
+    assert(get_le32(&buf[84516 + 16]) == 3193u);
+    assert(semantic_xar_patch_buffer(&buf[0], buf.size(), SEMANTIC_XAR_FLAG_ALL) == SEMANTIC_XAR_ALREADY_PATCHED);
+}
+
 int main() {
     testCueMappings();
     testHandoff();
     testControllerStateMachine();
     testEndToEndLoopback();
+    testXarInMemoryPatch();
     printf("test_semantic_addon: all checks passed\n");
     return 0;
 }

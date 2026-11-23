@@ -26,6 +26,7 @@
 #include "native_model_wire/protocol.h"
 #include "semantic_cue_map.h"
 #include "semantic_handoff.h"
+#include "semantic_xar_hook.h"
 
 #if !defined(__QNXNTO__) || !defined(__arm__)
 #error basic_addon.c targets ARM QNX NavigationBasic
@@ -895,6 +896,7 @@ static void *worker_main(void *administrator) {
         struct timespec w = {0, 500000000};
         nanosleep(&w, NULL);
     }
+    unsigned xar_patched = semantic_xar_patch_shm_in_place(mem_fd);
     if (!rt.component || !rt.rg || !rt.milca) {
         fprintf(stderr, "SEMANTIC_BASIC refused owner_timeout\n");
         close(mem_fd);
@@ -914,14 +916,20 @@ static void *worker_main(void *administrator) {
         close(mem_fd);
         return NULL;
     }
-    fprintf(stderr, "SEMANTIC_BASIC ready pid=%d rg=%#x milca=%#x\n", getpid(), rt.rg, rt.milca);
+    fprintf(stderr, "SEMANTIC_BASIC ready pid=%d rg=%#x milca=%#x xar_patched=%u\n",
+            getpid(), rt.rg, rt.milca, xar_patched);
 
     struct pollfd pfds[2];
     pfds[0].fd = main_fd;  pfds[0].events = POLLIN;
     pfds[1].fd = alive_fd; pfds[1].events = POLLIN;
+    uint64_t next_xar_scan_ms = mono_ms() + 2000u;
 
     for (;;) {
         (void)poll(pfds, 2, 50);
+        if (xar_patched < 2u && mono_ms() >= next_xar_scan_ms) {
+            xar_patched = semantic_xar_patch_shm_in_place(mem_fd);
+            next_xar_scan_ms = mono_ms() + 5000u;
+        }
         uint64_t now = mono_ms();
 
         /* Handle liveness pings */
@@ -979,6 +987,8 @@ static void *worker_main(void *administrator) {
                             write_ng_reply(main_fd, (struct sockaddr *)&peer, peer_len,
                                            msg.sequence, NG_BAD_VALUE);
                         } else if (msg.operation == NG_BEGIN) {
+                            if (xar_patched < 2u)
+                                xar_patched = semantic_xar_patch_shm_in_place(rt.mem_fd);
                             if (rt.session && rt.session != msg.session)
                                 clear_session(&rt);
                             rt.session = msg.session;
@@ -1039,6 +1049,7 @@ __attribute__((visibility("default"))) void registerCallbacks(void *administrato
     static unsigned entered;
     if (__atomic_exchange_n(&entered, 1u, __ATOMIC_ACQ_REL))
         return;
+    semantic_xar_install_hooks();
     pthread_t worker;
     if (pthread_create(&worker, NULL, worker_main, administrator) == 0)
         pthread_detach(worker);
