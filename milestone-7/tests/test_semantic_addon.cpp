@@ -86,6 +86,7 @@ static void testCueMappings() {
         { 11, 45.0, false,   0,  3, 2, 19, 270.0f, 0 }, // u-turn left
         { 12, 45.0, false,   0,  3, 1, 19,  90.0f, 0 }, // u-turn right
         { 36,  0.0, false,   0,  1, 3,  1,   0.0f, 0 }, // straight 0 m
+        { 1,   0.0, false,   0,  1, 3,  1,   0.0f, 0 }, // depart 0 m
         { 2,  30.0, false,   0,  1, 3,  1,   0.0f, 0 }, // name change
         { 39,  0.0, false,   0, 18, 3,  1,   0.0f, 1 }, // arrival zero
         { 41, 15.0, false,   0, 18, 2,  1, 270.0f, 1 }, // arrival left

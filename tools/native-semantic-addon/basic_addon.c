@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -53,6 +54,22 @@ static uint64_t mono_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000L);
+}
+
+static void basic_log(const char *fmt, ...) {
+    char line[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (n <= 0)
+        return;
+    size_t len = (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1u;
+    int fd = open("/dev/shmem/semantic-basic.log", O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) {
+        (void)write(fd, line, len);
+        close(fd);
+    }
 }
 
 enum {
@@ -340,18 +357,77 @@ static int deliver_fixture_resolution(void *resolver) {
     return 1;
 }
 
+/* BMW NavigationBasic keeps cleared tour vector slots as NULL pointers (0x0)
+ * instead of shrinking stub+0x14c..0x150 after an OEM route ends. Count only
+ * live (non-null) tour pointers and locate the latest live one. */
+static unsigned scan_live_tours_direct(uint32_t stub, uint32_t *out_last_tour) {
+    uint32_t start = *(uint32_t *)(uintptr_t)(stub + 0x14c);
+    uint32_t end = *(uint32_t *)(uintptr_t)(stub + 0x150);
+    if (out_last_tour)
+        *out_last_tour = 0u;
+    if (start == end)
+        return 0u;
+    if (start < 0x10000u || end < start || (end - start) % 4u != 0u ||
+        (end - start) / 4u > 64u)
+        return 0xffffu;
+    unsigned count = 0u;
+    for (uint32_t p = start; p < end; p += 4u) {
+        uint32_t tour = *(uint32_t *)(uintptr_t)p;
+        if (tour >= 0x10000u && tour < 0x80000000u) {
+            if (out_last_tour)
+                *out_last_tour = tour;
+            ++count;
+        }
+    }
+    return count;
+}
+
+static unsigned scan_live_tours_mem(int mem_fd, uint32_t stub, uint32_t *out_last_tour) {
+    uint32_t start = 0, end = 0;
+    if (out_last_tour)
+        *out_last_tour = 0u;
+    if (!word(mem_fd, stub + 0x14c, &start) || !word(mem_fd, stub + 0x150, &end))
+        return 0u;
+    if (start == end || start < 0x10000u || end < start ||
+        (end - start) % 4u != 0u || (end - start) / 4u > 64u)
+        return 0u;
+    unsigned count = 0u;
+    for (uint32_t p = start; p < end; p += 4u) {
+        uint32_t tour = 0;
+        if (word(mem_fd, p, &tour) && tour >= 0x10000u && tour < 0x80000000u) {
+            if (out_last_tour)
+                *out_last_tour = tour;
+            ++count;
+        }
+    }
+    return count;
+}
+
+static int route_exists_in_stub(int mem_fd, uint32_t stub, uint32_t route_id) {
+    uint32_t rb = 0, re = 0;
+    if (!route_id || !word(mem_fd, stub + 0x15c, &rb) || !word(mem_fd, stub + 0x160, &re))
+        return 0;
+    if (rb < 0x10000u || re < rb || (re - rb) % 4u != 0u || (re - rb) / 4u > 64u)
+        return 0;
+    for (uint32_t p = rb; p < re; p += 4u) {
+        uint32_t robj = 0, id = 0;
+        if (word(mem_fd, p, &robj) && robj >= 0x10000u && robj < 0x80000000u &&
+            word(mem_fd, robj + 0x18u, &id) && id == route_id)
+            return 1;
+    }
+    return 0;
+}
+
 static int try_fixture_resolve(void *resolver, uint32_t kind) {
     if ((uint32_t)(uintptr_t)resolver != wrapped_resolver_addr ||
         !__atomic_load_n(&resolver_armed_flag, __ATOMIC_ACQUIRE) ||
         __atomic_load_n(&resolver_intercept_kind, __ATOMIC_ACQUIRE) != 0u)
         return 0;
-    uint32_t start = *(uint32_t *)(uintptr_t)(wrapped_stub_addr + 0x14c);
-    uint32_t end = *(uint32_t *)(uintptr_t)(wrapped_stub_addr + 0x150);
     uint32_t work_start = *(uint32_t *)((uint8_t *)resolver + 0x2c);
     uint32_t work_end = *(uint32_t *)((uint8_t *)resolver + 0x30);
     uint32_t token = *(uint32_t *)((uint8_t *)resolver + 0x20);
-    if (start != end || work_end < work_start ||
-        work_end - work_start != 156u || !token)
+    if (scan_live_tours_direct(wrapped_stub_addr, NULL) != 0u ||
+        work_end < work_start || work_end - work_start != 156u || !token)
         return 0;
     *(uint32_t *)resolver = RESOLVER_VPTR;
     if (!deliver_fixture_resolution(resolver))
@@ -395,11 +471,14 @@ static int calculate_fixture_route(struct owner_event *event,
     uint32_t pending_begin = *(uint32_t *)(uintptr_t)(event->component + 0x2b0 + 0x74);
     uint32_t pending_end = *(uint32_t *)(uintptr_t)(event->component + 0x2b0 + 0x78);
     if (calc_after != calc_before + 1u ||
-        pending_end < pending_begin || pending_end - pending_begin != 0x2e8u ||
-        *(uint32_t *)(uintptr_t)(pending_begin + 4) != calc_after ||
-        *(uint32_t *)(uintptr_t)(pending_begin + 0x10) != tour_high ||
-        *(uint32_t *)(uintptr_t)(pending_begin + 0x14) != tour_low ||
-        *(uint32_t *)(uintptr_t)(pending_begin + 0x2e4) != event->stub + 0x120u)
+        pending_end < pending_begin + 0x2e8u ||
+        (pending_end - pending_begin) % 0x2e8u != 0u)
+        return 0;
+    uint32_t pending_item = pending_end - 0x2e8u;
+    if (*(uint32_t *)(uintptr_t)(pending_item + 4) != calc_after ||
+        *(uint32_t *)(uintptr_t)(pending_item + 0x10) != tour_high ||
+        *(uint32_t *)(uintptr_t)(pending_item + 0x14) != tour_low ||
+        *(uint32_t *)(uintptr_t)(pending_item + 0x2e4) != event->stub + 0x120u)
         return 0;
 
     uint8_t *route_result = calloc(1, 256);
@@ -429,21 +508,21 @@ static int calculate_fixture_route(struct owner_event *event,
     uint32_t route_data = event->component + 0x464u;
     FN(0x577fe0, void, void *, void *, uint32_t, void *, void *, void *)(
         (void *)(uintptr_t)(event->stub + 0x120u),
-        (void *)(uintptr_t)(pending_begin + 0xcu), calc_after,
-        (void *)(uintptr_t)(pending_begin + 0x1e0u),
-        (void *)(uintptr_t)(pending_begin + 0x288u), route_result);
+        (void *)(uintptr_t)(pending_item + 0xcu), calc_after,
+        (void *)(uintptr_t)(pending_item + 0x1e0u),
+        (void *)(uintptr_t)(pending_item + 0x288u), route_result);
     /* Disarm stale Hermes1WorkerHighPrio callback so CHBStubBase::restoreContext
      * (CHBStubBase.cpp:173) is never double-called when the background task expires. */
-    *(uint32_t *)(uintptr_t)(pending_begin + 0x2e4u) = 0;
+    *(uint32_t *)(uintptr_t)(pending_item + 0x2e4u) = 0;
 
     uint32_t work_begin = *(uint32_t *)(uintptr_t)(route_data + 0x2c);
     uint32_t work_end = *(uint32_t *)(uintptr_t)(route_data + 0x30);
     uint32_t route_peer = *(uint32_t *)(uintptr_t)(route_data + 0x1c);
     uint32_t peer_request = route_peer >= 0x10000u ? *(uint32_t *)(uintptr_t)(route_peer + 0x10) : 0;
-    uint32_t work_token = (work_end >= work_begin && work_end - work_begin == 0xf0u)
-                              ? *(uint32_t *)(uintptr_t)(work_begin + 4) : 0;
-    uint32_t cb_owner = (work_end >= work_begin && work_end - work_begin == 0xf0u)
-                            ? *(uint32_t *)(uintptr_t)(work_begin + 0xec) : 0;
+    uint32_t work_item = (work_end >= work_begin + 0xf0u && (work_end - work_begin) % 0xf0u == 0u)
+                             ? (work_end - 0xf0u) : 0u;
+    uint32_t work_token = work_item ? *(uint32_t *)(uintptr_t)(work_item + 4) : 0;
+    uint32_t cb_owner = work_item ? *(uint32_t *)(uintptr_t)(work_item + 0xec) : 0;
     if (!work_token || work_token != peer_request || cb_owner != event->stub + 0x124u)
         return 0;
 
@@ -457,10 +536,15 @@ static int calculate_fixture_route(struct owner_event *event,
     uint32_t rb = *(uint32_t *)(uintptr_t)(event->stub + 0x15c);
     uint32_t re = *(uint32_t *)(uintptr_t)(event->stub + 0x160);
     uint32_t live_route_id = 0;
-    if (rb >= 0x10000u && re >= rb + 4u) {
-        uint32_t route_obj = *(uint32_t *)(uintptr_t)(re - 4u);
-        if (route_obj >= 0x10000u && route_obj < 0x80000000u)
-            live_route_id = *(uint32_t *)(uintptr_t)(route_obj + 0x18);
+    if (rb >= 0x10000u && re >= rb + 4u && (re - rb) % 4u == 0u) {
+        for (uint32_t p = re; p > rb; p -= 4u) {
+            uint32_t route_obj = *(uint32_t *)(uintptr_t)(p - 4u);
+            if (route_obj >= 0x10000u && route_obj < 0x80000000u) {
+                live_route_id = *(uint32_t *)(uintptr_t)(route_obj + 0x18);
+                if (live_route_id)
+                    break;
+            }
+        }
     }
     if (!live_route_id)
         return 0;
@@ -717,7 +801,13 @@ static void execute_event(void *raw, void *dispatcher) {
     }
     if (event->phase == PHASE_INSTALL_RESOLVER) {
         uint32_t resolver = event->component + 0x428u;
-        if (*(uint32_t *)(uintptr_t)resolver != RESOLVER_VPTR) {
+        uint32_t cur_vptr = *(uint32_t *)(uintptr_t)resolver;
+        if (cur_vptr == (uint32_t)(uintptr_t)resolver_vtable_copy &&
+            wrapped_resolver_addr == resolver && wrapped_stub_addr == event->stub) {
+            __atomic_store_n(&resolver_wrapper_state, 1u, __ATOMIC_RELEASE);
+            return;
+        }
+        if (cur_vptr != RESOLVER_VPTR) {
             __atomic_store_n(&resolver_wrapper_state, 2u, __ATOMIC_RELEASE);
             return;
         }
@@ -736,14 +826,8 @@ static void execute_event(void *raw, void *dispatcher) {
         return;
     }
     if (event->phase == PHASE_CALC_ROUTE) {
-        uint32_t start = *(uint32_t *)(uintptr_t)(event->stub + 0x14c);
-        uint32_t end = *(uint32_t *)(uintptr_t)(event->stub + 0x150);
-        if (start < 0x10000u || end < start + 4u) {
-            __atomic_store_n(&owner_dispatch_state, 2u, __ATOMIC_RELEASE);
-            return;
-        }
-        uint32_t tour = *(uint32_t *)(uintptr_t)(end - 4u);
-        if (tour < 0x10000u) {
+        uint32_t tour = 0u;
+        if (scan_live_tours_direct(event->stub, &tour) == 0u || tour < 0x10000u) {
             __atomic_store_n(&owner_dispatch_state, 2u, __ATOMIC_RELEASE);
             return;
         }
@@ -876,22 +960,23 @@ static void progress_handoff(struct basic_runtime *rt) {
 
     uint32_t route_id = __atomic_load_n(&active_route_id, __ATOMIC_ACQUIRE);
     if (!route_id) {
-        /* Wait for Controller's NewTrip to create a tour in Basic, then build 2-link route. */
-        uint32_t start = 0, end = 0;
-        if (word(rt->mem_fd, rt->stub + 0x14c, &start) &&
-            word(rt->mem_fd, rt->stub + 0x150, &end) && end >= start + 4u) {
-            if (dispatch_owner(rt->component, rt->stub, rt->owner_tid,
-                               PHASE_CALC_ROUTE, 0u, &owner_dispatch_state) == 1u) {
-                route_id = __atomic_load_n(&created_route_id, __ATOMIC_ACQUIRE);
-                if (route_id) {
-                    __atomic_store_n(&active_route_id, route_id, __ATOMIC_RELEASE);
-                    struct semantic_handoff h;
-                    memset(&h, 0, sizeof(h));
-                    h.state = SH_ROUTE_READY;
-                    h.route_id = route_id;
-                    h.session = rt->session;
-                    (void)semantic_handoff_write(semantic_handoff_default_path(), &h);
-                }
+        /* Wait for Controller's NewTrip to create a live (non-null) tour in Basic, then build 2-link route. */
+        uint32_t live_tour = 0u;
+        if (scan_live_tours_mem(rt->mem_fd, rt->stub, &live_tour) > 0u && live_tour >= 0x10000u) {
+            uint32_t st = dispatch_owner(rt->component, rt->stub, rt->owner_tid,
+                                         PHASE_CALC_ROUTE, 0u, &owner_dispatch_state);
+            route_id = (st == 1u) ? __atomic_load_n(&created_route_id, __ATOMIC_ACQUIRE) : 0u;
+            basic_log("SEMANTIC_BASIC calc_route tour=%#x st=%u route_id=%u intercept=%u\n",
+                      live_tour, st, route_id,
+                      __atomic_load_n(&resolver_intercept_kind, __ATOMIC_ACQUIRE));
+            if (route_id) {
+                __atomic_store_n(&active_route_id, route_id, __ATOMIC_RELEASE);
+                struct semantic_handoff h;
+                memset(&h, 0, sizeof(h));
+                h.state = SH_ROUTE_READY;
+                h.route_id = route_id;
+                h.session = rt->session;
+                (void)semantic_handoff_write(semantic_handoff_default_path(), &h);
             }
         }
         return;
@@ -901,10 +986,14 @@ static void progress_handoff(struct basic_runtime *rt) {
     struct semantic_handoff h;
     if (semantic_handoff_read(semantic_handoff_default_path(), &h) &&
         h.session == rt->session && h.state == SH_GUIDANCE_ACTIVE && h.route_id == route_id) {
-        if (dispatch_owner(rt->rg, rt->milca, rt->rg_tid, PHASE_ACTIVATE_GUIDANCE,
-                           route_id, &hud_dispatch_state) == 1u) {
+        uint32_t ast = dispatch_owner(rt->rg, rt->milca, rt->rg_tid, PHASE_ACTIVATE_GUIDANCE,
+                                      route_id, &hud_dispatch_state);
+        basic_log("SEMANTIC_BASIC activate route_id=%u st=%u\n", route_id, ast);
+        if (ast == 1u) {
             rt->guidance_active = 1;
-            (void)try_publish_pending(rt);
+            int pub = try_publish_pending(rt);
+            basic_log("SEMANTIC_BASIC publish_first route_id=%u ok=%d road='%s' dist_dm=%u\n",
+                      route_id, pub, rt->published_cue.road, rt->published_cue.dist_dm);
         }
     }
 }
@@ -1066,12 +1155,23 @@ static void *worker_main(void *administrator) {
                             rt.has_published = 0;
 
                             uint32_t existing_route = __atomic_load_n(&active_route_id, __ATOMIC_ACQUIRE);
+                            if (existing_route && !route_exists_in_stub(rt.mem_fd, rt.stub, existing_route)) {
+                                basic_log("SEMANTIC_BASIC stale_route=%u cleared (absent from stub)\n", existing_route);
+                                __atomic_store_n(&active_route_id, 0u, __ATOMIC_RELEASE);
+                                existing_route = 0u;
+                            }
                             if (!existing_route) {
-                                /* First route this boot: arm resolver wrapper for Controller's NewTrip. */
+                                /* First route (or after OEM nav cleared our old route): arm resolver wrapper for Controller's NewTrip. */
                                 __atomic_store_n(&resolver_intercept_kind, 0u, __ATOMIC_RELEASE);
                                 __atomic_store_n(&resolver_armed_flag, 1u, __ATOMIC_RELEASE);
-                                (void)dispatch_owner(rt.component, rt.stub, rt.owner_tid,
-                                                     PHASE_INSTALL_RESOLVER, 0u, &resolver_wrapper_state);
+                                uint32_t wst = dispatch_owner(rt.component, rt.stub, rt.owner_tid,
+                                                              PHASE_INSTALL_RESOLVER, 0u, &resolver_wrapper_state);
+                                basic_log("SEMANTIC_BASIC begin session=%#llx wrap_st=%u tours=%u\n",
+                                          (unsigned long long)rt.session, wst,
+                                          scan_live_tours_mem(rt.mem_fd, rt.stub, NULL));
+                            } else {
+                                basic_log("SEMANTIC_BASIC begin session=%#llx reuse_route=%u\n",
+                                          (unsigned long long)rt.session, existing_route);
                             }
                             struct semantic_handoff h;
                             memset(&h, 0, sizeof(h));

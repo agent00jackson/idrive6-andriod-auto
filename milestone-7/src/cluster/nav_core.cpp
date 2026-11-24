@@ -174,11 +174,13 @@ bool Core::distanceHold(const NavView& v) {
 
 void Core::step(const NavView* in, double now, const char* why_none) {
     if (stop_ != kRunning) return;
-    // A DEPART at 0 m counts as no guidance: after a reroute the arrow shown stays through it (and goes after grace_s,
-    // as in any gap) instead of a straight arrow at 0 yd for a second, drawn and then replaced or cleared.
-    bool depart = in && departHere(*in);
+    // A DEPART at 0 m during an active non-DEPART route (after a reroute) counts as a brief guidance gap so the arrow
+    // already shown stays through it (and clears after grace_s if nothing follows) instead of flickering to a
+    // 0-distance straight arrow. At route start (nothing shown yet, or already showing DEPART), show DEPART
+    // immediately and keep it up while parked, just like OEM navigation.
+    bool depart = in && has_shown_ && shown_.aa_type != 1 && departHere(*in);
     if (depart) {
-        if (!depart_) log("DEPART at 0 m: not shown%s", has_shown_ ? ", the arrow shown stays" : "");
+        if (!depart_) log("DEPART at 0 m: not shown, the arrow shown stays");
         in = NULL;
         why_none = "depart only";
     }

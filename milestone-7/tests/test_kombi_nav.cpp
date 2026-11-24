@@ -504,8 +504,9 @@ static void testRenewedStep() {
     }
 }
 
-// A DEPART at 0 m (route start, each reroute) is never drawn: the arrow shown stays through the reroute, and goes
-// after the grace time if nothing else comes.
+// A DEPART at 0 m at route start is shown immediately (matching OEM navigation) and stays up while parked;
+// after a reroute (once a non-DEPART maneuver is already shown), the arrow shown stays through the brief DEPART
+// and clears after the grace time if nothing else comes.
 static void testDepart() {
     {
         Rig r(timeApproach());
@@ -514,25 +515,26 @@ static void testDepart() {
         n.pos(0, 0);
         r.feed(n.m, 0.0);
         r.feed(n.m, 0.25);
-        assert(!r.core.shown() && r.k.count() == 0 && countLog("DEPART") == 1 && hasLog("DEPART at 0 m: not shown"));
+        r.feed(n.m, 12.0); // stays shown while parked past grace_s
+        assert(r.core.shown() && r.core.current().aa_type == 1 && countLog("SHOW ") == 1 && countLog("DEPART") == 0);
         n.step(8, "FIRST RD");
         n.pos(400, 20);
-        r.feed(n.m, 1.0);
-        assert(r.core.shown() && r.core.current().aa_type == 8 && countLog("SHOW ") == 1);
-        assert(!r.core.takeFallback());                              // the DEPART had no seconds: not a fallback
+        r.feed(n.m, 13.0);
+        assert(r.core.shown() && r.core.current().aa_type == 8 && countLog("SHOW ") == 2);
+        assert(!r.core.takeFallback());
         // a reroute: off, then a DEPART, then the new route's first turn
         n.guidance(2);
-        r.feed(n.m, 2.0);
+        r.feed(n.m, 14.0);
         n.guidance(1);
         n.step(1, "TOWARDS NEW RD");
         n.pos(0, 0);
-        r.feed(n.m, 2.5);
-        assert(r.core.shown() && r.core.current().aa_type == 8 && countLog("SHOW ") == 1 && countLog("CLEAR") == 0);
+        r.feed(n.m, 14.5);
+        assert(r.core.shown() && r.core.current().aa_type == 8 && countLog("SHOW ") == 2 && countLog("CLEAR") == 0);
         assert(hasLog("DEPART at 0 m: not shown, the arrow shown stays"));
         n.step(7, "NEW RD");
         n.pos(300, 15);
-        r.feed(n.m, 3.0);
-        assert(r.core.shown() && r.core.current().aa_type == 7 && countLog("SHOW ") == 2);
+        r.feed(n.m, 15.0);
+        assert(r.core.shown() && r.core.current().aa_type == 7 && countLog("SHOW ") == 3);
     }
     // a DEPART that stays: the arrow shown goes after the grace time, counted from guidance off
     {

@@ -50,7 +50,7 @@ int main(int argc, char** argv) {
         const bool roundabout=(type>=32&&type<=35)||(type>=43&&type<=46);
         const bool offRampOrFork=type>=21&&type<=26;
         const bool arrival=type>=39&&type<=42;
-        if((type<2||type>12)&&type!=36&&!roundabout&&!offRampOrFork&&!arrival){
+        if((type<1||type>12)&&type!=36&&!roundabout&&!offRampOrFork&&!arrival){
             assert(!turnDirection(type,selectedTurn,selectedDirection));
             assert(selectedTurn==77&&selectedDirection==55);
         }
@@ -58,8 +58,12 @@ int main(int argc, char** argv) {
     Message rejected;
     assert(fromNav(phone(7, std::vector<TLane>(), 46), rejected));
     assert(rejected.turn == 2 && rejected.direction == 6400);
-    for(int type=0;type<=256;++type)if(type!=2&&type!=7&&type!=8&&type!=36)
-        assert(!fromNav(phone(type, std::vector<TLane>(), 46), rejected)); // no implicit straight/depart/unknown mapping
+    for(int type=0;type<=256;++type)if(type!=1&&type!=2&&type!=7&&type!=8&&type!=36)
+        assert(!fromNav(phone(type, std::vector<TLane>(), 46), rejected)); // no implicit unknown mapping
+    assert(fromNav(phone(1, {}, 0), rejected));
+    assert(rejected.turn == NG_STRAIGHT && rejected.direction == 0 && rejected.distanceMm == 0);
+    assert(fromNav(phone(1, {}, 0), rejected, NG_CAP_SUPPORTED));
+    assert(rejected.aaType == 1 && rejected.roadLength == 11);
     assert(fromNav(phone(2, {}, 46), rejected));
     assert(rejected.turn == NG_STRAIGHT && rejected.direction == 0);
     assert(fromNav(phone(2, {}, 46), rejected, NG_CAP_SUPPORTED));

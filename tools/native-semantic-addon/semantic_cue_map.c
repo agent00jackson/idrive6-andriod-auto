@@ -29,6 +29,7 @@ static int map_aa_type(const struct ng_message *msg, struct semantic_basic_cue *
     const int32_t exit_angle = has_angle ? msg->exit_angle : 90;
 
     switch (msg->aa_type) {
+    case 1:  /* DEPART */
     case 2:  /* NAME_CHANGE */
     case 36: /* STRAIGHT */
         out->action = 1u; out->direction = 3u; out->elem_type = 1u; out->angle_deg = 0.0f;

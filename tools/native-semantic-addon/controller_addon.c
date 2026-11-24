@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,6 +52,22 @@ static uint64_t mono_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000L);
+}
+
+static void ctrl_log(const char *fmt, ...) {
+    char line[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (n <= 0)
+        return;
+    size_t len = (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1u;
+    int fd = open("/dev/shmem/semantic-ctrl.log", O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) {
+        (void)write(fd, line, len);
+        close(fd);
+    }
 }
 
 enum {
@@ -229,9 +246,14 @@ static void execute_event(void *raw, void *dispatcher) {
         *(uint32_t *)(uintptr_t)(task + 0xcu) != manager + 0x74u ||
         *(uint32_t *)(uintptr_t)(task + 0x18u) != manager)
         return;
-    if (*(uint32_t *)(uintptr_t)(manager + 0x7cu) !=
-        *(uint32_t *)(uintptr_t)(manager + 0x80u))
-        return; /* Never create a second trip. */
+    {
+        uint32_t first = *(uint32_t *)(uintptr_t)(manager + 0x7cu);
+        uint32_t last = *(uint32_t *)(uintptr_t)(manager + 0x80u);
+        for (uint32_t p = first; p < last; p += 4u) {
+            if (*(uint32_t *)(uintptr_t)p >= 0x10000u)
+                return; /* Never create a second live trip. */
+        }
+    }
 
     FN(0x2cdf84, void, void *)(description);
     FN(0x2cd2c4, void, void *)(segment);
@@ -262,14 +284,20 @@ static int inspect_trip_table(uint32_t *out_entries, uint32_t *out_attached_rout
     *out_entries = 0;
     *out_attached_route = 0;
     if (!live_manager || !word_at(live_manager + 0x7cu, &first) ||
-        !word_at(live_manager + 0x80u, &last) || last < first)
+        !word_at(live_manager + 0x80u, &last) || last < first ||
+        (last - first) % 4u != 0u || (last - first) / 4u > 1024u)
         return 0;
-    *out_entries = (last - first) / 4u;
-    if (*out_entries == 1u && first >= 0x10000u) {
+    uint32_t live = 0, only_entry = 0;
+    for (uint32_t p = first; p < last; p += 4u) {
         uint32_t entry = 0;
-        if (word_at(first, &entry) && entry >= 0x10000u)
-            (void)word_at(entry + 0xa8u, out_attached_route);
+        if (word_at(p, &entry) && entry >= 0x10000u && entry < 0x80000000u) {
+            only_entry = entry;
+            ++live;
+        }
     }
+    *out_entries = live;
+    if (live == 1u && only_entry >= 0x10000u)
+        (void)word_at(only_entry + 0xa8u, out_attached_route);
     return 1;
 }
 
@@ -351,9 +379,15 @@ static int ctrl_start_route(void *ctx, uint64_t session) {
             struct timespec d = {0, 25000000};
             nanosleep(&d, NULL);
         }
-        if (!handle)
+        if (!handle) {
+            ctrl_log("SEMANTIC_CTRL new_trip_fail session=%#llx cb=%u\n",
+                     (unsigned long long)session,
+                     __atomic_load_n(&trip_callback_state, __ATOMIC_ACQUIRE));
             return 0;
+        }
         owned_trip_handle = handle;
+        ctrl_log("SEMANTIC_CTRL new_trip_ok session=%#llx handle=%#x\n",
+                 (unsigned long long)session, handle);
 
         /* 2. Wait for NavigationBasic addon to publish RouteId for this session */
         for (unsigned w = 0; w < 200u && !__atomic_load_n(&stopping, __ATOMIC_ACQUIRE); ++w) {
@@ -366,8 +400,11 @@ static int ctrl_start_route(void *ctx, uint64_t session) {
             struct timespec d = {0, 25000000};
             nanosleep(&d, NULL);
         }
-        if (!route_id)
+        if (!route_id) {
+            ctrl_log("SEMANTIC_CTRL route_ready_timeout session=%#llx\n",
+                     (unsigned long long)session);
             return 0;
+        }
 
         /* 3. AttachRoute(owned_trip_handle, route_id) on Root context 0 */
         uint32_t *attach_req = calloc(1, 0x40);
@@ -391,16 +428,27 @@ static int ctrl_start_route(void *ctx, uint64_t session) {
             struct timespec d = {0, 25000000};
             nanosleep(&d, NULL);
         }
-        if (__atomic_load_n(&attach_callback_state, __ATOMIC_ACQUIRE) != 1u)
+        if (__atomic_load_n(&attach_callback_state, __ATOMIC_ACQUIRE) != 1u) {
+            ctrl_log("SEMANTIC_CTRL attach_fail session=%#llx route_id=%u st=%u\n",
+                     (unsigned long long)session, route_id,
+                     __atomic_load_n(&attach_callback_state, __ATOMIC_ACQUIRE));
             return 0;
+        }
         owned_route_id = route_id;
     } else {
+        ctrl_log("SEMANTIC_CTRL foreign_active entries=%u attached=%u\n", entries, attached);
         return 0; /* Foreign BMW route active */
     }
 
     /* 4. StartGuidance(owned_trip_handle) on Root context 0 */
-    if (!dispatch_start_guidance(owned_trip_handle))
+    if (!dispatch_start_guidance(owned_trip_handle)) {
+        ctrl_log("SEMANTIC_CTRL start_guidance_fail session=%#llx handle=%#x\n",
+                 (unsigned long long)session, owned_trip_handle);
         return 0;
+    }
+
+    ctrl_log("SEMANTIC_CTRL guidance_active session=%#llx handle=%#x route_id=%u\n",
+             (unsigned long long)session, owned_trip_handle, route_id);
 
     struct semantic_handoff h;
     memset(&h, 0, sizeof(h));
@@ -458,6 +506,16 @@ static void *run(void *unused) {
     if (fd < 0)
         return NULL;
 
+    {
+        int lfd = open("/dev/shmem/semantic-ctrl.log", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (lfd >= 0) {
+            char msg[128];
+            int ln = snprintf(msg, sizeof(msg), "SEMANTIC_CTRL ready pid=%d manager=%#x\n",
+                              getpid(), live_manager);
+            if (ln > 0) (void)write(lfd, msg, (size_t)ln);
+            close(lfd);
+        }
+    }
     fprintf(stderr, "SEMANTIC_CTRL ready pid=%d manager=%#x\n", getpid(), live_manager);
 
     struct sc_machine machine;

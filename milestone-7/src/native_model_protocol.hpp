@@ -182,7 +182,7 @@ inline bool turnDirection(int type, uint32_t& turn, uint16_t& angle) {
         case 24: turn = NG_RIGHT; angle = 19200; return true;
         case 25: turn = NG_LEFT; angle = 6400; return true;   // selected fork branch
         case 26: turn = NG_RIGHT; angle = 19200; return true;
-        case 2: case 36: turn = NG_STRAIGHT; angle = 0; return true; // NAME_CHANGE or STRAIGHT
+        case 1: case 2: case 36: turn = NG_STRAIGHT; angle = 0; return true; // DEPART, NAME_CHANGE or STRAIGHT
         case 32: case 33: case 43: case 44: turn = NG_RIGHT; angle = 19200; return true;
         case 34: case 35: case 45: case 46: turn = NG_LEFT; angle = 6400; return true;
         case 39: case 40: turn = NG_STRAIGHT; angle = 0; return true; // destination or straight arrival
