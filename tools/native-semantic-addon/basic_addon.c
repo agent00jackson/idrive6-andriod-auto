@@ -64,7 +64,10 @@ enum {
     RESOLVER_VPTR = 0x00f872a0,
     ROUTE_DATA_VPTR = 0x00f872f8,
     MUX_VPTR = 0x00ee1690,
-    MUX9_ADDR = 0x02795d88,
+    MUX_OWNER_HINT = 0x02795e98,
+    MUX9_HINT = 0x02795d88,
+    HEAP_SCAN_BEGIN = 0x0255c000,
+    HEAP_SCAN_END = 0x20000000,
     RG_VPTR = 0x00f44450,
     MILCA_VPTR = 0x00f3f3c8,
 };
@@ -214,10 +217,9 @@ static int component_valid(int fd, uint32_t candidate) {
     return 1;
 }
 
-static int find_owner(int fd, uint32_t *component, uint16_t *thread) {
+static int check_owner_mux(int fd, uint32_t mux, uint32_t *component, uint16_t *thread) {
     uint32_t found_component = 0, start = 0, end = 0, limit = 0, raw_thread = 0;
     unsigned components = 0;
-    const uint32_t mux = 0x02795e98u;
     uint32_t vptr = 0;
     if (!word(fd, mux, &vptr) || vptr != MUX_VPTR ||
         !word(fd, mux + 0x1c, &start) || !word(fd, mux + 0x20, &end) ||
@@ -244,15 +246,16 @@ static int find_owner(int fd, uint32_t *component, uint16_t *thread) {
     return 1;
 }
 
-static int find_rg_and_milca(int fd, uint32_t *out_rg, uint32_t *out_milca,
-                             uint16_t *out_thread) {
-    uint32_t vptr = 0, start = 0, end = 0, raw_tid = 0;
+static int check_rg_milca_mux(int fd, uint32_t mux, uint32_t *out_rg, uint32_t *out_milca,
+                              uint16_t *out_thread) {
+    uint32_t vptr = 0, start = 0, end = 0, limit = 0, raw_tid = 0;
     uint32_t rg = 0, milca = 0;
     unsigned rg_count = 0, milca_count = 0;
-    if (!word(fd, MUX9_ADDR, &vptr) || vptr != MUX_VPTR ||
-        !word(fd, MUX9_ADDR + 0x1c, &start) || !word(fd, MUX9_ADDR + 0x20, &end) ||
-        !word(fd, MUX9_ADDR + 0x70, &raw_tid) ||
-        start < 0x10000u || end < start || end - start > 64u * 4u ||
+    if (!word(fd, mux, &vptr) || vptr != MUX_VPTR ||
+        !word(fd, mux + 0x1c, &start) || !word(fd, mux + 0x20, &end) ||
+        !word(fd, mux + 0x24, &limit) || !word(fd, mux + 0x70, &raw_tid) ||
+        start < 0x10000u || end < start || end > limit ||
+        (end - start) % 4u != 0 || (end - start) / 4u > 64u ||
         (raw_tid & 0xffffu) == 0u || (raw_tid & 0xffffu) >= 0x7fffu)
         return 0;
     for (uint32_t at = start; at < end; at += 4u) {
@@ -268,6 +271,43 @@ static int find_rg_and_milca(int fd, uint32_t *out_rg, uint32_t *out_milca,
     *out_milca = milca;
     *out_thread = (uint16_t)raw_tid;
     return 1;
+}
+
+/* Dynamically locate both CHBMultiplexer heap objects by MUX_VPTR so live cars
+ * with NDS maps (different heap addresses than the mapless emulator) work reliably. */
+static int find_all_mux_targets(int fd,
+                                uint32_t *out_component, uint16_t *out_owner_tid,
+                                uint32_t *out_rg, uint32_t *out_milca, uint16_t *out_rg_tid) {
+    int have_owner = (*out_component != 0u);
+    int have_rg = (*out_rg != 0u && *out_milca != 0u);
+
+    if (!have_owner && check_owner_mux(fd, MUX_OWNER_HINT, out_component, out_owner_tid))
+        have_owner = 1;
+    if (!have_rg && check_rg_milca_mux(fd, MUX9_HINT, out_rg, out_milca, out_rg_tid))
+        have_rg = 1;
+    if (have_owner && have_rg)
+        return 1;
+
+    uint32_t page[1024];
+    uint32_t addr = HEAP_SCAN_BEGIN;
+    while (addr < HEAP_SCAN_END && !(have_owner && have_rg)) {
+        if (lseek(fd, (off_t)addr, SEEK_SET) != (off_t)addr ||
+            read(fd, page, sizeof(page)) != (ssize_t)sizeof(page)) {
+            addr = (addr + 65536u) & ~65535u;
+            continue;
+        }
+        for (unsigned i = 0; i < 1024u && !(have_owner && have_rg); ++i) {
+            if (page[i] != MUX_VPTR)
+                continue;
+            uint32_t cand = addr + i * 4u;
+            if (!have_owner && check_owner_mux(fd, cand, out_component, out_owner_tid))
+                have_owner = 1;
+            else if (!have_rg && check_rg_milca_mux(fd, cand, out_rg, out_milca, out_rg_tid))
+                have_rg = 1;
+        }
+        addr += 4096u;
+    }
+    return have_owner && have_rg;
 }
 
 static void destroy_ev(void *raw) { FN(0x1457f8, void, void *)(raw); }
@@ -877,6 +917,12 @@ static void *worker_main(void *administrator) {
         return NULL;
 
     if (!verify_identity(mem_fd, administrator)) {
+        int lfd = open("/dev/shmem/semantic-basic.log", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (lfd >= 0) {
+            const char msg[] = "SEMANTIC_BASIC refused identity\n";
+            (void)write(lfd, msg, sizeof(msg) - 1u);
+            close(lfd);
+        }
         fprintf(stderr, "SEMANTIC_BASIC refused identity\n");
         close(mem_fd);
         return NULL;
@@ -890,14 +936,23 @@ static void *worker_main(void *administrator) {
     for (unsigned i = 0; i < 600u; ++i) {
         uint32_t ready = 0;
         if (word(mem_fd, DATA_ACCESS_READY, &ready) && (ready & 1u) &&
-            find_owner(mem_fd, &rt.component, &rt.owner_tid) &&
-            find_rg_and_milca(mem_fd, &rt.rg, &rt.milca, &rt.rg_tid))
+            find_all_mux_targets(mem_fd, &rt.component, &rt.owner_tid,
+                                 &rt.rg, &rt.milca, &rt.rg_tid))
             break;
         struct timespec w = {0, 500000000};
         nanosleep(&w, NULL);
     }
     unsigned xar_patched = semantic_xar_patch_shm_in_place(mem_fd);
     if (!rt.component || !rt.rg || !rt.milca) {
+        int lfd = open("/dev/shmem/semantic-basic.log", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (lfd >= 0) {
+            char msg[192];
+            int ln = snprintf(msg, sizeof(msg),
+                              "SEMANTIC_BASIC refused owner_timeout comp=%#x rg=%#x milca=%#x\n",
+                              rt.component, rt.rg, rt.milca);
+            if (ln > 0) (void)write(lfd, msg, (size_t)ln);
+            close(lfd);
+        }
         fprintf(stderr, "SEMANTIC_BASIC refused owner_timeout\n");
         close(mem_fd);
         return NULL;
@@ -915,6 +970,18 @@ static void *worker_main(void *administrator) {
         if (alive_fd >= 0) close(alive_fd);
         close(mem_fd);
         return NULL;
+    }
+    {
+        int lfd = open("/dev/shmem/semantic-basic.log", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (lfd >= 0) {
+            char msg[256];
+            int ln = snprintf(msg, sizeof(msg),
+                              "SEMANTIC_BASIC ready pid=%d comp=%#x owner_tid=%u rg=%#x milca=%#x rg_tid=%u xar_patched=%u\n",
+                              getpid(), rt.component, (unsigned)rt.owner_tid, rt.rg, rt.milca,
+                              (unsigned)rt.rg_tid, xar_patched);
+            if (ln > 0) (void)write(lfd, msg, (size_t)ln);
+            close(lfd);
+        }
     }
     fprintf(stderr, "SEMANTIC_BASIC ready pid=%d rg=%#x milca=%#x xar_patched=%u\n",
             getpid(), rt.rg, rt.milca, xar_patched);
