@@ -24,6 +24,7 @@
 #include "queue-pins.h"
 #include "semantic_ctrl_wire.h"
 #include "semantic_handoff.h"
+#include "semantic_minimap_shm.h"
 #include "sha256.h"
 #include "source-pins.h"
 
@@ -77,6 +78,18 @@ enum {
     START_GUIDANCE_VPTR = 0x00f18ba0,
     CORE_VPTR = 0x00fe7020,
     DEFAULT_STRING = 0x0110c94c,
+
+    /* Exact X20511I CIcHudComm_TF11_13 HUD polygon substitution pins */
+    HUD_COMM_VPTR            = 0x00fb3488, /* 38-slot vtable */
+    HUD_COMM_DRAW_CMD_ORIG   = 0x0077dd70, /* slot 14 */
+    HUD_COMM_SWITCH_VIS_ORIG = 0x0077c3c0, /* slot 35 */
+    HUD_COMM_GET_TARGET_ORIG = 0x0077a2c0, /* slot 36 */
+    HUD_COMM_SET_LINE_WIDTH  = 0x007735cc,
+    HUD_COMM_SET_FILL_COLOR  = 0x007734d8,
+    HUD_COMM_ADD_POLYGON     = 0x00778e64,
+    HB_BYTESTREAM_CTOR       = 0x00127c74,
+    HB_BYTESTREAM_DOWRITE    = 0x00128dd8,
+    HB_BYTESTREAM_DTOR       = 0x0012a0bc,
 };
 
 struct owner_event {
@@ -102,6 +115,17 @@ static unsigned short target_thread = 0xffff;
 static uint32_t live_manager;
 static uint32_t owned_trip_handle;
 static uint32_t owned_route_id;
+static volatile uint64_t owned_session;
+
+/* CIcHudComm_TF11_13 vtable override state (covers both HUD isFpk=0 and 6WB IC isFpk=1). */
+static uint32_t hud_comm_addrs[2];
+static volatile unsigned hud_comm_count;
+static uint32_t hud_comm_vtable_copy[2 + 38];
+static int hud_comm_vtable_ready;
+static int g_mm_override_active;
+static void *g_mm_override_self;
+static int g_mm_override_tf;
+static struct semantic_minimap_record g_mm_override_rec;
 
 static void (*event_construct)(void *);
 static void (*event_destruct)(void *);
@@ -196,6 +220,156 @@ static uint32_t find_manager(void) {
         }
     }
     return count == 1u ? candidate : 0u;
+}
+
+static unsigned find_hud_comms(uint32_t out[2]) {
+    uint32_t words[1024];
+    uint32_t addr = 0x01000000u;
+    unsigned found = 0u;
+    while (addr < 0x20000000u && found < 2u) {
+        if (!read_at(addr, words, sizeof(words))) {
+            addr = (addr + 65536u) & ~65535u;
+            continue;
+        }
+        for (uint32_t i = 0u; i < 1024u && found < 2u; ++i) {
+            if (words[i] != HUD_COMM_VPTR)
+                continue;
+            uint32_t cand = addr + i * 4u;
+            uint32_t magic = 0u, prefix = 0u;
+            uint8_t is_fpk = 255u;
+            if (word_at(cand + 76u, &magic) && magic == 129u &&
+                word_at(cand + 208u, &prefix) && prefix >= 0x10000u && prefix < 0x80000000u &&
+                read_at(cand + 224u, &is_fpk, 1u) && (is_fpk == 0u || is_fpk == 1u)) {
+                out[found++] = cand;
+            }
+        }
+        addr += 4096u;
+    }
+    return found;
+}
+
+static int wrapped_hud_get_target_inst(void *self, int top_frame, int slot) {
+    if (g_mm_override_active && self == g_mm_override_self &&
+        top_frame == g_mm_override_tf && (slot == 4 || slot == 5))
+        return -1; /* Suppress OEM Guiding_Arrow bg (slot 4) & fg (slot 5); our 4-layer minimap replaces both. */
+    return FN(HUD_COMM_GET_TARGET_ORIG, int, void *, int, int)(self, top_frame, slot);
+}
+
+static void emit_hud_minimap_polygons(void *self, int inst_vec_ind, uint16_t *elem_cnt,
+                                      const struct semantic_hud_minimap *map) {
+    if (inst_vec_ind < 0 || !elem_cnt || !map || !map->valid || map->poly_count == 0u)
+        return;
+
+    FN(HUD_COMM_SET_LINE_WIDTH, void, void *, int, uint32_t, uint8_t)(
+        self, inst_vec_ind, 0u, 0u);
+
+    int last_color = -1;
+    uint8_t count = map->poly_count;
+    if (count > SEMANTIC_HUD_MAX_POLYS)
+        count = SEMANTIC_HUD_MAX_POLYS;
+
+    for (uint8_t i = 0u; i < count; ++i) {
+        const struct semantic_hud_poly *p = &map->polys[i];
+        if (p->pt_count < 3u || p->pt_count > SEMANTIC_HUD_MAX_POLY_PTS)
+            continue;
+        if ((int)p->color != last_color) {
+            FN(HUD_COMM_SET_FILL_COLOR, void, void *, int, uint32_t, uint8_t)(
+                self, inst_vec_ind, (uint32_t)p->color, 0u);
+            last_color = (int)p->color;
+        }
+
+        uint8_t be_pts[SEMANTIC_HUD_MAX_POLY_PTS * 4u];
+        for (uint8_t k = 0u; k < p->pt_count; ++k) {
+            uint16_t px = p->x[k];
+            uint16_t py = p->y[k];
+            be_pts[k * 4u + 0u] = (uint8_t)(px >> 8);
+            be_pts[k * 4u + 1u] = (uint8_t)(px & 0xffu);
+            be_pts[k * 4u + 2u] = (uint8_t)(py >> 8);
+            be_pts[k * 4u + 3u] = (uint8_t)(py & 0xffu);
+        }
+
+        _Alignas(8) uint8_t bs[64];
+        memset(bs, 0, sizeof(bs));
+        FN(HB_BYTESTREAM_CTOR, void, void *)(bs);
+        FN(HB_BYTESTREAM_DOWRITE, uint32_t, void *, const void *, uint32_t)(
+            bs, be_pts, (uint32_t)p->pt_count * 4u);
+        uint16_t item_idx = *elem_cnt;
+        FN(HUD_COMM_ADD_POLYGON, void, void *, int, uint16_t, uint32_t, uint8_t, const void *, uint8_t)(
+            self, inst_vec_ind, item_idx, 3u, p->pt_count, bs, 0u);
+        *elem_cnt = (uint16_t)(item_idx + 1u);
+        FN(HB_BYTESTREAM_DTOR, void, void *)(bs);
+    }
+}
+
+static void wrapped_hud_switch_visibility(void *self, int handle, int dirty_flag) {
+    if (g_mm_override_active && self == g_mm_override_self && handle == 1) {
+        int inst_vec_ind = *(int32_t *)((uint8_t *)self + 256u);
+        uint16_t *elem_cnt = (uint16_t *)((uint8_t *)self + 286u);
+        emit_hud_minimap_polygons(self, inst_vec_ind, elem_cnt, &g_mm_override_rec.map);
+    }
+    FN(HUD_COMM_SWITCH_VIS_ORIG, void, void *, int, int)(self, handle, dirty_flag);
+}
+
+static void wrapped_hud_draw_command_data(void *self, const void *chunk, int top_frame, int arg3,
+                                          int man_id, int man_type, int data_seq, int man_phase) {
+    uint64_t sess = __atomic_load_n(&owned_session, __ATOMIC_ACQUIRE);
+    g_mm_override_active = 0;
+    g_mm_override_self = NULL;
+    if (sess != 0u && owned_trip_handle != 0u && top_frame == 11) {
+        struct semantic_minimap_record rec;
+        if (semantic_minimap_shm_read(NULL, &rec) &&
+            rec.map.valid && rec.map.poly_count > 0u &&
+            (rec.session == sess || rec.session == 0u)) {
+            g_mm_override_rec = rec;
+            g_mm_override_self = self;
+            g_mm_override_tf = top_frame;
+            g_mm_override_active = 1;
+            uint8_t is_fpk = *((const uint8_t *)self + 224u);
+            ctrl_log("SEMANTIC_CTRL hud_minimap_override fpk=%u tf=%d seq=%u polys=%u conf=%u\n",
+                     (unsigned)is_fpk, top_frame, rec.sequence, (unsigned)rec.map.poly_count,
+                     (unsigned)rec.map.confidence);
+        }
+    }
+    FN(HUD_COMM_DRAW_CMD_ORIG, void, void *, const void *, int, int, int, int, int, int)(
+        self, chunk, top_frame, arg3, man_id, man_type, data_seq, man_phase);
+    g_mm_override_active = 0;
+    g_mm_override_self = NULL;
+}
+
+static void try_install_hud_comm_hook(void) {
+    unsigned cur_cnt = __atomic_load_n(&hud_comm_count, __ATOMIC_ACQUIRE);
+    if (cur_cnt >= 2u)
+        return;
+    if (!hud_comm_vtable_ready) {
+        memcpy(hud_comm_vtable_copy, (const void *)(uintptr_t)(HUD_COMM_VPTR - 8u),
+               sizeof(hud_comm_vtable_copy));
+        if (hud_comm_vtable_copy[2 + 14] != HUD_COMM_DRAW_CMD_ORIG ||
+            hud_comm_vtable_copy[2 + 35] != HUD_COMM_SWITCH_VIS_ORIG ||
+            hud_comm_vtable_copy[2 + 36] != HUD_COMM_GET_TARGET_ORIG)
+            return;
+        hud_comm_vtable_copy[2 + 14] = (uint32_t)(uintptr_t)&wrapped_hud_draw_command_data;
+        hud_comm_vtable_copy[2 + 35] = (uint32_t)(uintptr_t)&wrapped_hud_switch_visibility;
+        hud_comm_vtable_copy[2 + 36] = (uint32_t)(uintptr_t)&wrapped_hud_get_target_inst;
+        hud_comm_vtable_ready = 1;
+    }
+    uint32_t cands[2] = {0u, 0u};
+    unsigned found = find_hud_comms(cands);
+    for (unsigned i = 0u; i < found && cur_cnt < 2u; ++i) {
+        uint32_t cand = cands[i];
+        int dup = 0;
+        for (unsigned j = 0u; j < cur_cnt; ++j)
+            if (hud_comm_addrs[j] == cand) dup = 1;
+        if (dup) continue;
+        uint32_t cur_vptr = *(uint32_t *)(uintptr_t)cand;
+        if (cur_vptr != HUD_COMM_VPTR) continue;
+        uint8_t is_fpk = *((const uint8_t *)(uintptr_t)cand + 224u);
+        hud_comm_addrs[cur_cnt++] = cand;
+        __atomic_store_n((uint32_t *)(uintptr_t)cand,
+                         (uint32_t)(uintptr_t)&hud_comm_vtable_copy[2],
+                         __ATOMIC_RELEASE);
+        __atomic_store_n(&hud_comm_count, cur_cnt, __ATOMIC_RELEASE);
+        ctrl_log("SEMANTIC_CTRL hud_comm_hooked #%u addr=%#x fpk=%u\n", cur_cnt, cand, (unsigned)is_fpk);
+    }
 }
 
 static void destroy_event(void *raw) { event_destruct(raw); }
@@ -448,7 +622,10 @@ static int ctrl_start_route(void *ctx, uint64_t session) {
     }
 
     /* 4. StartGuidance(owned_trip_handle) on Root context 0 */
+    try_install_hud_comm_hook();
+    __atomic_store_n(&owned_session, session, __ATOMIC_RELEASE);
     if (!dispatch_start_guidance(owned_trip_handle)) {
+        __atomic_store_n(&owned_session, 0u, __ATOMIC_RELEASE);
         ctrl_log("SEMANTIC_CTRL start_guidance_fail session=%#llx handle=%#x\n",
                  (unsigned long long)session, owned_trip_handle);
         return 0;
@@ -470,6 +647,8 @@ static int ctrl_start_route(void *ctx, uint64_t session) {
 static int ctrl_stop_route(void *ctx, uint64_t session) {
     (void)ctx;
     (void)session;
+    __atomic_store_n(&owned_session, 0u, __ATOMIC_RELEASE);
+    semantic_minimap_shm_clear(NULL);
     /* NavigationBasic addon performs the clean RG_GuidanceState=00 clear on NG_STOP. */
     return 1;
 }
@@ -537,10 +716,15 @@ static void *run(void *unused) {
     struct pollfd pfd;
     pfd.fd = fd;
     pfd.events = POLLIN;
+    uint64_t next_hud_scan_ms = mono_ms() + 1000u;
 
     while (!__atomic_load_n(&stopping, __ATOMIC_ACQUIRE)) {
         (void)poll(&pfd, 1, 100);
         uint64_t now = mono_ms();
+        if (__atomic_load_n(&hud_comm_count, __ATOMIC_ACQUIRE) < 2u && now >= next_hud_scan_ms) {
+            try_install_hud_comm_hook();
+            next_hud_scan_ms = now + 2000u;
+        }
         if (pfd.revents & POLLIN) {
             uint8_t buf[SC_WIRE_BYTES + 4u];
             struct qnx_sockaddr_un peer;
@@ -567,6 +751,14 @@ static void *run(void *unused) {
 
 static void stop_cb(void *context) {
     (void)context;
+    __atomic_store_n(&owned_session, 0u, __ATOMIC_RELEASE);
+    unsigned cnt = __atomic_load_n(&hud_comm_count, __ATOMIC_ACQUIRE);
+    for (unsigned i = 0u; i < cnt && i < 2u; ++i) {
+        if (hud_comm_addrs[i]) {
+            __atomic_store_n((uint32_t *)(uintptr_t)hud_comm_addrs[i], HUD_COMM_VPTR, __ATOMIC_RELEASE);
+        }
+    }
+    __atomic_store_n(&hud_comm_count, 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&stopping, 1u, __ATOMIC_RELEASE);
     if (worker_started)
         pthread_join(worker, NULL);

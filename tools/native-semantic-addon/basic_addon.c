@@ -27,6 +27,10 @@
 #include "native_model_wire/protocol.h"
 #include "semantic_cue_map.h"
 #include "semantic_handoff.h"
+#include "semantic_minimap_render.h"
+#include "semantic_minimap_shm.h"
+#include "semantic_nds_map.h"
+#include "semantic_nds_probe.h"
 #include "semantic_xar_hook.h"
 
 #if !defined(__QNXNTO__) || !defined(__arm__)
@@ -599,13 +603,44 @@ static uint32_t find_milca_list_for_route(uint32_t milca, uint32_t route_id) {
     return 0;
 }
 
+/* Lock-free seqlock carrying live car GPS captured from CRouteGuidance::onCarPositionUpdate. */
+static volatile uint32_t g_gps_seq = 0u;
+static struct semantic_car_gps g_live_gps;
+
+static void store_live_gps(const struct semantic_car_gps *src) {
+    uint32_t s = __atomic_load_n(&g_gps_seq, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_gps_seq, s + 1u, __ATOMIC_RELEASE);
+    g_live_gps = *src;
+    __atomic_store_n(&g_gps_seq, s + 2u, __ATOMIC_RELEASE);
+}
+
+static int load_live_gps(struct semantic_car_gps *out) {
+    for (unsigned tries = 0u; tries < 4u; ++tries) {
+        uint32_t s1 = __atomic_load_n(&g_gps_seq, __ATOMIC_ACQUIRE);
+        if (s1 & 1u)
+            continue;
+        *out = g_live_gps;
+        uint32_t s2 = __atomic_load_n(&g_gps_seq, __ATOMIC_ACQUIRE);
+        if (s1 == s2)
+            return out->valid;
+    }
+    memset(out, 0, sizeof(*out));
+    return 0;
+}
+
 /* While our synthetic 2-link fixture route is actively guiding, live car GPS
  * ticks in CRouteGuidance::onCarPositionUpdate (rg+0x24c slot 3) spawn
  * CCarPositionUpdateJob, which computes distance=0 against the fixture links
  * and pushes dist=0 via onDistanceToManeuverCalculatedEvent (rg+0x308 slot 2).
- * Suppress both only while g_rg_gps_suppressed != 0; pass straight through
- * when OEM navigation runs. */
+ * Always capture live WGS84 car GPS for OEM NDS map lookup before suppressing. */
 static void wrapped_rg_on_car_pos(void *subobj, const void *pos) {
+    if (pos) {
+        struct semantic_car_gps snap;
+        memset(&snap, 0, sizeof(snap));
+        semantic_nds_capture_car_pos(pos, mono_ms(), &snap);
+        if (snap.valid)
+            store_live_gps(&snap);
+    }
     if (__atomic_load_n(&g_rg_gps_suppressed, __ATOMIC_ACQUIRE))
         return;
     FN(RG_CARPOS_ORIG, void, void *, const void *)(subobj, pos);
@@ -1014,14 +1049,121 @@ struct basic_runtime {
     int guidance_active;
     int has_pending;
     int has_published;
+    struct ng_message pending_msg;
     struct semantic_basic_cue pending_cue;
     struct semantic_basic_cue published_cue;
     uint64_t session;
     uint64_t last_alive_ms;
     uint64_t next_calc_ms;
+    uint64_t last_nds_query_ms;
     uint32_t calc_attempts;
     uint32_t last_seq;
+    uint32_t minimap_seq;
+    int has_active_minimap;
 };
+
+static int cue_eligible_for_minimap(const struct ng_message *msg,
+                                    const struct semantic_basic_cue *cue) {
+    if (!msg || !cue || cue->is_arrival)
+        return 0;
+    float dist_m = (float)msg->distance_mm * 0.001f;
+    if (dist_m > 450.0f)
+        return 0;
+    /* Roundabouts (AA 32..38), turns/forks/ramps (anything non-straight/non-depart). */
+    uint16_t aa = (msg->metadata_flags & NG_META_AA_TYPE) ? msg->aa_type : 0u;
+    if (aa == 1u || aa == 2u || aa == 39u || aa == 40u || aa == 41u)
+        return 0; /* DEPART, NAME_CHANGE, DESTINATION_* */
+    if (aa == 0u && msg->turn == NG_STRAIGHT)
+        return 0;
+    return 1;
+}
+
+/* Returns 1 if a fresh valid minimap was just written to SHM, 0 otherwise. */
+static int refresh_nds_minimap(struct basic_runtime *rt, int force) {
+    uint64_t now = mono_ms();
+    if (!force && now < rt->last_nds_query_ms + 600u)
+        return 0;
+
+    if (!cue_eligible_for_minimap(&rt->pending_msg, &rt->pending_cue)) {
+        if (rt->has_active_minimap || force) {
+            semantic_minimap_shm_clear(NULL);
+            rt->has_active_minimap = 0;
+        }
+        return 0;
+    }
+
+    struct semantic_car_gps gps;
+    if (!load_live_gps(&gps) || now > gps.timestamp_ms + 5000u) {
+        if (rt->has_active_minimap || force) {
+            semantic_minimap_shm_clear(NULL);
+            rt->has_active_minimap = 0;
+        }
+        return 0;
+    }
+
+    rt->last_nds_query_ms = now;
+    float dist_m = (float)rt->pending_msg.distance_mm * 0.001f;
+    float radius_m = dist_m + 120.0f;
+
+    struct snds_graph *graph = calloc(1, sizeof(*graph));
+    if (!graph) {
+        semantic_minimap_shm_clear(NULL);
+        rt->has_active_minimap = 0;
+        return 0;
+    }
+
+    int links = semantic_nds_query_local_graph(rt->mem_fd, &gps, radius_m, graph);
+    if (links <= 0) {
+        free(graph);
+        if (rt->has_active_minimap || force) {
+            semantic_minimap_shm_clear(NULL);
+            rt->has_active_minimap = 0;
+        }
+        return 0;
+    }
+
+    struct snds_query q;
+    memset(&q, 0, sizeof(q));
+    q.car_x = 0.0f;
+    q.car_y = 0.0f;
+    q.car_heading_deg = gps.heading_deg;
+    q.aa_type = (rt->pending_msg.metadata_flags & NG_META_AA_TYPE) ? rt->pending_msg.aa_type : 0u;
+    q.dist_m = dist_m;
+    if (rt->pending_msg.metadata_flags & NG_META_EXIT_NUMBER)
+        q.exit_number = rt->pending_msg.exit_number;
+    if (rt->pending_msg.metadata_flags & NG_META_EXIT_ANGLE)
+        q.exit_angle = rt->pending_msg.exit_angle;
+    if (rt->pending_cue.road[0]) {
+        strncpy(q.road_name, rt->pending_cue.road, sizeof(q.road_name) - 1u);
+    }
+
+    struct snds_junction junc;
+    memset(&junc, 0, sizeof(junc));
+    int matched = snds_match_maneuver(graph, &q, &junc);
+    free(graph);
+
+    struct semantic_hud_minimap mm;
+    memset(&mm, 0, sizeof(mm));
+    if (matched && semantic_render_hud_minimap(&junc, g_next_man_id, 65u, &mm)) {
+        rt->minimap_seq++;
+        (void)semantic_minimap_shm_write(NULL, rt->session, rt->minimap_seq, &mm);
+        rt->has_active_minimap = 1;
+        basic_log("SEMANTIC_BASIC nds_minimap ok links=%d rb=%u conf=%u polys=%u dist_m=%.0f\n",
+                  links, (unsigned)mm.is_roundabout, (unsigned)mm.confidence,
+                  (unsigned)mm.poly_count, (double)dist_m);
+        return 1;
+    }
+
+    if (rt->has_active_minimap || force) {
+        semantic_minimap_shm_clear(NULL);
+        rt->has_active_minimap = 0;
+    }
+    if (force) {
+        basic_log("SEMANTIC_BASIC nds_minimap fallback links=%d matched=%d conf=%u dist_m=%.0f\n",
+                  links, matched, (unsigned)junc.confidence, (double)dist_m);
+    }
+    return 0;
+}
 
 static int try_publish_pending(struct basic_runtime *rt) {
     if (!rt->has_pending || !rt->guidance_active)
@@ -1034,6 +1176,14 @@ static int try_publish_pending(struct basic_runtime *rt) {
     g_pending_cue = rt->pending_cue;
     g_pending_dtm_only = (rt->has_published &&
                           semantic_cue_is_distance_only(&rt->published_cue, &rt->pending_cue)) ? 1u : 0u;
+    if (!g_pending_dtm_only) {
+        (void)refresh_nds_minimap(rt, 1);
+    } else if (!rt->has_active_minimap &&
+               cue_eligible_for_minimap(&rt->pending_msg, &rt->pending_cue)) {
+        /* Maneuver just entered <=450m approach range: upgrade to real NDS minimap once! */
+        if (refresh_nds_minimap(rt, 0))
+            g_pending_dtm_only = 0u;
+    }
     if (dispatch_owner(rt->rg, rt->milca, rt->rg_tid, PHASE_PUBLISH_CUE, route_id, &hud_dispatch_state) != 1u)
         return 0;
     rt->published_cue = rt->pending_cue;
@@ -1045,12 +1195,14 @@ static int try_publish_pending(struct basic_runtime *rt) {
 static void clear_session(struct basic_runtime *rt) {
     uint32_t route_id = __atomic_load_n(&active_route_id, __ATOMIC_ACQUIRE);
     __atomic_store_n(&g_rg_gps_suppressed, 0u, __ATOMIC_RELEASE);
+    semantic_minimap_shm_clear(NULL);
     if (rt->guidance_active && route_id) {
         (void)dispatch_owner(rt->rg, rt->milca, rt->rg_tid, PHASE_CLEAR_GUIDANCE, route_id, &hud_dispatch_state);
     }
     rt->guidance_active = 0;
     rt->has_pending = 0;
     rt->has_published = 0;
+    rt->has_active_minimap = 0;
     rt->session = 0;
     rt->last_seq = 0;
     __atomic_store_n(&resolver_armed_flag, 0u, __ATOMIC_RELEASE);
@@ -1265,6 +1417,7 @@ static void *worker_main(void *administrator) {
                             rt.last_alive_ms = now;
                             rt.next_calc_ms = 0u;
                             rt.calc_attempts = 0u;
+                            rt.pending_msg = msg;
                             rt.pending_cue = cue;
                             rt.has_pending = 1;
                             rt.has_published = 0;
@@ -1303,6 +1456,7 @@ static void *worker_main(void *administrator) {
                             } else {
                                 rt.last_seq = msg.sequence;
                                 rt.last_alive_ms = now;
+                                rt.pending_msg = msg;
                                 rt.pending_cue = cue;
                                 rt.has_pending = 1;
                                 (void)try_publish_pending(&rt);

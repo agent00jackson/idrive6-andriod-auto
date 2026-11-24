@@ -7,6 +7,10 @@ add_library(native_semantic_basic SHARED
   fixture-provider.c
   semantic_cue_map.c
   semantic_handoff.c
+  semantic_minimap_render.c
+  semantic_minimap_shm.c
+  semantic_nds_map.c
+  semantic_nds_probe.c
   semantic_xar_patch.c
   semantic_xar_hook.c
   ../../milestone-7/src/native_model_wire/protocol.c
@@ -22,6 +26,7 @@ add_library(native_semantic_controller SHARED
   controller_addon.c
   semantic_ctrl_wire.c
   semantic_handoff.c
+  semantic_minimap_shm.c
 )
 target_include_directories(native_semantic_controller PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}"
