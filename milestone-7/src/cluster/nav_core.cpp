@@ -411,7 +411,10 @@ bool KombiNav::createDisplay(const char* id, most::Client* most) {
         }
         display_ = native;
         native_display_ = true;
-        yield_enabled_ = true;
+        // NavNBTEvoController's semantic addon checks the live trip table directly and yields
+        // authoritatively to any foreign BMW route; sloginfo RouteGuidanceStarted fires on our own
+        // StartGuidance and would make nbt-aad yield to itself.
+        yield_enabled_ = false;
         target_ = "BMW native semantic guidance";
         stopHint_ = "native semantic adapter unavailable or unqualified";
         return true;
@@ -566,7 +569,7 @@ void KombiNav::start(most::Client* most) {
     if (!createDisplay(clusterId, most)) return;
     core_ = new Core(*display_, settings_, &KombiNav::logLine, this);
     if (native_display_) {
-        printf("[KombiNav] BMW native guidance %s, approach %s, factory-route yield on\n",
+        printf("[KombiNav] BMW native guidance %s, approach %s, controller factory-route yield on\n",
                enabledNow() ? "ON" : "off", approachText().c_str());
     } else if (client_)
         printf("[KombiNav] cluster/HUD arrows %s (%s); KOMBI %s:%u handle 0x%X, approach %s, bar %s, iDrive-route "
