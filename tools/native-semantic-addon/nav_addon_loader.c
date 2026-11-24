@@ -17,6 +17,8 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -24,6 +26,10 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __QNXNTO__
+#include <devctl.h>
+#include <sys/procfs.h>
+#endif
 
 #define NAV_ADDON_DEFAULT_ROOT     "/opt/aa/nav-addons"
 #define NAV_ADDON_DISABLE_FLAG     "/var/opt/aa/nav-addons-disabled"
@@ -133,11 +139,47 @@ static size_t nav_addon_collect_dir(const char *dir_path,
 
 #ifndef NAV_ADDON_LOADER_HOST_TEST
 
+static FILE *g_loader_log = NULL;
+
+static void loader_log(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fflush(stderr);
+    if (g_loader_log) {
+        va_start(ap, fmt);
+        vfprintf(g_loader_log, fmt, ap);
+        va_end(ap);
+        fflush(g_loader_log);
+    }
+}
+
 static int read_exefile_path(char *buf, size_t cap) {
     if (!buf || cap < 2u)
         return 0;
-    const char *candidates[2];
+
     char pid_path[64];
+#ifdef __QNXNTO__
+    /* QNX 6.5.0 /proc/<pid> only exposes "as"; use DCMD_PROC_MAPDEBUG_BASE. */
+    snprintf(pid_path, sizeof(pid_path), "/proc/%d/as", (int)getpid());
+    int as_fd = open(pid_path, O_RDONLY);
+    if (as_fd >= 0) {
+        struct {
+            procfs_debuginfo info;
+            char buff[PATH_MAX];
+        } map;
+        memset(&map, 0, sizeof(map));
+        int rc = devctl(as_fd, DCMD_PROC_MAPDEBUG_BASE, &map, sizeof(map), NULL);
+        close(as_fd);
+        if (rc == EOK && map.info.path[0] != '\0') {
+            snprintf(buf, cap, "%s", map.info.path);
+            return 1;
+        }
+    }
+#endif
+
+    const char *candidates[2];
     snprintf(pid_path, sizeof(pid_path), "/proc/%d/exefile", (int)getpid());
     candidates[0] = "/proc/self/exefile";
     candidates[1] = pid_path;
@@ -162,16 +204,22 @@ void registerCallbacks(void *administrator) {
     if (__atomic_exchange_n(&entered, 1u, __ATOMIC_ACQ_REL))
         return;
 
+    char log_path[96];
+    snprintf(log_path, sizeof(log_path), "/dev/shmem/nav-addon-loader-%d.log", (int)getpid());
+    g_loader_log = fopen(log_path, "w");
+
     if (access(NAV_ADDON_DISABLE_FLAG, F_OK) == 0) {
-        fprintf(stderr, "NAV_ADDON_LOADER disabled via %s\n", NAV_ADDON_DISABLE_FLAG);
+        loader_log("NAV_ADDON_LOADER disabled via %s\n", NAV_ADDON_DISABLE_FLAG);
+        if (g_loader_log) { fclose(g_loader_log); g_loader_log = NULL; }
         return;
     }
 
-    char exepath[256];
+    char exepath[PATH_MAX];
     char proc_name[128];
     if (!read_exefile_path(exepath, sizeof(exepath)) ||
         !nav_addon_extract_basename(exepath, proc_name, sizeof(proc_name))) {
-        fprintf(stderr, "NAV_ADDON_LOADER could not determine process basename; skipping\n");
+        loader_log("NAV_ADDON_LOADER could not determine process basename; skipping\n");
+        if (g_loader_log) { fclose(g_loader_log); g_loader_log = NULL; }
         return;
     }
 
@@ -181,13 +229,16 @@ void registerCallbacks(void *administrator) {
 
     char scan_dir[384];
     int dn = snprintf(scan_dir, sizeof(scan_dir), "%s/%s.d", root, proc_name);
-    if (dn <= 0 || (size_t)dn >= sizeof(scan_dir))
+    if (dn <= 0 || (size_t)dn >= sizeof(scan_dir)) {
+        if (g_loader_log) { fclose(g_loader_log); g_loader_log = NULL; }
         return;
+    }
 
     char names[NAV_ADDON_MAX_COUNT][NAV_ADDON_MAX_NAME];
     size_t count = nav_addon_collect_dir(scan_dir, names, NAV_ADDON_MAX_COUNT);
     if (count == 0u) {
-        fprintf(stderr, "NAV_ADDON_LOADER no addons in %s\n", scan_dir);
+        loader_log("NAV_ADDON_LOADER no addons in %s (exe=%s)\n", scan_dir, exepath);
+        if (g_loader_log) { fclose(g_loader_log); g_loader_log = NULL; }
         return;
     }
 
@@ -200,22 +251,23 @@ void registerCallbacks(void *administrator) {
         void *handle = dlopen(full, RTLD_NOW | RTLD_LOCAL);
         if (!handle) {
             const char *err = dlerror();
-            fprintf(stderr, "NAV_ADDON_LOADER dlopen failed path=%s err=%s\n",
-                    full, err ? err : "unknown");
+            loader_log("NAV_ADDON_LOADER dlopen failed path=%s err=%s\n",
+                       full, err ? err : "unknown");
             continue;
         }
         nav_addon_register_fn_t reg =
             (nav_addon_register_fn_t)dlsym(handle, "registerCallbacks");
         if (reg) {
             reg(administrator);
-            fprintf(stderr, "NAV_ADDON_LOADER loaded %s (registerCallbacks invoked)\n", full);
+            loader_log("NAV_ADDON_LOADER loaded %s (registerCallbacks invoked)\n", full);
         } else {
-            fprintf(stderr, "NAV_ADDON_LOADER loaded %s (constructor only)\n", full);
+            loader_log("NAV_ADDON_LOADER loaded %s (constructor only)\n", full);
         }
         ++loaded;
     }
-    fprintf(stderr, "NAV_ADDON_LOADER ready process=%s dir=%s loaded=%u/%u\n",
-            proc_name, scan_dir, loaded, (unsigned)count);
+    loader_log("NAV_ADDON_LOADER ready process=%s exe=%s dir=%s loaded=%u/%u\n",
+               proc_name, exepath, scan_dir, loaded, (unsigned)count);
+    if (g_loader_log) { fclose(g_loader_log); g_loader_log = NULL; }
 }
 
 #endif /* !NAV_ADDON_LOADER_HOST_TEST */

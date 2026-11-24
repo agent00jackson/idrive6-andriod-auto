@@ -386,9 +386,9 @@ const unsigned    kActSpeechBt      = 174;   // "Prompts on car radio (BT, beta)
 const unsigned    kSpeechBtModel    = 177;   // raBoolModel
 // Navigation Mode sub-page (hmiState 16, parentId 14): Semantic / J29 / 6WA selector persisted to nav-mode.
 const unsigned    kNavModeState          = 16;
-const unsigned    kActNavModeSemantic    = 181;
-const unsigned    kActNavModeJ29         = 182;
-const unsigned    kActNavMode6wa         = 183;
+const unsigned    kActNavModeSemantic    = 196;
+const unsigned    kActNavModeJ29         = 197;
+const unsigned    kActNavMode6wa         = 198;
 const unsigned    kNavModeBtnModel       = 182;   // textIdModel on Settings row ("Navigation Mode: ...")
 const unsigned    kNavModeSemanticModel  = 185;   // raBoolModel ("Semantic")
 const unsigned    kNavModeJ29Model       = 187;   // raBoolModel ("J29")

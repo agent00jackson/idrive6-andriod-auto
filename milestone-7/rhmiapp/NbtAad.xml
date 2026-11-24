@@ -32,10 +32,10 @@
       <raAction id="136"/>
       <raAction id="137"/>
       <raAction id="159"/>
-      <hmiAction id="180" target="16"/>
-      <raAction id="181"/>
-      <raAction id="182"/>
-      <raAction id="183"/>
+      <hmiAction id="195" target="16"/>
+      <raAction id="196"/>
+      <raAction id="197"/>
+      <raAction id="198"/>
     </actions>
     <models>
       <textIdModel id="3" textId="1">
@@ -275,7 +275,7 @@
           <checkbox action="27" id="68" model="42" text="MENU key opens iDrive" textModel="43"/>
           <checkbox action="28" id="69" model="44" text="Show driving mode changes" textModel="45"/>
           <checkbox action="29" id="72" model="46" text="Show navigation in HUD/gauge cluster" textModel="47"/>
-          <button action="180" id="191" model="182" text="Navigation Mode: J29"/>
+          <button action="195" id="191" model="182" text="Navigation Mode: J29"/>
           <checkbox action="167" id="169" model="170" text="Show directions at any distance" textModel="168"/>
           <checkbox action="173" id="174" model="175" text="Disable logging (performance test)" textModel="176"/>
           <checkbox action="174" id="180" model="177" text="Prompts on car radio (BT, beta)" textModel="178"/>
@@ -316,9 +316,9 @@
           <property id="24" value="3"/>
         </properties>
         <components>
-          <checkbox action="181" id="192" model="185" text="Semantic" textModel="186"/>
-          <checkbox action="182" id="193" model="187" text="J29" textModel="188"/>
-          <checkbox action="183" id="194" model="189" text="6WA" textModel="190"/>
+          <checkbox action="196" id="192" model="185" text="Semantic" textModel="186"/>
+          <checkbox action="197" id="193" model="187" text="J29" textModel="188"/>
+          <checkbox action="198" id="194" model="189" text="6WA" textModel="190"/>
         </components>
       </hmiState>
     </hmiStates>
