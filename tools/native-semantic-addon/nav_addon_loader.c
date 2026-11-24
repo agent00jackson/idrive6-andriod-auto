@@ -139,19 +139,21 @@ static size_t nav_addon_collect_dir(const char *dir_path,
 
 #ifndef NAV_ADDON_LOADER_HOST_TEST
 
-static FILE *g_loader_log = NULL;
+static int g_loader_log_fd = -1;
 
 static void loader_log(const char *fmt, ...) {
+    char line[768];
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    int n = vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
+    if (n <= 0)
+        return;
+    size_t len = (size_t)n < sizeof(line) ? (size_t)n : (sizeof(line) - 1u);
+    fprintf(stderr, "%s", line);
     fflush(stderr);
-    if (g_loader_log) {
-        va_start(ap, fmt);
-        vfprintf(g_loader_log, fmt, ap);
-        va_end(ap);
-        fflush(g_loader_log);
+    if (g_loader_log_fd >= 0) {
+        (void)write(g_loader_log_fd, line, len);
     }
 }
 
@@ -206,11 +208,11 @@ void registerCallbacks(void *administrator) {
 
     char log_path[96];
     snprintf(log_path, sizeof(log_path), "/dev/shmem/nav-addon-loader-%d.log", (int)getpid());
-    g_loader_log = fopen(log_path, "w");
+    g_loader_log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 
     if (access(NAV_ADDON_DISABLE_FLAG, F_OK) == 0) {
         loader_log("NAV_ADDON_LOADER disabled via %s\n", NAV_ADDON_DISABLE_FLAG);
-        if (g_loader_log) { fclose(g_loader_log); g_loader_log = NULL; }
+        if (g_loader_log_fd >= 0) { close(g_loader_log_fd); g_loader_log_fd = -1; }
         return;
     }
 
@@ -219,7 +221,7 @@ void registerCallbacks(void *administrator) {
     if (!read_exefile_path(exepath, sizeof(exepath)) ||
         !nav_addon_extract_basename(exepath, proc_name, sizeof(proc_name))) {
         loader_log("NAV_ADDON_LOADER could not determine process basename; skipping\n");
-        if (g_loader_log) { fclose(g_loader_log); g_loader_log = NULL; }
+        if (g_loader_log_fd >= 0) { close(g_loader_log_fd); g_loader_log_fd = -1; }
         return;
     }
 
@@ -230,7 +232,7 @@ void registerCallbacks(void *administrator) {
     char scan_dir[384];
     int dn = snprintf(scan_dir, sizeof(scan_dir), "%s/%s.d", root, proc_name);
     if (dn <= 0 || (size_t)dn >= sizeof(scan_dir)) {
-        if (g_loader_log) { fclose(g_loader_log); g_loader_log = NULL; }
+        if (g_loader_log_fd >= 0) { close(g_loader_log_fd); g_loader_log_fd = -1; }
         return;
     }
 
@@ -238,7 +240,7 @@ void registerCallbacks(void *administrator) {
     size_t count = nav_addon_collect_dir(scan_dir, names, NAV_ADDON_MAX_COUNT);
     if (count == 0u) {
         loader_log("NAV_ADDON_LOADER no addons in %s (exe=%s)\n", scan_dir, exepath);
-        if (g_loader_log) { fclose(g_loader_log); g_loader_log = NULL; }
+        if (g_loader_log_fd >= 0) { close(g_loader_log_fd); g_loader_log_fd = -1; }
         return;
     }
 
@@ -267,7 +269,7 @@ void registerCallbacks(void *administrator) {
     }
     loader_log("NAV_ADDON_LOADER ready process=%s exe=%s dir=%s loaded=%u/%u\n",
                proc_name, exepath, scan_dir, loaded, (unsigned)count);
-    if (g_loader_log) { fclose(g_loader_log); g_loader_log = NULL; }
+    if (g_loader_log_fd >= 0) { close(g_loader_log_fd); g_loader_log_fd = -1; }
 }
 
 #endif /* !NAV_ADDON_LOADER_HOST_TEST */
