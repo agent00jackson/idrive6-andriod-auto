@@ -309,8 +309,10 @@ static int ctrl_can_select(void *ctx, uint32_t *out_foreign_active) {
         return 0;
     if (entries == 0u)
         return 1;
-    /* Reuse our own trip across back-to-back AA routes; yield if a foreign BMW trip exists. */
-    if (entries == 1u && owned_trip_handle && owned_route_id && attached == owned_route_id)
+    /* Reuse our own trip across back-to-back AA routes (or an unfinished owned trip);
+     * yield if a foreign BMW trip exists. */
+    if (entries == 1u && owned_trip_handle &&
+        ((owned_route_id && attached == owned_route_id) || attached == 0u))
         return 1;
     *out_foreign_active = 1u;
     return 0;
@@ -351,43 +353,48 @@ static int ctrl_start_route(void *ctx, uint64_t session) {
     uint32_t route_id = 0;
     if (entries == 1u && owned_trip_handle && owned_route_id && attached == owned_route_id) {
         route_id = owned_route_id;
-    } else if (entries == 0u) {
-        /* 1. Run NewTrip on Root context 0 */
-        uint8_t *request = calloc(1, 0x100);
-        uint8_t *trip = calloc(1, 0x24);
-        uint8_t *segment = calloc(1, 0xcc);
-        struct owner_event *ev = calloc(1, sizeof(*ev));
-        if (!request || !trip || !segment || !ev)
-            return 0;
-        __atomic_store_n(&trip_callback_state, 0u, __ATOMIC_RELEASE);
-        __atomic_store_n(&executed, 0u, __ATOMIC_RELEASE);
-        event_construct(ev);
-        ev->vtable = event_vtable;
-        ev->manager = live_manager;
-        ev->request = (uint32_t)(uintptr_t)request;
-        ev->trip_segment = (uint32_t)(uintptr_t)trip;
-        ev->tour_segment = (uint32_t)(uintptr_t)segment;
-        ev->thread = target_thread;
-        ev->action = 0u;
-        send_event(ev);
+    } else if (entries == 0u || (entries == 1u && owned_trip_handle && attached == 0u)) {
+        if (entries == 0u) {
+            /* 1. Run NewTrip on Root context 0 */
+            uint8_t *request = calloc(1, 0x100);
+            uint8_t *trip = calloc(1, 0x24);
+            uint8_t *segment = calloc(1, 0xcc);
+            struct owner_event *ev = calloc(1, sizeof(*ev));
+            if (!request || !trip || !segment || !ev)
+                return 0;
+            __atomic_store_n(&trip_callback_state, 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(&executed, 0u, __ATOMIC_RELEASE);
+            event_construct(ev);
+            ev->vtable = event_vtable;
+            ev->manager = live_manager;
+            ev->request = (uint32_t)(uintptr_t)request;
+            ev->trip_segment = (uint32_t)(uintptr_t)trip;
+            ev->tour_segment = (uint32_t)(uintptr_t)segment;
+            ev->thread = target_thread;
+            ev->action = 0u;
+            send_event(ev);
 
-        uint32_t handle = 0;
-        for (unsigned w = 0; w < 200u && !__atomic_load_n(&stopping, __ATOMIC_ACQUIRE); ++w) {
-            handle = __atomic_load_n((uint32_t *)request, __ATOMIC_ACQUIRE);
-            unsigned cb = __atomic_load_n(&trip_callback_state, __ATOMIC_ACQUIRE);
-            if (handle || cb == 2u) break;
-            struct timespec d = {0, 25000000};
-            nanosleep(&d, NULL);
+            uint32_t handle = 0;
+            for (unsigned w = 0; w < 200u && !__atomic_load_n(&stopping, __ATOMIC_ACQUIRE); ++w) {
+                handle = __atomic_load_n((uint32_t *)request, __ATOMIC_ACQUIRE);
+                unsigned cb = __atomic_load_n(&trip_callback_state, __ATOMIC_ACQUIRE);
+                if (handle || cb == 2u) break;
+                struct timespec d = {0, 25000000};
+                nanosleep(&d, NULL);
+            }
+            if (!handle) {
+                ctrl_log("SEMANTIC_CTRL new_trip_fail session=%#llx cb=%u\n",
+                         (unsigned long long)session,
+                         __atomic_load_n(&trip_callback_state, __ATOMIC_ACQUIRE));
+                return 0;
+            }
+            owned_trip_handle = handle;
+            ctrl_log("SEMANTIC_CTRL new_trip_ok session=%#llx handle=%#x\n",
+                     (unsigned long long)session, handle);
+        } else {
+            ctrl_log("SEMANTIC_CTRL reuse_unattached_trip session=%#llx handle=%#x\n",
+                     (unsigned long long)session, owned_trip_handle);
         }
-        if (!handle) {
-            ctrl_log("SEMANTIC_CTRL new_trip_fail session=%#llx cb=%u\n",
-                     (unsigned long long)session,
-                     __atomic_load_n(&trip_callback_state, __ATOMIC_ACQUIRE));
-            return 0;
-        }
-        owned_trip_handle = handle;
-        ctrl_log("SEMANTIC_CTRL new_trip_ok session=%#llx handle=%#x\n",
-                 (unsigned long long)session, handle);
 
         /* 2. Wait for NavigationBasic addon to publish RouteId for this session */
         for (unsigned w = 0; w < 200u && !__atomic_load_n(&stopping, __ATOMIC_ACQUIRE); ++w) {

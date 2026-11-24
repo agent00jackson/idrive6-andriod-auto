@@ -453,8 +453,10 @@ static void wrapped_resolve_ok(void *resolver, void *resolved) {
 static int calculate_fixture_route(struct owner_event *event,
                                    uint32_t tour_high, uint32_t tour_low) {
     uint32_t source_handle = register_fixture_source();
-    if (!source_handle)
+    if (!source_handle) {
+        basic_log("SEMANTIC_BASIC calc_fail stage=source_handle\n");
         return 0;
+    }
     uint8_t *calculate = calloc(1, 4096);
     if (!calculate)
         return 0;
@@ -472,14 +474,23 @@ static int calculate_fixture_route(struct owner_event *event,
     uint32_t pending_end = *(uint32_t *)(uintptr_t)(event->component + 0x2b0 + 0x78);
     if (calc_after != calc_before + 1u ||
         pending_end < pending_begin + 0x2e8u ||
-        (pending_end - pending_begin) % 0x2e8u != 0u)
+        (pending_end - pending_begin) % 0x2e8u != 0u) {
+        basic_log("SEMANTIC_BASIC calc_fail stage=pending before=%u after=%u pb=%#x pe=%#x th=%#x tl=%#x\n",
+                  calc_before, calc_after, pending_begin, pending_end, tour_high, tour_low);
         return 0;
+    }
     uint32_t pending_item = pending_end - 0x2e8u;
     if (*(uint32_t *)(uintptr_t)(pending_item + 4) != calc_after ||
         *(uint32_t *)(uintptr_t)(pending_item + 0x10) != tour_high ||
         *(uint32_t *)(uintptr_t)(pending_item + 0x14) != tour_low ||
-        *(uint32_t *)(uintptr_t)(pending_item + 0x2e4) != event->stub + 0x120u)
+        *(uint32_t *)(uintptr_t)(pending_item + 0x2e4) != event->stub + 0x120u) {
+        basic_log("SEMANTIC_BASIC calc_fail stage=pending_fields id=%u th=%#x tl=%#x cb=%#x\n",
+                  *(uint32_t *)(uintptr_t)(pending_item + 4),
+                  *(uint32_t *)(uintptr_t)(pending_item + 0x10),
+                  *(uint32_t *)(uintptr_t)(pending_item + 0x14),
+                  *(uint32_t *)(uintptr_t)(pending_item + 0x2e4));
         return 0;
+    }
 
     uint8_t *route_result = calloc(1, 256);
     if (!route_result)
@@ -488,8 +499,10 @@ static int calculate_fixture_route(struct owner_event *event,
     FN(0x7116f0, void, void *, uint32_t, uint32_t, uint32_t,
        uint32_t, uint32_t, uint32_t, uint32_t)(route_result + 8, 3, 1, 0, 0, 0, 2, 1);
     uint32_t container = *(uint32_t *)(route_result + 0x18);
-    if (container < 0x10000u)
+    if (container < 0x10000u) {
+        basic_log("SEMANTIC_BASIC calc_fail stage=container\n");
         return 0;
+    }
     *(uint32_t *)(uintptr_t)(container + 0x50) = source_handle;
     uint32_t point[2] = {0, 0};
     FN(0x711428, void, void *, const uint32_t *, uint64_t,
@@ -502,8 +515,11 @@ static int calculate_fixture_route(struct owner_event *event,
     point[1] = 4823;
     FN(0x711318, void, void *, const uint32_t *, uint32_t)(
         (void *)(uintptr_t)container, point, 0);
-    if (*(uint32_t *)(uintptr_t)container != 6u)
+    if (*(uint32_t *)(uintptr_t)container != 6u) {
+        basic_log("SEMANTIC_BASIC calc_fail stage=container_links count=%u\n",
+                  *(uint32_t *)(uintptr_t)container);
         return 0;
+    }
 
     uint32_t route_data = event->component + 0x464u;
     FN(0x577fe0, void, void *, void *, uint32_t, void *, void *, void *)(
@@ -523,8 +539,11 @@ static int calculate_fixture_route(struct owner_event *event,
                              ? (work_end - 0xf0u) : 0u;
     uint32_t work_token = work_item ? *(uint32_t *)(uintptr_t)(work_item + 4) : 0;
     uint32_t cb_owner = work_item ? *(uint32_t *)(uintptr_t)(work_item + 0xec) : 0;
-    if (!work_token || work_token != peer_request || cb_owner != event->stub + 0x124u)
+    if (!work_token || work_token != peer_request || cb_owner != event->stub + 0x124u) {
+        basic_log("SEMANTIC_BASIC calc_fail stage=route_data wb=%#x we=%#x tok=%u peer=%u cb=%#x\n",
+                  work_begin, work_end, work_token, peer_request, cb_owner);
         return 0;
+    }
 
     uint32_t *source_result = calloc(16, sizeof(*source_result));
     if (!source_result)
@@ -546,8 +565,10 @@ static int calculate_fixture_route(struct owner_event *event,
             }
         }
     }
-    if (!live_route_id)
+    if (!live_route_id) {
+        basic_log("SEMANTIC_BASIC calc_fail stage=no_route_id rb=%#x re=%#x\n", rb, re);
         return 0;
+    }
     __atomic_store_n(&created_route_id, live_route_id, __ATOMIC_RELEASE);
     return 1;
 }
@@ -831,8 +852,9 @@ static void execute_event(void *raw, void *dispatcher) {
             __atomic_store_n(&owner_dispatch_state, 2u, __ATOMIC_RELEASE);
             return;
         }
-        uint32_t th = *(uint32_t *)(uintptr_t)(tour + 4u);
-        uint32_t tl = *(uint32_t *)(uintptr_t)(tour + 8u);
+        /* Exact X20511I CTour::getId() (0x574e9c / 0x574ea4): tour+0x18 / tour+0x1c. */
+        uint32_t th = *(uint32_t *)(uintptr_t)(tour + 0x18u);
+        uint32_t tl = *(uint32_t *)(uintptr_t)(tour + 0x1cu);
         tour_high_cached = th;
         tour_low_cached = tl;
         int ok = calculate_fixture_route(event, th, tl);
@@ -913,6 +935,8 @@ struct basic_runtime {
     struct semantic_basic_cue published_cue;
     uint64_t session;
     uint64_t last_alive_ms;
+    uint64_t next_calc_ms;
+    uint32_t calc_attempts;
     uint32_t last_seq;
 };
 
@@ -961,8 +985,13 @@ static void progress_handoff(struct basic_runtime *rt) {
     uint32_t route_id = __atomic_load_n(&active_route_id, __ATOMIC_ACQUIRE);
     if (!route_id) {
         /* Wait for Controller's NewTrip to create a live (non-null) tour in Basic, then build 2-link route. */
+        uint64_t now = mono_ms();
+        if (rt->calc_attempts >= 5u || now < rt->next_calc_ms)
+            return;
         uint32_t live_tour = 0u;
         if (scan_live_tours_mem(rt->mem_fd, rt->stub, &live_tour) > 0u && live_tour >= 0x10000u) {
+            rt->calc_attempts++;
+            rt->next_calc_ms = now + 500u;
             uint32_t st = dispatch_owner(rt->component, rt->stub, rt->owner_tid,
                                          PHASE_CALC_ROUTE, 0u, &owner_dispatch_state);
             route_id = (st == 1u) ? __atomic_load_n(&created_route_id, __ATOMIC_ACQUIRE) : 0u;
@@ -1150,6 +1179,8 @@ static void *worker_main(void *administrator) {
                             rt.session = msg.session;
                             rt.last_seq = msg.sequence;
                             rt.last_alive_ms = now;
+                            rt.next_calc_ms = 0u;
+                            rt.calc_attempts = 0u;
                             rt.pending_cue = cue;
                             rt.has_pending = 1;
                             rt.has_published = 0;
