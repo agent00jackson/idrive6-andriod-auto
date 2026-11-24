@@ -86,6 +86,12 @@ enum {
     HEAP_SCAN_BEGIN = 0x0255c000,
     HEAP_SCAN_END = 0x20000000,
     RG_VPTR = 0x00f44450,
+    RG_CARPOS_OFF = 0x24c,
+    RG_CARPOS_VPTR = 0x00f446b8,
+    RG_CARPOS_ORIG = 0x00402674,
+    RG_DTMCALC_OFF = 0x308,
+    RG_DTMCALC_VPTR = 0x00f447e0,
+    RG_DTMCALC_ORIG = 0x00402268,
     MILCA_VPTR = 0x00f3f3c8,
 };
 
@@ -120,6 +126,9 @@ static volatile uint32_t tour_low_cached;
 static uint32_t resolver_vtable_copy[10];
 static uint32_t wrapped_resolver_addr;
 static uint32_t wrapped_stub_addr;
+static uint32_t rg_carpos_vtable_copy[8];   /* [-2..+5]: offset-to-top, RTTI, 6 slots */
+static uint32_t rg_dtmcalc_vtable_copy[5];  /* [-2..+2]: offset-to-top, RTTI, 3 slots */
+static volatile uint32_t g_rg_gps_suppressed;
 static uint32_t fixture_source_handle;
 static uint32_t fixture_factory_calls;
 
@@ -590,14 +599,68 @@ static uint32_t find_milca_list_for_route(uint32_t milca, uint32_t route_id) {
     return 0;
 }
 
+/* While our synthetic 2-link fixture route is actively guiding, live car GPS
+ * ticks in CRouteGuidance::onCarPositionUpdate (rg+0x24c slot 3) spawn
+ * CCarPositionUpdateJob, which computes distance=0 against the fixture links
+ * and pushes dist=0 via onDistanceToManeuverCalculatedEvent (rg+0x308 slot 2).
+ * Suppress both only while g_rg_gps_suppressed != 0; pass straight through
+ * when OEM navigation runs. */
+static void wrapped_rg_on_car_pos(void *subobj, const void *pos) {
+    if (__atomic_load_n(&g_rg_gps_suppressed, __ATOMIC_ACQUIRE))
+        return;
+    FN(RG_CARPOS_ORIG, void, void *, const void *)(subobj, pos);
+}
+
+static void wrapped_rg_on_dtm_calc(void *subobj, const void *ev) {
+    if (__atomic_load_n(&g_rg_gps_suppressed, __ATOMIC_ACQUIRE)) {
+        uint32_t our_route = __atomic_load_n(&active_route_id, __ATOMIC_ACQUIRE);
+        uint32_t ev_route = ev ? *(const uint32_t *)((const uint8_t *)ev + 0x1c) : 0u;
+        if (!our_route || !ev_route || ev_route == our_route)
+            return;
+    }
+    FN(RG_DTMCALC_ORIG, void, void *, const void *)(subobj, ev);
+}
+
+static void install_rg_gps_wrappers(uint32_t rg) {
+    uint32_t carpos_addr = rg + RG_CARPOS_OFF;
+    uint32_t carpos_vptr = *(uint32_t *)(uintptr_t)carpos_addr;
+    int carpos_ok = (carpos_vptr == (uint32_t)(uintptr_t)&rg_carpos_vtable_copy[2]);
+    if (!carpos_ok && carpos_vptr == RG_CARPOS_VPTR) {
+        memcpy(rg_carpos_vtable_copy, (const void *)(uintptr_t)(RG_CARPOS_VPTR - 8u),
+               sizeof(rg_carpos_vtable_copy));
+        if (rg_carpos_vtable_copy[2 + 3] == RG_CARPOS_ORIG) {
+            rg_carpos_vtable_copy[2 + 3] = (uint32_t)(uintptr_t)&wrapped_rg_on_car_pos;
+            *(uint32_t *)(uintptr_t)carpos_addr = (uint32_t)(uintptr_t)&rg_carpos_vtable_copy[2];
+            carpos_ok = 1;
+        }
+    }
+
+    uint32_t dtmcalc_addr = rg + RG_DTMCALC_OFF;
+    uint32_t dtmcalc_vptr = *(uint32_t *)(uintptr_t)dtmcalc_addr;
+    int dtmcalc_ok = (dtmcalc_vptr == (uint32_t)(uintptr_t)&rg_dtmcalc_vtable_copy[2]);
+    if (!dtmcalc_ok && dtmcalc_vptr == RG_DTMCALC_VPTR) {
+        memcpy(rg_dtmcalc_vtable_copy, (const void *)(uintptr_t)(RG_DTMCALC_VPTR - 8u),
+               sizeof(rg_dtmcalc_vtable_copy));
+        if (rg_dtmcalc_vtable_copy[2 + 2] == RG_DTMCALC_ORIG) {
+            rg_dtmcalc_vtable_copy[2 + 2] = (uint32_t)(uintptr_t)&wrapped_rg_on_dtm_calc;
+            *(uint32_t *)(uintptr_t)dtmcalc_addr = (uint32_t)(uintptr_t)&rg_dtmcalc_vtable_copy[2];
+            dtmcalc_ok = 1;
+        }
+    }
+    basic_log("SEMANTIC_BASIC rg_gps_wrap carpos=%d dtmcalc=%d\n", carpos_ok, dtmcalc_ok);
+}
+
 static void publish_dtm(uint32_t rg, uint32_t route_id, uint32_t man_id,
-                        uint32_t dist_dm, uint32_t norm_m, const void *locale) {
+                        uint32_t dist_dm, uint32_t norm_m,
+                        uint32_t bargraph_flag, uint32_t bargraph_max_dm,
+                        const void *locale) {
     _Alignas(8) uint8_t dtm[0x2c];
     memset(dtm, 0, sizeof(dtm));
     *(uint32_t *)(dtm + 0x00) = route_id;
     *(uint32_t *)(dtm + 0x04) = man_id;
     *(uint32_t *)(dtm + 0x08) = dist_dm;
-    *(uint32_t *)(dtm + 0x0c) = 1u; /* BG_ENABLED */
+    *(uint32_t *)(dtm + 0x0c) = bargraph_flag;
+    *(uint32_t *)(dtm + 0x10) = bargraph_max_dm;
     FN(0x16c5f4, void, void *)(dtm + 0x14);
     FN(0x16ce4c, void, void *, const void *)(dtm + 0x14, locale);
     *(uint32_t *)(dtm + 0x24) = norm_m;
@@ -611,12 +674,24 @@ static void reset_milca_active_ids(uint32_t list) {
     *(uint32_t *)(uintptr_t)(list + 0x68) = id_beg;
 }
 
-static void append_neutral_lane_boundary(uint8_t *point) {
+static void append_lane_boundary(uint8_t *point, uint32_t marking) {
     _Alignas(8) uint8_t lane[28];
     memset(lane, 0, sizeof(lane));
     FN(0x1d6580, void, void *)(lane);
+    *(uint32_t *)(lane + 16) = marking;
     FN(0xcc59e0, void, void *, const void *)(point + 0x14c, lane);
     FN(0x1d57f8, void, void *)(lane);
+}
+
+static void append_point_element(uint8_t *point, uint32_t elem_type, float angle_deg) {
+    _Alignas(8) uint8_t elem[24];
+    FN(0x792cb8, void, void *)(elem);
+    *(uint32_t *)(elem + 0x00) = elem_type;
+    memcpy(elem + 0x14, &angle_deg, sizeof(angle_deg));
+    uint32_t usage = 0;
+    FN(0x8e6a6c, void, void *, const uint32_t *)(elem + 0x04, &usage);
+    FN(0xcded58, void, void *, const void *)(point + 0x84, elem);
+    FN(0x7928b0, void, void *)(elem);
 }
 
 static int insert_milca_maneuver(uint32_t list, uint32_t id, uint32_t sort_pos_dm,
@@ -649,17 +724,12 @@ static int insert_milca_maneuver(uint32_t list, uint32_t id, uint32_t sort_pos_d
     *(uint32_t *)(point + 0x144) = 4u; /* NOW */
     *(uint32_t *)(point + 0x18c) = cue->dist_dm;
 
-    _Alignas(8) uint8_t elem[24];
-    FN(0x792cb8, void, void *)(elem);
-    *(uint32_t *)(elem + 0x00) = cue->elem_type;
-    memcpy(elem + 0x14, &cue->angle_deg, sizeof(cue->angle_deg));
-    uint32_t usage = 0;
-    FN(0x8e6a6c, void, void *, const uint32_t *)(elem + 0x04, &usage);
-    FN(0xcded58, void, void *, const void *)(point + 0x84, elem);
-    FN(0x7928b0, void, void *)(elem);
+    append_point_element(point, cue->elem_type, cue->angle_deg);
+    for (uint8_t k = 0u; k < cue->extra_arm_count; ++k)
+        append_point_element(point, 32u, cue->extra_arm_deg[k]);
 
     if (cue->lane_count > 0u) {
-        append_neutral_lane_boundary(point);
+        append_lane_boundary(point, semantic_lane_boundary_marking(0u, cue->lane_count));
         for (uint32_t i = cue->lane_count; i > 0u; --i) {
             const struct ng_lane data = cue->lanes[i - 1u];
             _Alignas(8) uint8_t lane[28];
@@ -679,7 +749,8 @@ static int insert_milca_maneuver(uint32_t list, uint32_t id, uint32_t sort_pos_d
             *(uint32_t *)(lane + 20) = 0u;
             FN(0xcc59e0, void, void *, const void *)(point + 0x14c, lane);
             FN(0x1d57f8, void, void *)(lane);
-            append_neutral_lane_boundary(point);
+            uint32_t bidx = (uint32_t)cue->lane_count - i + 1u;
+            append_lane_boundary(point, semantic_lane_boundary_marking(bidx, cue->lane_count));
         }
         *(uint32_t *)(point + 0x148) = 1u;
     }
@@ -710,6 +781,8 @@ static void execute_hud_phase(const struct owner_event *event, unsigned context)
         return;
     }
     if (event->phase == PHASE_ACTIVATE_GUIDANCE) {
+        install_rg_gps_wrappers(rg);
+        __atomic_store_n(&g_rg_gps_suppressed, 1u, __ATOMIC_RELEASE);
         uint32_t gs = 2u; /* GUIDANCE_NORMAL_ACTIVE */
         _Alignas(8) uint8_t ts[0xd0];
         FN(0x402a6c, void, void *, const uint32_t *)((void *)(uintptr_t)rg, &gs);
@@ -732,6 +805,7 @@ static void execute_hud_phase(const struct owner_event *event, unsigned context)
         const struct semantic_basic_cue *cue = &g_pending_cue;
         if (g_pending_dtm_only && g_active_man_id != 0u) {
             publish_dtm(rg, route_id, g_active_man_id, cue->dist_dm, cue->norm_m,
+                        cue->bargraph_flag, cue->bargraph_max_dm,
                         (const void *)(uintptr_t)(list + 0x50));
             __atomic_store_n(&hud_dispatch_state, 1u, __ATOMIC_RELEASE);
             return;
@@ -767,6 +841,13 @@ static void execute_hud_phase(const struct owner_event *event, unsigned context)
         FN(0x3f1fe8, void, void *, void *)((void *)(uintptr_t)milca,
                                            (void *)(uintptr_t)list);
 
+        /* Pre-seed NavigationFully's mLastDTM cache (GVP+0x234) with the new
+         * maneuver ID BEFORE emitting DRP so responseGetManeuverListStartingAtManeuver
+         * populates maneuverData->dtm immediately instead of rendering -1 -> "0". */
+        publish_dtm(rg, route_id, id, cue->dist_dm, cue->norm_m,
+                    cue->bargraph_flag, cue->bargraph_max_dm,
+                    (const void *)(uintptr_t)(list + 0x50));
+
         _Alignas(8) uint8_t drp[0x1c];
         memset(drp, 0, sizeof(drp));
         *(uint32_t *)(drp + 0x00) = route_id;
@@ -779,11 +860,13 @@ static void execute_hud_phase(const struct owner_event *event, unsigned context)
         FN(0x16cf50, void, void *)(drp + 0x0c);
 
         publish_dtm(rg, route_id, id, cue->dist_dm, cue->norm_m,
+                    cue->bargraph_flag, cue->bargraph_max_dm,
                     (const void *)(uintptr_t)(list + 0x50));
         __atomic_store_n(&hud_dispatch_state, 1u, __ATOMIC_RELEASE);
         return;
     }
     if (event->phase == PHASE_CLEAR_GUIDANCE) {
+        __atomic_store_n(&g_rg_gps_suppressed, 0u, __ATOMIC_RELEASE);
         uint32_t gs = 5u; /* GUIDANCE_STOPPED_BY_USER_REQUEST */
         _Alignas(8) uint8_t ts[0xd0];
         FN(0x402a6c, void, void *, const uint32_t *)((void *)(uintptr_t)rg, &gs);
@@ -961,6 +1044,7 @@ static int try_publish_pending(struct basic_runtime *rt) {
 
 static void clear_session(struct basic_runtime *rt) {
     uint32_t route_id = __atomic_load_n(&active_route_id, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&g_rg_gps_suppressed, 0u, __ATOMIC_RELEASE);
     if (rt->guidance_active && route_id) {
         (void)dispatch_owner(rt->rg, rt->milca, rt->rg_tid, PHASE_CLEAR_GUIDANCE, route_id, &hud_dispatch_state);
     }

@@ -143,12 +143,70 @@ static void testCueMappings() {
     assert(semantic_map_ng_message(&b, &cb));
     assert(semantic_cue_is_distance_only(&ca, &cb) == 0);
 
-    // Verify lane degrees
+    // Verify lane degrees and lane divider markings
     assert(semantic_lane_degrees(NG_LANE_STRAIGHT) == 0.0f);
     assert(semantic_lane_degrees(NG_LANE_LEFT) == 270.0f);
     assert(semantic_lane_degrees(NG_LANE_RIGHT) == 90.0f);
     assert(semantic_lane_degrees(NG_LANE_UTURN_LEFT) == 181.0f);
     assert(semantic_lane_degrees(NG_LANE_UTURN_RIGHT) == 179.0f);
+    assert(semantic_lane_boundary_marking(0, 3) == SEMANTIC_LANE_MARKING_SOLID);
+    assert(semantic_lane_boundary_marking(1, 3) == SEMANTIC_LANE_MARKING_SHORT_DASHED);
+    assert(semantic_lane_boundary_marking(2, 3) == SEMANTIC_LANE_MARKING_SHORT_DASHED);
+    assert(semantic_lane_boundary_marking(3, 3) == SEMANTIC_LANE_MARKING_SOLID);
+
+    // Bargraph thresholds & flags:
+    // - straight/depart: BG_INVALID (0), max 0
+    // - urban turn: max 2500 dm (250 m), BG_ENABLED > 250 m, BG_VISIBLE <= 250 m (distance-only!)
+    // - highway off-ramp / fork: max 5000 dm (500 m)
+    {
+        ng_message m;
+        semantic_basic_cue c1, c2;
+        memset(&m, 0, sizeof(m));
+        m.operation = NG_BEGIN; m.turn = NG_STRAIGHT; m.distance_mm = 100000;
+        m.metadata_flags = NG_META_AA_TYPE; m.aa_type = 1; // DEPART
+        assert(semantic_map_ng_message(&m, &c1));
+        assert(c1.bargraph_flag == SEMANTIC_BG_INVALID && c1.bargraph_max_dm == 0u);
+
+        m.turn = NG_LEFT; m.aa_type = 7; m.distance_mm = 400000; // 400 m -> BG_ENABLED
+        assert(semantic_map_ng_message(&m, &c1));
+        assert(c1.bargraph_max_dm == 2500u && c1.bargraph_flag == SEMANTIC_BG_ENABLED);
+
+        m.distance_mm = 150000; // 150 m -> BG_VISIBLE
+        assert(semantic_map_ng_message(&m, &c2));
+        assert(c2.bargraph_max_dm == 2500u && c2.bargraph_flag == SEMANTIC_BG_VISIBLE);
+        // Crossing into bargraph range must remain distance-only (no maneuver rotation)
+        assert(semantic_cue_is_distance_only(&c1, &c2) == 1);
+
+        m.aa_type = 24; m.distance_mm = 400000; // OFF_RAMP_NORMAL_RIGHT at 400 m -> BG_VISIBLE (<= 500 m)
+        assert(semantic_map_ng_message(&m, &c1));
+        assert(c1.bargraph_max_dm == 5000u && c1.bargraph_flag == SEMANTIC_BG_VISIBLE);
+    }
+
+    // Roundabout multi-arm spoke synthesis (CCW 3rd exit at 270 deg -> 2 passed exits at 90 and 0)
+    {
+        ng_message m;
+        semantic_basic_cue c;
+        memset(&m, 0, sizeof(m));
+        m.operation = NG_BEGIN; m.turn = NG_LEFT; m.distance_mm = 120000;
+        m.metadata_flags = NG_META_AA_TYPE | NG_META_EXIT_NUMBER | NG_META_EXIT_ANGLE;
+        m.aa_type = 46; // ROUNDABOUT_ENTER_AND_EXIT_CCW_WITH_ANGLE
+        m.exit_number = 3;
+        m.exit_angle = 270;
+        assert(semantic_map_ng_message(&m, &c));
+        assert(c.elem_type == 16u && fabsf(c.angle_deg - 270.0f) < 0.01f);
+        assert(c.extra_arm_count == 2u);
+        assert(fabsf(c.extra_arm_deg[0] - 90.0f) < 0.01f); // 1st exit (3 o'clock)
+        assert(fabsf(c.extra_arm_deg[1] - 0.0f) < 0.01f);  // 2nd exit (12 o'clock)
+
+        // CCW 1st exit at 90 deg -> 0 passed exits, 2 post-exit arms at 0 and 270
+        m.exit_number = 1;
+        m.exit_angle = 90;
+        assert(semantic_map_ng_message(&m, &c));
+        assert(fabsf(c.angle_deg - 90.0f) < 0.01f);
+        assert(c.extra_arm_count == 2u);
+        assert(fabsf(c.extra_arm_deg[0] - 0.0f) < 0.01f);
+        assert(fabsf(c.extra_arm_deg[1] - 270.0f) < 0.01f);
+    }
 }
 
 static void testHandoff() {

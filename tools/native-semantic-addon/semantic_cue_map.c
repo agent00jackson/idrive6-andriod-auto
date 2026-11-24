@@ -9,6 +9,58 @@ static float normalize_deg(int32_t deg) {
     return (float)m;
 }
 
+static int32_t angle_delta_deg(int32_t a, int32_t b) {
+    int32_t d = (a - b) % 360;
+    if (d < 0) d += 360;
+    if (d > 180) d = 360 - d;
+    return d;
+}
+
+static void append_roundabout_arm(struct semantic_basic_cue *out, int cw, int32_t travel_deg,
+                                  int32_t guided_travel_deg) {
+    if (out->extra_arm_count >= SEMANTIC_MAX_EXTRA_ARMS)
+        return;
+    /* Keep clear of entry (0/360) and the guided exit spoke. */
+    if (travel_deg <= 30 || travel_deg >= 330 || angle_delta_deg(travel_deg, guided_travel_deg) < 35)
+        return;
+    float oem_deg = normalize_deg(cw ? (540 + travel_deg) : (540 - travel_deg));
+    for (uint8_t i = 0; i < out->extra_arm_count; ++i) {
+        if (angle_delta_deg((int32_t)out->extra_arm_deg[i], (int32_t)oem_deg) < 25)
+            return;
+    }
+    out->extra_arm_deg[out->extra_arm_count++] = oem_deg;
+}
+
+static void populate_roundabout_arms(struct semantic_basic_cue *out, int cw,
+                                     int32_t guided_travel_deg,
+                                     int has_exit_num, int32_t exit_num) {
+    out->extra_arm_count = 0u;
+    if (has_exit_num && exit_num >= 1 && exit_num <= 6) {
+        /* Exact number of passed exits between entry (0 deg) and guided exit. */
+        if (exit_num >= 2 && guided_travel_deg > 45) {
+            for (int32_t k = 1; k < exit_num; ++k) {
+                int32_t arm_travel = (k * guided_travel_deg + exit_num / 2) / exit_num;
+                append_roundabout_arm(out, cw, arm_travel, guided_travel_deg);
+            }
+        }
+        /* Also add remaining standard spokes after the guided exit so the ring
+         * reads clearly as a multi-arm roundabout. */
+        for (int32_t post = guided_travel_deg + 90; post <= 285; post += 90)
+            append_roundabout_arm(out, cw, post, guided_travel_deg);
+        return;
+    }
+    /* No exit_number: show standard 4-way cardinal arms around the ring. */
+    static const int32_t cardinal[3] = { 90, 180, 270 };
+    for (size_t i = 0; i < 3u; ++i)
+        append_roundabout_arm(out, cw, cardinal[i], guided_travel_deg);
+}
+
+uint32_t semantic_lane_boundary_marking(uint32_t boundary_index, uint32_t lane_count) {
+    if (lane_count == 0u || boundary_index == 0u || boundary_index >= lane_count)
+        return SEMANTIC_LANE_MARKING_SOLID;
+    return SEMANTIC_LANE_MARKING_SHORT_DASHED;
+}
+
 float semantic_lane_degrees(uint16_t bit) {
     switch (bit) {
     case NG_LANE_STRAIGHT:     return 0.0f;
@@ -26,7 +78,9 @@ float semantic_lane_degrees(uint16_t bit) {
 
 static int map_aa_type(const struct ng_message *msg, struct semantic_basic_cue *out) {
     const int has_angle = (msg->metadata_flags & NG_META_EXIT_ANGLE) != 0;
+    const int has_exit_num = (msg->metadata_flags & NG_META_EXIT_NUMBER) != 0;
     const int32_t exit_angle = has_angle ? msg->exit_angle : 90;
+    const int32_t exit_num = has_exit_num ? msg->exit_number : 0;
 
     switch (msg->aa_type) {
     case 1:  /* DEPART */
@@ -77,22 +131,34 @@ static int map_aa_type(const struct ng_message *msg, struct semantic_basic_cue *
     case 32: /* ROUNDABOUT_ENTER_CW */
     case 33: /* ROUNDABOUT_EXIT_CW */
     case 43: /* ROUNDABOUT_ENTER_AND_EXIT_CW */
-    case 44: /* ROUNDABOUT_ENTER_AND_EXIT_CW_WITH_ANGLE */
+    case 44: /* ROUNDABOUT_ENTER_AND_EXIT_CW_WITH_ANGLE */ {
         /* AA measures travel from entry (180 deg in OEM 0x87617c) in circulation direction.
          * CW: (540 + exit_angle) % 360 -> 90->270, 180->0, 270->90 (verified BT81/BT86). */
+        int32_t travel_deg = 270;
+        if (has_angle && exit_angle > 0 && exit_angle <= 360)
+            travel_deg = exit_angle;
+        else if (has_exit_num && exit_num >= 1 && exit_num <= 4)
+            travel_deg = exit_num * 90;
         out->action = 2u; out->direction = 1u; out->elem_type = 15u;
-        out->angle_deg = (has_angle && exit_angle > 0 && exit_angle <= 360)
-                             ? normalize_deg(540 + exit_angle) : 90.0f;
+        out->angle_deg = normalize_deg(540 + travel_deg);
+        populate_roundabout_arms(out, 1, travel_deg, has_exit_num, exit_num);
         return 1;
+    }
     case 34: /* ROUNDABOUT_ENTER_CCW */
     case 35: /* ROUNDABOUT_EXIT_CCW */
     case 45: /* ROUNDABOUT_ENTER_AND_EXIT_CCW */
-    case 46: /* ROUNDABOUT_ENTER_AND_EXIT_CCW_WITH_ANGLE */
+    case 46: /* ROUNDABOUT_ENTER_AND_EXIT_CCW_WITH_ANGLE */ {
         /* CCW: (540 - exit_angle) % 360 -> 90->90, 180->0, 270->270 (verified BT86). */
+        int32_t travel_deg = 270;
+        if (has_angle && exit_angle > 0 && exit_angle <= 360)
+            travel_deg = exit_angle;
+        else if (has_exit_num && exit_num >= 1 && exit_num <= 4)
+            travel_deg = exit_num * 90;
         out->action = 2u; out->direction = 2u; out->elem_type = 16u;
-        out->angle_deg = (has_angle && exit_angle > 0 && exit_angle <= 360)
-                             ? normalize_deg(540 - exit_angle) : 270.0f;
+        out->angle_deg = normalize_deg(540 - travel_deg);
+        populate_roundabout_arms(out, 0, travel_deg, has_exit_num, exit_num);
         return 1;
+    }
     case 39: /* DESTINATION */
     case 40: /* DESTINATION_STRAIGHT */
         out->action = 18u; out->direction = 3u; out->elem_type = 1u; out->angle_deg = 0.0f;
@@ -158,6 +224,21 @@ int semantic_map_ng_message(const struct ng_message *msg, struct semantic_basic_
     out->dist_dm = (msg->distance_mm + 50u) / 100u;
     out->norm_m = (msg->distance_mm + 500u) / 1000u;
 
+    /* OEM approach progress bar (NavigationBasic 0x412d20 / NavigationFully 0x7e6f04):
+     *   - straight/depart/name-change: no bargraph (BG_INVALID)
+     *   - highway off-ramps / forks: 500 m (5000 dm)
+     *   - urban turns / U-turns / roundabouts / arrivals: 250 m (2500 dm)
+     * Visible (BG_VISIBLE = 2) once within bargraph_max_dm, hidden (BG_ENABLED = 1) farther out. */
+    if (out->action == 1u) {
+        out->bargraph_max_dm = 0u;
+        out->bargraph_flag = SEMANTIC_BG_INVALID;
+    } else {
+        out->bargraph_max_dm = (out->action == 14u || out->action == 16u) ? 5000u : 2500u;
+        out->bargraph_flag = (out->dist_dm <= out->bargraph_max_dm)
+                                 ? SEMANTIC_BG_VISIBLE
+                                 : SEMANTIC_BG_ENABLED;
+    }
+
     if ((msg->metadata_flags & NG_META_ROAD) && msg->road_length > 0u) {
         size_t n = msg->road_length;
         if (n > NG_MAX_ROAD_BYTES) n = NG_MAX_ROAD_BYTES;
@@ -180,10 +261,16 @@ int semantic_cue_is_distance_only(const struct semantic_basic_cue *prev,
         prev->direction != next->direction ||
         prev->elem_type != next->elem_type ||
         prev->angle_deg != next->angle_deg ||
+        prev->bargraph_max_dm != next->bargraph_max_dm ||
         prev->is_arrival != next->is_arrival ||
+        prev->extra_arm_count != next->extra_arm_count ||
         prev->lane_count != next->lane_count ||
         strcmp(prev->road, next->road) != 0)
         return 0;
+    for (uint8_t i = 0; i < prev->extra_arm_count; ++i) {
+        if (prev->extra_arm_deg[i] != next->extra_arm_deg[i])
+            return 0;
+    }
     for (uint8_t i = 0; i < prev->lane_count; ++i) {
         if (prev->lanes[i].arrows != next->lanes[i].arrows ||
             prev->lanes[i].recommended != next->lanes[i].recommended)
