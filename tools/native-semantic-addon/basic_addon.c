@@ -1084,6 +1084,14 @@ static int refresh_nds_minimap(struct basic_runtime *rt, int force) {
     if (!force && now < rt->last_nds_query_ms + 600u)
         return 0;
 
+    /* Test-only sentinel: lets a parked synthetic test drive /dev/shmem/aa-semantic-minimap
+     * directly without NavigationBasic overwriting or clearing it on cue publish. */
+    if (access("/dev/shmem/aa-semantic-minimap-lock", F_OK) == 0) {
+        if (force)
+            basic_log("SEMANTIC_BASIC nds_minimap locked (synthetic test override)\n");
+        return 0;
+    }
+
     if (!cue_eligible_for_minimap(&rt->pending_msg, &rt->pending_cue)) {
         if (rt->has_active_minimap || force) {
             semantic_minimap_shm_clear(NULL);
@@ -1097,6 +1105,11 @@ static int refresh_nds_minimap(struct basic_runtime *rt, int force) {
         if (rt->has_active_minimap || force) {
             semantic_minimap_shm_clear(NULL);
             rt->has_active_minimap = 0;
+        }
+        if (force) {
+            basic_log("SEMANTIC_BASIC nds_minimap skip=no_gps valid=%d age_ms=%llu\n",
+                      gps.valid,
+                      gps.valid ? (unsigned long long)(now - gps.timestamp_ms) : 0ULL);
         }
         return 0;
     }
@@ -1118,6 +1131,10 @@ static int refresh_nds_minimap(struct basic_runtime *rt, int force) {
         if (rt->has_active_minimap || force) {
             semantic_minimap_shm_clear(NULL);
             rt->has_active_minimap = 0;
+        }
+        if (force) {
+            basic_log("SEMANTIC_BASIC nds_minimap skip=no_links lat=%.5f lon=%.5f hdg=%.1f r=%.0f\n",
+                      gps.lat_deg, gps.lon_deg, (double)gps.heading_deg, (double)radius_m);
         }
         return 0;
     }
