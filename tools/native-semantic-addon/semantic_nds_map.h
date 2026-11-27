@@ -16,6 +16,7 @@ extern "C" {
 #define SNDS_MAX_ROAD_NAME    64u
 #define SNDS_MAX_JUNCTION_PTS 48u
 #define SNDS_MAX_ARMS         6u
+#define SNDS_MAX_CONTEXT      12u
 #define SNDS_MAX_ARM_PTS      20u
 
 /* 2D point in local East/North metres relative to the car (or anchor). */
@@ -84,7 +85,10 @@ struct snds_junction {
     struct snds_polyline ring;     /* Closed roundabout ring (if is_roundabout) */
 
     uint8_t arm_count;
-    struct snds_arm arms[SNDS_MAX_ARMS]; /* Directly connected non-guided arms only */
+    struct snds_arm arms[SNDS_MAX_ARMS]; /* Directly connected non-guided arms */
+
+    uint8_t context_count;
+    struct snds_arm context[SNDS_MAX_CONTEXT]; /* Nearby parallel carriageways, slip ramps, side roads */
 
     uint8_t current_link_lanes;    /* NDS lane count on car's current link (0 if unknown) */
 };

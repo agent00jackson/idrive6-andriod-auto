@@ -13,7 +13,7 @@ extern "C" {
 #endif
 
 #define SEMANTIC_MINIMAP_SHM_MAGIC   0x4D4D4150u /* 'MMAP' */
-#define SEMANTIC_MINIMAP_SHM_VERSION 1u
+#define SEMANTIC_MINIMAP_SHM_VERSION 2u
 
 struct semantic_minimap_record {
     uint32_t magic;

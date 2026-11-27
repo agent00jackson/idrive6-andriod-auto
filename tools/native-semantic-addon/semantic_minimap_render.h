@@ -18,7 +18,7 @@ extern "C" {
 
 #define SEMANTIC_HUD_MINIMAP_W        176u
 #define SEMANTIC_HUD_MINIMAP_H        116u
-#define SEMANTIC_HUD_MAX_POLYS        20u
+#define SEMANTIC_HUD_MAX_POLYS        36u
 #define SEMANTIC_HUD_MAX_POLY_PTS     28u
 
 /* Verified OEM BMW 6WB HUD color palette IDs on handles 0x1f / 0x20 (bt97-off): */

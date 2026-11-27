@@ -1219,9 +1219,10 @@ static int refresh_nds_minimap(struct basic_runtime *rt, int force) {
         rt->minimap_seq++;
         (void)semantic_minimap_shm_write(NULL, rt->session, rt->minimap_seq, &mm);
         rt->has_active_minimap = 1;
-        basic_log("SEMANTIC_BASIC nds_minimap ok links=%d rb=%u arms=%u conf=%u polys=%u dist_m=%.0f ctr=(%.0f,%.0f)\n",
-                  links, (unsigned)mm.is_roundabout, (unsigned)junc.arm_count, (unsigned)mm.confidence,
-                  (unsigned)mm.poly_count, (double)dist_m, (double)junc.center.x, (double)junc.center.y);
+        basic_log("SEMANTIC_BASIC nds_minimap ok links=%d rb=%u arms=%u ctx=%u conf=%u polys=%u dist_m=%.0f ctr=(%.0f,%.0f)\n",
+                  links, (unsigned)mm.is_roundabout, (unsigned)junc.arm_count, (unsigned)junc.context_count,
+                  (unsigned)mm.confidence, (unsigned)mm.poly_count, (double)dist_m,
+                  (double)junc.center.x, (double)junc.center.y);
         return 1;
     }
 

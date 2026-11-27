@@ -29,22 +29,49 @@ static struct fpt world_to_local(struct snds_pt p, struct snds_pt center,
     return r;
 }
 
-/* Clip a polyline starting near origin outward to circle of radius R (clean CID widget cut). */
+/* Clip a polyline to circle of radius R (clean CID widget cut), including long
+ * chords whose endpoints both lie outside R while crossing through the circle. */
 static int clip_polyline_radius(const struct fpt *in, int n, float radius,
                                 struct fpt *out, int max_out) {
     if (n < 2 || max_out < 2) return 0;
+    const float r2_lim = radius * radius;
     int m = 0;
     /* Find first point inside radius */
     int start = 0;
-    while (start < n - 1 && (in[start].x * in[start].x + in[start].y * in[start].y) > radius * radius)
+    while (start < n && (in[start].x * in[start].x + in[start].y * in[start].y) > r2_lim)
         start++;
+    if (start >= n) {
+        /* All vertices lie outside R: check if any segment pierces the circle as a chord. */
+        for (int i = 1; i < n; ++i) {
+            struct fpt a = in[i - 1], b = in[i];
+            float dx = b.x - a.x, dy = b.y - a.y;
+            float A = dx * dx + dy * dy;
+            if (A <= 1e-6f) continue;
+            float B = 2.0f * (a.x * dx + a.y * dy);
+            float C = a.x * a.x + a.y * a.y - r2_lim;
+            float disc = B * B - 4.0f * A * C;
+            if (disc > 0.0f) {
+                float sq = m_sqrtf(disc);
+                float t1 = (-B - sq) / (2.0f * A);
+                float t2 = (-B + sq) / (2.0f * A);
+                if (t1 < 0.0f) t1 = 0.0f;
+                if (t2 > 1.0f) t2 = 1.0f;
+                if (t2 > t1 + 1e-3f) {
+                    out[0] = (struct fpt){ a.x + t1 * dx, a.y + t1 * dy };
+                    out[1] = (struct fpt){ a.x + t2 * dx, a.y + t2 * dy };
+                    return 2;
+                }
+            }
+        }
+        return 0;
+    }
     if (start > 0) {
         /* Intersect entering segment with circle */
         struct fpt a = in[start - 1], b = in[start];
         float dx = b.x - a.x, dy = b.y - a.y;
         float A = dx * dx + dy * dy;
         float B = 2.0f * (a.x * dx + a.y * dy);
-        float C = a.x * a.x + a.y * a.y - radius * radius;
+        float C = a.x * a.x + a.y * a.y - r2_lim;
         float disc = B * B - 4.0f * A * C;
         if (disc >= 0.0f && A > 1e-6f) {
             float t = (-B - m_sqrtf(disc)) / (2.0f * A);
@@ -56,14 +83,14 @@ static int clip_polyline_radius(const struct fpt *in, int n, float radius,
     for (int i = start; i < n && m < max_out; ++i) {
         struct fpt p = in[i];
         float r2 = p.x * p.x + p.y * p.y;
-        if (r2 <= radius * radius) {
+        if (r2 <= r2_lim) {
             out[m++] = p;
         } else if (m > 0) {
             struct fpt a = out[m - 1];
             float dx = p.x - a.x, dy = p.y - a.y;
             float A = dx * dx + dy * dy;
             float B = 2.0f * (a.x * dx + a.y * dy);
-            float C = a.x * a.x + a.y * a.y - radius * radius;
+            float C = a.x * a.x + a.y * a.y - r2_lim;
             float disc = B * B - 4.0f * A * C;
             if (disc >= 0.0f && A > 1e-6f) {
                 float t = (-B + m_sqrtf(disc)) / (2.0f * A);
@@ -338,34 +365,36 @@ int semantic_render_hud_minimap(const struct snds_junction *junc,
     const float cos_h = m_cosf(h_rad);
     const float sin_h = m_sinf(h_rad);
 
-    /* Choose clean world clipping radius (like CID maneuver widget):
-     *   - Roundabout: ~2.4x radius (clamped 42..100 m) so ring has a bold, clear center island
-     *     and all exit stubs fit cleanly inside the 120x72 6WB / HUD vector viewport
-     *   - Intersection/turn: 65 m so approach, exit, and crossing arms fill the viewport cleanly */
-    float clip_r = 65.0f;
+    /* Choose zoomed-out world clipping radius showing surrounding intersection context:
+     *   - Roundabout: ~2.7x radius (clamped 55..110 m) for clear center island + surrounding feeders
+     *   - Intersection/turn: 105 m so dual carriageways, slip ramps, and adjacent streets are visible */
+    float clip_r = 105.0f;
     if (junc->is_roundabout) {
-        clip_r = junc->roundabout_radius_m * 2.4f;
-        if (clip_r < 42.0f) clip_r = 42.0f;
-        if (clip_r > 100.0f) clip_r = 100.0f;
+        clip_r = junc->roundabout_radius_m * 2.7f;
+        if (clip_r < 55.0f) clip_r = 55.0f;
+        if (clip_r > 110.0f) clip_r = 110.0f;
     }
 
     /* Map world [-clip_r..+clip_r] into the exact 6WB/HUD 120x72 vector surface
-     * (clip box x=[0..118], y=[0..71], non-faded zone x=[0..103]) centered cleanly
-     * above the 3-lane guidance strip (lane-bar center at x_local ~ 72). */
-    const float cx_px = junc->is_roundabout ? 64.0f : 68.0f;
+     * (clip box x=[0..118], y=[0..71], non-faded zone x=[0..103]). */
+    const float cx_px = junc->is_roundabout ? 62.0f : 64.0f;
     const float cy_px = 38.0f;
-    const float px_radius = junc->is_roundabout ? 29.0f : 31.0f;
+    const float px_radius = junc->is_roundabout ? 31.0f : 33.0f;
     const float scale = px_radius / clip_r;
 
-    /* Helper lambda-style coordinate transform: local world (x_right, y_up) -> screen (sx, sy). */
+    /* Helper coordinate transform buffers: local world (x_right, y_up) -> screen (sx, sy). */
     struct fpt tmp_w[SNDS_MAX_JUNCTION_PTS];
     struct fpt tmp_c[SNDS_MAX_JUNCTION_PTS];
 
-    /* 1. Prepare non-guided crossing arms in screen space. */
-    struct fpt arms_px[SNDS_MAX_ARMS][12];
-    int arm_lens[SNDS_MAX_ARMS];
+    /* 1. Prepare all non-guided roads (directly connected arms + surrounding context roads).
+     * Cap total background polylines so Layer 1 + Layer 2 leave >= 4 slots for Layer 3 + 4! */
+    enum { MAX_BG_ROADS = 14 };
+    struct fpt arms_px[MAX_BG_ROADS][8];
+    int arm_lens[MAX_BG_ROADS];
+    uint8_t arm_is_ctx[MAX_BG_ROADS];
     int valid_arms = 0;
-    for (uint8_t a = 0u; a < junc->arm_count && valid_arms < (int)SNDS_MAX_ARMS; ++a) {
+
+    for (uint8_t a = 0u; a < junc->arm_count && valid_arms < MAX_BG_ROADS; ++a) {
         int n = (int)junc->arms[a].pt_count;
         if (n < 2) continue;
         for (int i = 0; i < n; ++i)
@@ -376,9 +405,28 @@ int semantic_render_hud_minimap(const struct snds_junction *junc,
             tmp_c[i].x = cx_px + tmp_c[i].x * scale;
             tmp_c[i].y = cy_px - tmp_c[i].y * scale;
         }
-        int ns = simplify_screen_poly(tmp_c, nc, 1.8f, arms_px[valid_arms], 8);
+        int ns = simplify_screen_poly(tmp_c, nc, 1.4f, arms_px[valid_arms], 6);
         if (ns >= 2) {
             arm_lens[valid_arms] = ns;
+            arm_is_ctx[valid_arms] = 0u;
+            valid_arms++;
+        }
+    }
+    for (uint8_t c = 0u; c < junc->context_count && valid_arms < MAX_BG_ROADS; ++c) {
+        int n = (int)junc->context[c].pt_count;
+        if (n < 2) continue;
+        for (int i = 0; i < n; ++i)
+            tmp_w[i] = world_to_local(junc->context[c].pts[i], junc->center, cos_h, sin_h);
+        int nc = clip_polyline_radius(tmp_w, n, clip_r, tmp_c, (int)SNDS_MAX_JUNCTION_PTS);
+        if (nc < 2) continue;
+        for (int i = 0; i < nc; ++i) {
+            tmp_c[i].x = cx_px + tmp_c[i].x * scale;
+            tmp_c[i].y = cy_px - tmp_c[i].y * scale;
+        }
+        int ns = simplify_screen_poly(tmp_c, nc, 1.3f, arms_px[valid_arms], 6);
+        if (ns >= 2) {
+            arm_lens[valid_arms] = ns;
+            arm_is_ctx[valid_arms] = 1u;
             valid_arms++;
         }
     }
@@ -409,25 +457,37 @@ int semantic_render_hud_minimap(const struct snds_junction *junc,
         tmp_c[i].y = cy_px - tmp_c[i].y * scale;
     }
     struct fpt guided_px[14];
-    int gs = simplify_screen_poly(tmp_c, gc, 1.8f, guided_px, 5);
+    int gs = simplify_screen_poly(tmp_c, gc, 1.5f, guided_px, 6);
     if (gs < 2) return 0;
 
-    /* OEM BMW visual widths calibrated for the 120x72 6WB/HUD vector surface:
-     *   - Roundabout: slightly leaner strokes (3.6+1.8 px) keep a bold pitch-black center island
-     *   - Intersection: bold strokes (4.4+2.0 px) matching OEM arrow weight */
-    const float road_fill_hw  = junc->is_roundabout ? 3.6f : 4.4f;
-    const float border_w      = junc->is_roundabout ? 1.8f : 2.0f;
+    /* OEM BMW visual widths calibrated for the zoomed-out 120x72 6WB/HUD vector surface:
+     *   - Roundabout: medium strokes (2.8+1.4 px) keep a bold pitch-black center island
+     *   - Intersection: sleeker context/road strokes (1.8+1.0 px; secondary ctx 1.4+0.9 px)
+     *     so parallel dual carriageways and slip ramps stay sharply separated, while the
+     *     guided white route arrow (2.8+1.3 px) pops clearly on top! */
+    const float road_fill_hw  = junc->is_roundabout ? 2.8f : 1.8f;
+    const float border_w      = junc->is_roundabout ? 1.4f : 1.0f;
     const float road_bord_hw  = road_fill_hw + border_w;
-    const float arrow_fill_hw = junc->is_roundabout ? 3.6f : 4.2f;
-    const float arrow_bord_hw = arrow_fill_hw + border_w;
-    const float head_len      = junc->is_roundabout ? 12.5f : 14.0f;
-    const float head_hw       = junc->is_roundabout ? 8.8f : 9.8f;
+    const float ctx_fill_hw   = junc->is_roundabout ? 2.0f : 1.4f;
+    const float ctx_bord_hw   = ctx_fill_hw + 0.9f;
+    const float arrow_fill_hw = junc->is_roundabout ? 2.8f : 2.6f;
+    const float arrow_bord_hw = arrow_fill_hw + (junc->is_roundabout ? 1.4f : 1.3f);
+    const float head_len      = junc->is_roundabout ? 11.5f : 11.0f;
+    const float head_hw       = junc->is_roundabout ? 7.8f : 7.2f;
+
+    /* Reserve 4 slots for Layer 3 + 4 (guided route border/fill + arrowhead border/fill).
+     * If ring_n >= 6, reserve 4 more slots for ring borders/fills. */
+    int max_bg_slots = (int)SEMANTIC_HUD_MAX_POLYS - 4 - (ring_n >= 6 ? 4 : 2);
+    int emit_arms = valid_arms;
+    if (emit_arms * 2 > max_bg_slots)
+        emit_arms = max_bg_slots / 2;
 
     struct fpt poly[SEMANTIC_HUD_MAX_POLY_PTS];
 
     /* ================= LAYER 1: Non-guided road ORANGE borders ================= */
-    for (int a = 0; a < valid_arms; ++a) {
-        int m = stroke_ribbon(arms_px[a], arm_lens[a], road_bord_hw, 0.0f, 0.0f,
+    for (int a = 0; a < emit_arms; ++a) {
+        float hw = arm_is_ctx[a] ? ctx_bord_hw : road_bord_hw;
+        int m = stroke_ribbon(arms_px[a], arm_lens[a], hw, 0.0f, 0.0f,
                               poly, (int)SEMANTIC_HUD_MAX_POLY_PTS);
         if (m >= 3) (void)emit_poly(out, SEMANTIC_HUD_COLOR_ORANGE, poly, m);
     }
@@ -441,8 +501,9 @@ int semantic_render_hud_minimap(const struct snds_junction *junc,
     /* ================= LAYER 2: Non-guided road DARK BROWN fills =================
      * Drawn ON TOP of ALL Layer-1 borders -> merges every arm & roundabout ring
      * seamlessly with ZERO messy internal orange seam lines! */
-    for (int a = 0; a < valid_arms; ++a) {
-        int m = stroke_ribbon(arms_px[a], arm_lens[a], road_fill_hw, 0.0f, 0.5f,
+    for (int a = 0; a < emit_arms; ++a) {
+        float hw = arm_is_ctx[a] ? ctx_fill_hw : road_fill_hw;
+        int m = stroke_ribbon(arms_px[a], arm_lens[a], hw, 0.0f, 0.5f,
                               poly, (int)SEMANTIC_HUD_MAX_POLY_PTS);
         if (m >= 3) (void)emit_poly(out, SEMANTIC_HUD_COLOR_BROWN, poly, m);
     }

@@ -518,7 +518,7 @@ static int match_roundabout_at_node(const struct snds_graph *g,
 
     struct snds_arm guided_exit;
     arm_from_link(g, &guided_exit, cand_arms[best_arm].link_idx,
-                  cand_arms[best_arm].rev, 65.0f, approach_hdg);
+                  cand_arms[best_arm].rev, 70.0f, approach_hdg);
     for (uint8_t j = 0u; j < guided_exit.pt_count; ++j)
         poly_append_pt(&out->guided, guided_exit.pts[j]);
 
@@ -526,7 +526,7 @@ static int match_roundabout_at_node(const struct snds_graph *g,
     for (int k = 0; k < cand_count && out->arm_count < SNDS_MAX_ARMS; ++k) {
         if (k == best_arm) continue;
         arm_from_link(g, &out->arms[out->arm_count], cand_arms[k].link_idx,
-                      cand_arms[k].rev, 55.0f, approach_hdg);
+                      cand_arms[k].rev, 115.0f, approach_hdg);
         out->arm_count++;
     }
 
@@ -605,15 +605,24 @@ static int match_turn_at_node(const struct snds_graph *g,
     out->guided = *approach_poly;
 
     struct snds_arm exit_arm;
-    arm_from_link(g, &exit_arm, best_idx, best_rev, 70.0f, approach_hdg);
+    arm_from_link(g, &exit_arm, best_idx, best_rev, 65.0f, approach_hdg);
     for (uint8_t j = 0u; j < exit_arm.pt_count; ++j)
         poly_append_pt(&out->guided, exit_arm.pts[j]);
 
     for (int k = 0; k < conn_count && out->arm_count < SNDS_MAX_ARMS; ++k) {
         if (connected_links[k] == best_idx) continue;
         arm_from_link(g, &out->arms[out->arm_count], connected_links[k],
-                      connected_revs[k], 55.0f, approach_hdg);
+                      connected_revs[k], 125.0f, approach_hdg);
         out->arm_count++;
+    }
+
+    /* Also emit the full-length underlying exit road into context[0] so the target
+     * cross street visibly continues beyond the tip of the guided arrow. */
+    if (out->context_count < SNDS_MAX_CONTEXT) {
+        arm_from_link(g, &out->context[out->context_count], best_idx, best_rev,
+                      125.0f, approach_hdg);
+        if (out->context[out->context_count].pt_count >= 2u)
+            out->context_count++;
     }
 
     int conf = best_score;
@@ -621,6 +630,219 @@ static int match_turn_at_node(const struct snds_graph *g,
     if (conf < 40) conf = 40;
     out->confidence = (uint8_t)conf;
     return 1;
+}
+
+/* Minimum distance from point P to a polyline of pts[0..n-1]. */
+static float pt_poly_dist(struct snds_pt p, const struct snds_pt *pts, uint8_t n) {
+    float best = 1e9f;
+    for (uint8_t k = 1u; k < n; ++k) {
+        float d = pt_seg_dist(p, pts[k - 1u], pts[k], NULL);
+        if (d < best) best = d;
+    }
+    return best;
+}
+
+static int link_already_covered(const struct snds_link *l, const struct snds_junction *j) {
+    if (l->pt_count < 2u) return 1;
+    struct snds_pt mid = {
+        0.5f * (l->pts[0].x + l->pts[l->pt_count - 1u].x),
+        0.5f * (l->pts[0].y + l->pts[l->pt_count - 1u].y),
+    };
+    if (l->pt_count >= 3u)
+        mid = l->pts[l->pt_count / 2u];
+    const float tol = 3.2f;
+    if (j->guided.pt_count >= 2u && pt_poly_dist(mid, j->guided.pts, j->guided.pt_count) < tol)
+        return 1;
+    if (j->ring.pt_count >= 2u && pt_poly_dist(mid, j->ring.pts, j->ring.pt_count) < tol)
+        return 1;
+    for (uint8_t a = 0u; a < j->arm_count; ++a) {
+        if (j->arms[a].pt_count >= 2u &&
+            pt_poly_dist(mid, j->arms[a].pts, j->arms[a].pt_count) < tol)
+            return 1;
+    }
+    for (uint8_t c = 0u; c < j->context_count; ++c) {
+        if (j->context[c].pt_count >= 2u &&
+            pt_poly_dist(mid, j->context[c].pts, j->context[c].pt_count) < tol)
+            return 1;
+    }
+    return 0;
+}
+
+static float link_dist_to_pt(const struct snds_link *l, struct snds_pt p) {
+    return pt_poly_dist(p, l->pts, l->pt_count);
+}
+
+static void arm_append_pts(struct snds_arm *arm, const struct snds_link *l, int rev) {
+    if (!rev) {
+        for (uint8_t k = 0u; k < l->pt_count && arm->pt_count < SNDS_MAX_ARM_PTS; ++k) {
+            if (arm->pt_count == 0u || pt_dist(arm->pts[arm->pt_count - 1u], l->pts[k]) >= 1.0f)
+                arm->pts[arm->pt_count++] = l->pts[k];
+        }
+    } else {
+        for (int k = (int)l->pt_count - 1; k >= 0 && arm->pt_count < SNDS_MAX_ARM_PTS; --k) {
+            if (arm->pt_count == 0u || pt_dist(arm->pts[arm->pt_count - 1u], l->pts[k]) >= 1.0f)
+                arm->pts[arm->pt_count++] = l->pts[k];
+        }
+    }
+}
+
+/* Collect nearby non-guided context roads (parallel carriageways, slip ramps, nearby
+ * side roundabouts & cross streets) within radius_m of out->center, chaining smooth
+ * connected links so each road renders as a single crisp polyline. */
+static void collect_context_roads(const struct snds_graph *g,
+                                  float radius_m,
+                                  struct snds_junction *out) {
+    uint8_t used[SNDS_MAX_GRAPH_LINKS];
+    memset(used, 0, sizeof(used));
+
+    for (uint16_t i = 0u; i < g->link_count; ++i) {
+        const struct snds_link *l = &g->links[i];
+        if (l->pt_count < 2u || l->frc >= 7u) { used[i] = 1u; continue; }
+        if (link_dist_to_pt(l, out->center) > radius_m) { used[i] = 1u; continue; }
+        if (link_already_covered(l, out)) { used[i] = 1u; continue; }
+    }
+
+    while (out->context_count < SNDS_MAX_CONTEXT) {
+        int seed = -1;
+        float best_pri = 1e9f;
+        for (uint16_t i = 0u; i < g->link_count; ++i) {
+            if (used[i]) continue;
+            const struct snds_link *l = &g->links[i];
+            float d = link_dist_to_pt(l, out->center);
+            float pri = d + (float)l->frc * 9.0f - (l->is_roundabout ? 25.0f : 0.0f);
+            if (pri < best_pri) {
+                best_pri = pri;
+                seed = (int)i;
+            }
+        }
+        if (seed < 0) break;
+
+        /* Walk backward from seed start to find chain head (up to 4 hops). */
+        int chain_idx[10];
+        int chain_rev[10];
+        int head = 5, tail = 5;
+        chain_idx[head] = seed;
+        chain_rev[head] = 0;
+        used[seed] = 1u;
+
+        for (int hop = 0; hop < 4 && head > 0; ++hop) {
+            const struct snds_link *cl = &g->links[chain_idx[head]];
+            int crev = chain_rev[head];
+            uint64_t snode = crev ? cl->end_node : cl->start_node;
+            struct snds_pt spt = link_start_pt(cl, crev);
+            float shdg = link_heading(cl, crev, 0);
+            int prev_i = -1, prev_rev = 0;
+            float best_dh = 65.0f;
+            for (uint16_t i = 0u; i < g->link_count; ++i) {
+                if (used[i]) continue;
+                const struct snds_link *cand = &g->links[i];
+                /* Want cand's far end to touch spt so cand flows INTO cl. */
+                int touch = link_touches_node(cand, snode, spt);
+                if (touch < 0) continue;
+                int prev_dir = 1 - touch; /* traverse cand toward spt */
+                float dh = m_fabsf(wrap_deg_180(link_heading(cand, prev_dir, 1) - shdg));
+                if (dh < best_dh) {
+                    best_dh = dh;
+                    prev_i = (int)i;
+                    prev_rev = prev_dir;
+                }
+            }
+            if (prev_i < 0) break;
+            used[prev_i] = 1u;
+            head--;
+            chain_idx[head] = prev_i;
+            chain_rev[head] = prev_rev;
+        }
+
+        /* Walk forward from seed end to find chain tail (up to 4 hops). */
+        for (int hop = 0; hop < 4 && tail < 9; ++hop) {
+            const struct snds_link *cl = &g->links[chain_idx[tail]];
+            int crev = chain_rev[tail];
+            uint64_t enode = link_far_node(cl, crev);
+            struct snds_pt ept = link_end_pt(cl, crev);
+            float ehdg = link_heading(cl, crev, 1);
+            int next_i = -1, next_rev = 0;
+            float best_dh = 65.0f;
+            for (uint16_t i = 0u; i < g->link_count; ++i) {
+                if (used[i]) continue;
+                const struct snds_link *cand = &g->links[i];
+                int crev2 = link_touches_node(cand, enode, ept);
+                if (crev2 < 0) continue;
+                float dh = m_fabsf(wrap_deg_180(link_heading(cand, crev2, 0) - ehdg));
+                if (dh < best_dh) {
+                    best_dh = dh;
+                    next_i = (int)i;
+                    next_rev = crev2;
+                }
+            }
+            if (next_i < 0) break;
+            used[next_i] = 1u;
+            tail++;
+            chain_idx[tail] = next_i;
+            chain_rev[tail] = next_rev;
+        }
+
+        struct snds_arm *ctx = &out->context[out->context_count];
+        memset(ctx, 0, sizeof(*ctx));
+        for (int k = head; k <= tail; ++k)
+            arm_append_pts(ctx, &g->links[chain_idx[k]], chain_rev[k]);
+        if (ctx->pt_count >= 2u) {
+            float total_len = 0.0f;
+            for (uint8_t k = 1u; k < ctx->pt_count; ++k)
+                total_len += pt_dist(ctx->pts[k - 1u], ctx->pts[k]);
+            if (total_len >= 8.0f)
+                out->context_count++;
+        }
+    }
+}
+
+/* Prepend backward approach links if the approach starts closer than min_back_m to center. */
+static void extend_approach_backward(const struct snds_graph *g,
+                                     int snap_idx, int snap_rev,
+                                     float min_back_m,
+                                     struct snds_junction *out) {
+    if (out->guided.pt_count < 2u) return;
+    if (pt_dist(out->guided.pts[0], out->center) >= min_back_m) return;
+
+    int back_idx[3], back_rev[3];
+    int back_n = 0;
+    int cur_i = snap_idx, cur_r = snap_rev;
+    for (int hop = 0; hop < 3; ++hop) {
+        const struct snds_link *cl = &g->links[cur_i];
+        uint64_t snode = cur_r ? cl->end_node : cl->start_node;
+        struct snds_pt spt = link_start_pt(cl, cur_r);
+        if (pt_dist(spt, out->center) >= min_back_m) break;
+        float shdg = link_heading(cl, cur_r, 0);
+        int prev_i = -1, prev_r = 0;
+        float best_dh = 40.0f;
+        for (uint16_t i = 0u; i < g->link_count; ++i) {
+            if ((int)i == cur_i || (int)i == snap_idx) continue;
+            const struct snds_link *cand = &g->links[i];
+            if (cand->pt_count < 2u || cand->is_roundabout || cand->frc >= 7u) continue;
+            int touch = link_touches_node(cand, snode, spt);
+            if (touch < 0) continue;
+            int pdir = 1 - touch;
+            if (!link_allows_dir(cand, pdir)) continue;
+            float dh = m_fabsf(wrap_deg_180(link_heading(cand, pdir, 1) - shdg));
+            if (dh < best_dh) { best_dh = dh; prev_i = (int)i; prev_r = pdir; }
+        }
+        if (prev_i < 0) break;
+        back_idx[back_n] = prev_i;
+        back_rev[back_n] = prev_r;
+        back_n++;
+        cur_i = prev_i;
+        cur_r = prev_r;
+    }
+    if (back_n == 0) return;
+
+    struct snds_polyline rebuilt;
+    memset(&rebuilt, 0, sizeof(rebuilt));
+    for (int k = back_n - 1; k >= 0; --k)
+        poly_append_link(&rebuilt, &g->links[back_idx[k]], back_rev[k]);
+    for (uint8_t k = 0u; k < out->guided.pt_count; ++k)
+        poly_append_pt(&rebuilt, out->guided.pts[k]);
+    if (rebuilt.pt_count >= 2u)
+        out->guided = rebuilt;
 }
 
 int snds_match_maneuver(const struct snds_graph *graph,
@@ -637,6 +859,7 @@ int snds_match_maneuver(const struct snds_graph *graph,
     if (!snap_car_to_link(graph, query, &cur_idx, &cur_rev, &rem_m))
         return 0;
 
+    int snap_idx = cur_idx, snap_rev = cur_rev;
     uint8_t car_lanes = graph->links[cur_idx].lanes;
     const int want_rb = is_roundabout_aa(query->aa_type);
     const float max_walk_m = query->dist_m * 1.5f + 80.0f;
@@ -708,6 +931,8 @@ int snds_match_maneuver(const struct snds_graph *graph,
     }
 
     if (!best.valid) return 0;
+    extend_approach_backward(graph, snap_idx, snap_rev, 115.0f, &best);
+    collect_context_roads(graph, 115.0f, &best);
     best.current_link_lanes = car_lanes;
     *out = best;
     return 1;
