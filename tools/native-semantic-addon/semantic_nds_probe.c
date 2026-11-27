@@ -26,8 +26,10 @@ enum {
     ADAS_LINK_INFO_DTOR    = 0x0065d028u, /* CAdasLinkInfo::~CAdasLinkInfo() */
     ADAS_ATTR_STRIDE       = 48u,         /* sizeof(CAdasAttribute) */
 
-    /* Verified CPsiAdasAccessor::getLinkInfo attribute IDs (0x0093e4cc jump table) */
-    ADAS_ATTR_TRAVEL_DIR   = 0u,  /* 0=both, 1=fwd one-way, 2=bwd one-way */
+    /* Verified CPsiAdasAccessor::getLinkInfo attribute IDs (0x0093e4cc jump table):
+     *   0x00934f4c maps HERE/NDS travel-dir nibble (1=both, 2=fwd, 3=bwd) to:
+     *   td==2 -> both ways, td==1 -> fwd one-way, td==0 -> bwd one-way. */
+    ADAS_ATTR_TRAVEL_DIR   = 0u,
     ADAS_ATTR_FRC          = 9u,  /* FunctionalRoadClass 0..7 */
     ADAS_ATTR_ROUNDABOUT   = 37u, /* NDS FormOfWay == 4 (Roundabout) */
 
@@ -309,7 +311,7 @@ int semantic_nds_query_local_graph(int mem_fd,
                             uint16_t aid = *(const uint16_t *)(at + 0u);
                             if (aid == ADAS_ATTR_TRAVEL_DIR) {
                                 uint32_t td = *(const uint32_t *)(at + 16u);
-                                lnk->one_way = (td == 1u) ? 1u : (td == 2u ? 2u : 0u);
+                                lnk->one_way = (td == 2u) ? 0u : (td == 1u ? 1u : 2u);
                             } else if (aid == ADAS_ATTR_FRC) {
                                 uint32_t frc = *(const uint32_t *)(at + 16u);
                                 if (frc <= 8u) lnk->frc = (uint8_t)frc;
