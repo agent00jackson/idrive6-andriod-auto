@@ -493,7 +493,7 @@ static int ctrl_can_select(void *ctx, uint32_t *out_foreign_active) {
 }
 
 static int dispatch_start_guidance(uint32_t trip_handle) {
-    uint32_t *start_req = calloc(1, 0x40);
+    uint32_t *start_req = calloc(1, 0x200);
     struct owner_event *sev = calloc(1, sizeof(*sev));
     if (!start_req || !sev) { free(start_req); free(sev); return 0; }
     __atomic_store_n(&guidance_callback_state, 0u, __ATOMIC_RELEASE);
@@ -530,7 +530,7 @@ static int ctrl_start_route(void *ctx, uint64_t session) {
     } else if (entries == 0u || (entries == 1u && owned_trip_handle && attached == 0u)) {
         if (entries == 0u) {
             /* 1. Run NewTrip on Root context 0 */
-            uint8_t *request = calloc(1, 0x100);
+            uint8_t *request = calloc(1, 0x200);
             uint8_t *trip = calloc(1, 0x24);
             uint8_t *segment = calloc(1, 0xcc);
             struct owner_event *ev = calloc(1, sizeof(*ev));
@@ -587,8 +587,12 @@ static int ctrl_start_route(void *ctx, uint64_t session) {
             return 0;
         }
 
-        /* 3. AttachRoute(owned_trip_handle, route_id) on Root context 0 */
-        uint32_t *attach_req = calloc(1, 0x40);
+        /* 3. AttachRoute(owned_trip_handle, route_id) on Root context 0.
+         * CAttachRouteRequest embeds an optional CRouteDescription at +0x20..+0xc8
+         * (onAttachRouteResult checks the segment vector at +172/+176); allocate
+         * 0x200 zeroed bytes so it always takes the clean getRouteDescription() path
+         * and never reads OOB heap memory into std::vector::operator=. */
+        uint32_t *attach_req = calloc(1, 0x200);
         struct owner_event *aev = calloc(1, sizeof(*aev));
         if (!attach_req || !aev) return 0;
         __atomic_store_n(&attach_callback_state, 0u, __ATOMIC_RELEASE);
