@@ -18,6 +18,7 @@ enum {
     PSI_ADAS_PRIMARY_VPTR  = 0x0105d0c8u, /* CPsiAdasAccessor primary vtable (+0) */
     PSI_ADAS_IFACE_VPTR    = 0x0105d120u, /* IAdasAccessor secondary vtable (+216) */
     PSI_ADAS_IFACE_OFFSET  = 216u,
+    PSI_ADAS_COORDSYS_OFF  = 220u,        /* uint32_t mCoordSystem (0 == raw NDS 32-bit) */
     PSI_ADAS_INIT_FLAG_OFF = 280u,        /* uint8_t mInitialized on CPsiAdasAccessor */
     ROAD_TREE_PROV_VPTR    = 0x00f283e8u, /* CRoadTreeProvider primary vtable */
     ROAD_TREE_ADAS_OFF     = 684u,        /* IAdasAccessor* mAdasAccessor */
@@ -53,7 +54,7 @@ static int safe_read_word(int fd, uint32_t addr, uint32_t *out) {
 }
 
 static int validate_adas_iface(int fd, uint32_t iface_addr) {
-    uint32_t iface_vptr = 0u, prim_vptr = 0u;
+    uint32_t iface_vptr = 0u, prim_vptr = 0u, coord_sys = 99u;
     uint8_t init_flag = 0u;
     if (iface_addr < 0x10000u + PSI_ADAS_IFACE_OFFSET || iface_addr >= 0x80000000u)
         return 0;
@@ -61,6 +62,8 @@ static int validate_adas_iface(int fd, uint32_t iface_addr) {
     if (!safe_read_word(fd, iface_addr, &iface_vptr) || iface_vptr != PSI_ADAS_IFACE_VPTR)
         return 0;
     if (!safe_read_word(fd, prim_addr, &prim_vptr) || prim_vptr != PSI_ADAS_PRIMARY_VPTR)
+        return 0;
+    if (!safe_read_word(fd, prim_addr + PSI_ADAS_COORDSYS_OFF, &coord_sys) || coord_sys != 0u)
         return 0;
     if (!safe_read_mem(fd, prim_addr + PSI_ADAS_INIT_FLAG_OFF, &init_flag, 1u) || !init_flag)
         return 0;
@@ -99,12 +102,12 @@ static uint32_t find_live_adas_iface(int fd) {
                     g_cached_adas_iface = cand;
                     return cand;
                 }
-            } else if (w == ROAD_TREE_PROV_VPTR && !g_cached_rtp) {
+            } else if (w == ROAD_TREE_PROV_VPTR) {
                 uint32_t rtp = addr + i * 4u;
                 uint32_t adas_ptr = 0u;
-                g_cached_rtp = rtp;
                 if (safe_read_word(fd, rtp + ROAD_TREE_ADAS_OFF, &adas_ptr) &&
                     validate_adas_iface(fd, adas_ptr)) {
+                    g_cached_rtp = rtp;
                     g_cached_adas_iface = adas_ptr;
                     return adas_ptr;
                 }

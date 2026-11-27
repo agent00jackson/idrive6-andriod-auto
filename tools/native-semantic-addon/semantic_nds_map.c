@@ -182,6 +182,20 @@ static struct snds_pt link_start_pt(const struct snds_link *l, int rev) {
     return rev ? l->pts[l->pt_count - 1u] : l->pts[0];
 }
 
+/* Check whether link l starts at (node, pt) in forward (rev=0) or reverse (rev=1) order.
+ * Uses exact quantized node ID first, falling back to <= 2.5m endpoint proximity for
+ * NDS tile borders or rounding boundaries. */
+static int link_touches_node(const struct snds_link *l, uint64_t node, struct snds_pt node_pt) {
+    if (l->pt_count < 2u) return -1;
+    if (l->start_node == node) return 0;
+    if (l->end_node == node) return 1;
+    float d0 = pt_dist(l->pts[0], node_pt);
+    float d1 = pt_dist(l->pts[l->pt_count - 1u], node_pt);
+    if (d0 <= 2.5f && d0 <= d1) return 0;
+    if (d1 <= 2.5f) return 1;
+    return -1;
+}
+
 static void poly_append_pt(struct snds_polyline *poly, struct snds_pt p) {
     if (poly->pt_count >= SNDS_MAX_JUNCTION_PTS) return;
     if (poly->pt_count > 0u && pt_dist(poly->pts[poly->pt_count - 1u], p) < 0.5f)
@@ -199,32 +213,75 @@ static void poly_append_link(struct snds_polyline *poly, const struct snds_link 
     }
 }
 
-static void arm_from_link(struct snds_arm *arm, const struct snds_link *l, int rev,
+static void arm_from_link(const struct snds_graph *g, struct snds_arm *arm,
+                          int start_idx, int start_rev,
                           float max_len_m, float approach_hdg) {
+    const struct snds_link *first = &g->links[start_idx];
     arm->pt_count = 0u;
+    arm->exit_angle_deg = wrap_deg_180(link_heading(first, start_rev, 0) - approach_hdg);
+
     float accum = 0.0f;
-    struct snds_pt prev = link_start_pt(l, rev);
+    struct snds_pt prev = link_start_pt(first, start_rev);
     arm->pts[arm->pt_count++] = prev;
-    int step = rev ? -1 : 1;
-    int idx = rev ? (int)l->pt_count - 2 : 1;
-    while (idx >= 0 && idx < (int)l->pt_count && arm->pt_count < SNDS_MAX_ARM_PTS) {
-        struct snds_pt cur = l->pts[idx];
-        float seg = pt_dist(prev, cur);
-        if (seg > 0.2f) {
-            if (accum + seg > max_len_m) {
-                float t = (max_len_m - accum) / seg;
-                struct snds_pt cut = { prev.x + (cur.x - prev.x) * t,
-                                       prev.y + (cur.y - prev.y) * t };
-                arm->pts[arm->pt_count++] = cut;
-                break;
+
+    int cur_idx = start_idx;
+    int cur_rev = start_rev;
+    int seen[4] = { start_idx, -1, -1, -1 };
+    int seen_n = 1;
+
+    for (int hop = 0; hop < 4 && accum < max_len_m && arm->pt_count < SNDS_MAX_ARM_PTS; ++hop) {
+        const struct snds_link *l = &g->links[cur_idx];
+        int step = cur_rev ? -1 : 1;
+        int idx = cur_rev ? (int)l->pt_count - 2 : 1;
+        while (idx >= 0 && idx < (int)l->pt_count && arm->pt_count < SNDS_MAX_ARM_PTS) {
+            struct snds_pt cur = l->pts[idx];
+            float seg = pt_dist(prev, cur);
+            if (seg > 0.2f) {
+                if (accum + seg > max_len_m) {
+                    float t = (max_len_m - accum) / seg;
+                    struct snds_pt cut = { prev.x + (cur.x - prev.x) * t,
+                                           prev.y + (cur.y - prev.y) * t };
+                    arm->pts[arm->pt_count++] = cut;
+                    accum = max_len_m;
+                    break;
+                }
+                arm->pts[arm->pt_count++] = cur;
+                accum += seg;
+                prev = cur;
             }
-            arm->pts[arm->pt_count++] = cur;
-            accum += seg;
-            prev = cur;
+            idx += step;
         }
-        idx += step;
+        if (accum >= max_len_m || arm->pt_count >= SNDS_MAX_ARM_PTS)
+            break;
+
+        /* Follow straightest continuation link (e.g. past a 15m divided-median crossover). */
+        uint64_t far_node = link_far_node(l, cur_rev);
+        struct snds_pt far_pt = link_end_pt(l, cur_rev);
+        float exit_hdg = link_heading(l, cur_rev, 1);
+        int next_idx = -1, next_rev = 0;
+        float best_dh = 40.0f;
+        for (uint16_t i = 0u; i < g->link_count; ++i) {
+            int dup = 0;
+            for (int s = 0; s < seen_n; ++s) {
+                if (seen[s] == (int)i) { dup = 1; break; }
+            }
+            if (dup) continue;
+            const struct snds_link *cand = &g->links[i];
+            if (cand->pt_count < 2u || cand->is_roundabout || cand->frc >= 7u) continue;
+            int crev = link_touches_node(cand, far_node, far_pt);
+            if (crev < 0) continue;
+            float dh = m_fabsf(wrap_deg_180(link_heading(cand, crev, 0) - exit_hdg));
+            if (dh < best_dh) {
+                best_dh = dh;
+                next_idx = (int)i;
+                next_rev = crev;
+            }
+        }
+        if (next_idx < 0) break;
+        cur_idx = next_idx;
+        cur_rev = next_rev;
+        if (seen_n < 4) seen[seen_n++] = next_idx;
     }
-    arm->exit_angle_deg = wrap_deg_180(link_heading(l, rev, 0) - approach_hdg);
 }
 
 /* Distance from point P to segment AB, plus fractional projection t in [0..1]. */
@@ -299,12 +356,13 @@ static int match_roundabout_at_node(const struct snds_graph *g,
                                     const struct snds_polyline *approach_poly,
                                     struct snds_junction *out) {
     /* Verify at least one roundabout link leaves entry_node. */
+    struct snds_pt entry_pt = link_end_pt(&g->links[approach_link_idx], approach_rev);
     int rb_idx = -1;
     for (uint16_t i = 0u; i < g->link_count; ++i) {
         const struct snds_link *l = &g->links[i];
         if (!l->is_roundabout || l->pt_count < 2u) continue;
-        if ((l->start_node == entry_node && link_allows_dir(l, 0)) ||
-            (l->end_node == entry_node && link_allows_dir(l, 1))) {
+        int rev = link_touches_node(l, entry_node, entry_pt);
+        if (rev >= 0 && link_allows_dir(l, rev)) {
             rb_idx = (int)i; break;
         }
     }
@@ -314,8 +372,10 @@ static int match_roundabout_at_node(const struct snds_graph *g,
     int ring_links[16];
     int ring_revs[16];
     uint64_t ring_nodes[17];
+    struct snds_pt ring_pts[17];
     int ring_count = 0;
     uint64_t cur_node = entry_node;
+    struct snds_pt cur_pt = entry_pt;
     int visited[SNDS_MAX_GRAPH_LINKS];
     memset(visited, 0, sizeof(visited));
 
@@ -325,11 +385,9 @@ static int match_roundabout_at_node(const struct snds_graph *g,
             if (visited[i]) continue;
             const struct snds_link *l = &g->links[i];
             if (!l->is_roundabout || l->pt_count < 2u) continue;
-            if (l->start_node == cur_node && link_allows_dir(l, 0)) {
-                next_idx = (int)i; next_rev = 0; break;
-            }
-            if (l->end_node == cur_node && link_allows_dir(l, 1)) {
-                next_idx = (int)i; next_rev = 1; break;
+            int rev = link_touches_node(l, cur_node, cur_pt);
+            if (rev >= 0 && link_allows_dir(l, rev)) {
+                next_idx = (int)i; next_rev = rev; break;
             }
         }
         if (next_idx < 0) break;
@@ -337,12 +395,18 @@ static int match_roundabout_at_node(const struct snds_graph *g,
         ring_links[ring_count] = next_idx;
         ring_revs[ring_count] = next_rev;
         ring_nodes[ring_count] = cur_node;
+        ring_pts[ring_count] = cur_pt;
         ring_count++;
         cur_node = link_far_node(&g->links[next_idx], next_rev);
-        if (cur_node == entry_node) break;
+        cur_pt = link_end_pt(&g->links[next_idx], next_rev);
+        if (cur_node == entry_node || pt_dist(cur_pt, entry_pt) <= 2.5f) {
+            cur_node = entry_node;
+            break;
+        }
     }
     if (ring_count < 2 || cur_node != entry_node) return 0;
     ring_nodes[ring_count] = entry_node;
+    ring_pts[ring_count] = entry_pt;
 
     /* Build closed ring polyline & compute centroid + average radius. */
     struct snds_polyline ring_poly;
@@ -373,19 +437,17 @@ static int match_roundabout_at_node(const struct snds_graph *g,
     int cand_count = 0;
 
     int cw = is_roundabout_cw_aa(q->aa_type);
-    struct snds_pt entry_pt = link_end_pt(&g->links[approach_link_idx], approach_rev);
     float entry_bearing = vec_heading_deg(entry_pt.x - cx, entry_pt.y - cy);
 
     for (int step = 1; step <= ring_count; ++step) {
         uint64_t node = ring_nodes[step % ring_count];
+        struct snds_pt rpt = ring_pts[step % ring_count];
         for (uint16_t i = 0u; i < g->link_count && cand_count < 16; ++i) {
             const struct snds_link *l = &g->links[i];
             if (l->is_roundabout || l->pt_count < 2u) continue;
             if ((int)i == approach_link_idx) continue;
-            int rev = -1;
-            if (l->start_node == node) rev = 0;
-            else if (l->end_node == node) rev = 1;
-            else continue;
+            int rev = link_touches_node(l, node, rpt);
+            if (rev < 0) continue;
             if (l->frc >= 7u) continue; /* drop driveways/parking alleys */
 
             struct snds_pt arm_pt = link_start_pt(l, rev);
@@ -455,7 +517,7 @@ static int match_roundabout_at_node(const struct snds_graph *g,
         poly_append_link(&out->guided, &g->links[ring_links[s]], ring_revs[s]);
 
     struct snds_arm guided_exit;
-    arm_from_link(&guided_exit, &g->links[cand_arms[best_arm].link_idx],
+    arm_from_link(g, &guided_exit, cand_arms[best_arm].link_idx,
                   cand_arms[best_arm].rev, 65.0f, approach_hdg);
     for (uint8_t j = 0u; j < guided_exit.pt_count; ++j)
         poly_append_pt(&out->guided, guided_exit.pts[j]);
@@ -463,7 +525,7 @@ static int match_roundabout_at_node(const struct snds_graph *g,
     /* Non-guided arms: all other directly connected arms around the ring. */
     for (int k = 0; k < cand_count && out->arm_count < SNDS_MAX_ARMS; ++k) {
         if (k == best_arm) continue;
-        arm_from_link(&out->arms[out->arm_count], &g->links[cand_arms[k].link_idx],
+        arm_from_link(g, &out->arms[out->arm_count], cand_arms[k].link_idx,
                       cand_arms[k].rev, 55.0f, approach_hdg);
         out->arm_count++;
     }
@@ -479,6 +541,7 @@ static int match_roundabout_at_node(const struct snds_graph *g,
 static int match_turn_at_node(const struct snds_graph *g,
                               const struct snds_query *q,
                               uint64_t node,
+                              struct snds_pt node_pt,
                               int approach_link_idx,
                               float approach_hdg,
                               float cum_dist_m,
@@ -487,6 +550,7 @@ static int match_turn_at_node(const struct snds_graph *g,
     float exp_turn = expected_turn_deg(q->aa_type);
     int best_idx = -1, best_rev = 0;
     int best_score = -1000;
+    float best_adiff = 180.0f;
 
     int connected_links[12];
     int connected_revs[12];
@@ -496,10 +560,8 @@ static int match_turn_at_node(const struct snds_graph *g,
         if ((int)i == approach_link_idx) continue;
         const struct snds_link *l = &g->links[i];
         if (l->pt_count < 2u || l->frc >= 7u) continue;
-        int rev = -1;
-        if (l->start_node == node) rev = 0;
-        else if (l->end_node == node) rev = 1;
-        else continue;
+        int rev = link_touches_node(l, node, node_pt);
+        if (rev < 0) continue;
 
         connected_links[conn_count] = (int)i;
         connected_revs[conn_count] = rev;
@@ -527,10 +589,12 @@ static int match_turn_at_node(const struct snds_graph *g,
             best_score = score;
             best_idx = (int)i;
             best_rev = rev;
+            best_adiff = adiff;
         }
     }
 
-    if (best_idx < 0 || conn_count < 2) return 0;
+    if (best_idx < 0) return 0;
+    if (conn_count < 2 && !(best_adiff < 35.0f && best_score >= 70)) return 0;
 
     memset(out, 0, sizeof(*out));
     out->valid = 1u;
@@ -541,13 +605,13 @@ static int match_turn_at_node(const struct snds_graph *g,
     out->guided = *approach_poly;
 
     struct snds_arm exit_arm;
-    arm_from_link(&exit_arm, &g->links[best_idx], best_rev, 70.0f, approach_hdg);
+    arm_from_link(g, &exit_arm, best_idx, best_rev, 70.0f, approach_hdg);
     for (uint8_t j = 0u; j < exit_arm.pt_count; ++j)
         poly_append_pt(&out->guided, exit_arm.pts[j]);
 
     for (int k = 0; k < conn_count && out->arm_count < SNDS_MAX_ARMS; ++k) {
         if (connected_links[k] == best_idx) continue;
-        arm_from_link(&out->arms[out->arm_count], &g->links[connected_links[k]],
+        arm_from_link(g, &out->arms[out->arm_count], connected_links[k],
                       connected_revs[k], 55.0f, approach_hdg);
         out->arm_count++;
     }
@@ -593,6 +657,7 @@ int snds_match_maneuver(const struct snds_graph *graph,
     for (int hops = 0; hops < 24 && cum_m <= max_walk_m; ++hops) {
         const struct snds_link *cur_link = &graph->links[cur_idx];
         uint64_t node = link_far_node(cur_link, cur_rev);
+        struct snds_pt node_pt = link_end_pt(cur_link, cur_rev);
         float app_hdg = link_heading(cur_link, cur_rev, 1);
 
         if (cum_m >= min_match_m) {
@@ -605,7 +670,7 @@ int snds_match_maneuver(const struct snds_graph *graph,
                     break; /* First roundabout along approach within window */
                 }
             } else {
-                if (match_turn_at_node(graph, query, node, cur_idx, app_hdg,
+                if (match_turn_at_node(graph, query, node, node_pt, cur_idx, app_hdg,
                                        cum_m, &approach, &cand)) {
                     if (!best.valid || cand.confidence > best.confidence)
                         best = cand;
@@ -620,10 +685,8 @@ int snds_match_maneuver(const struct snds_graph *graph,
             if (visited[i]) continue;
             const struct snds_link *l = &graph->links[i];
             if (l->pt_count < 2u || l->is_roundabout || l->frc >= 7u) continue;
-            int rev = -1;
-            if (l->start_node == node && link_allows_dir(l, 0)) rev = 0;
-            else if (l->end_node == node && link_allows_dir(l, 1)) rev = 1;
-            else continue;
+            int rev = link_touches_node(l, node, node_pt);
+            if (rev < 0 || !link_allows_dir(l, rev)) continue;
 
             float dh = m_fabsf(wrap_deg_180(link_heading(l, rev, 0) - app_hdg));
             if (dh > 55.0f) continue;

@@ -1183,6 +1183,34 @@ static int refresh_nds_minimap(struct basic_runtime *rt, int force) {
     struct snds_junction junc;
     memset(&junc, 0, sizeof(junc));
     int matched = snds_match_maneuver(graph, &q, &junc);
+    if (!matched && force) {
+        float min_d2 = 1e18f;
+        int best_i = -1;
+        unsigned ow0 = 0, ow1 = 0, ow2 = 0, rbc = 0;
+        for (uint16_t i = 0u; i < graph->link_count; ++i) {
+            const struct snds_link *l = &graph->links[i];
+            if (l->one_way == 0u) ow0++;
+            else if (l->one_way == 1u) ow1++;
+            else ow2++;
+            if (l->is_roundabout) rbc++;
+            for (uint8_t k = 0u; k < l->pt_count; ++k) {
+                float d2 = l->pts[k].x * l->pts[k].x + l->pts[k].y * l->pts[k].y;
+                if (d2 < min_d2) { min_d2 = d2; best_i = (int)i; }
+            }
+        }
+        if (best_i >= 0) {
+            const struct snds_link *bl = &graph->links[best_i];
+            const struct snds_link *l0 = &graph->links[0];
+            basic_log("SEMANTIC_BASIC nds_diag ow=%u/%u/%u rb=%u near=(%.1f,%.1f)->(%.1f,%.1f) n=%u ow=%u frc=%u len=%.0f l0=(%.1f,%.1f)->(%.1f,%.1f)\n",
+                      ow0, ow1, ow2, rbc,
+                      (double)bl->pts[0].x, (double)bl->pts[0].y,
+                      (double)bl->pts[bl->pt_count - 1u].x, (double)bl->pts[bl->pt_count - 1u].y,
+                      (unsigned)bl->pt_count, (unsigned)bl->one_way, (unsigned)bl->frc,
+                      (double)bl->length_m,
+                      (double)l0->pts[0].x, (double)l0->pts[0].y,
+                      (double)l0->pts[l0->pt_count - 1u].x, (double)l0->pts[l0->pt_count - 1u].y);
+        }
+    }
     free(graph);
 
     struct semantic_hud_minimap mm;
