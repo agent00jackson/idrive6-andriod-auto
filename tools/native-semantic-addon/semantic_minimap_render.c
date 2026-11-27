@@ -365,14 +365,15 @@ int semantic_render_hud_minimap(const struct snds_junction *junc,
     const float cos_h = m_cosf(h_rad);
     const float sin_h = m_sinf(h_rad);
 
-    /* Choose zoomed-out world clipping radius showing surrounding intersection context:
-     *   - Roundabout: ~2.7x radius (clamped 55..110 m) for clear center island + surrounding feeders
-     *   - Intersection/turn: 105 m so dual carriageways, slip ramps, and adjacent streets are visible */
-    float clip_r = 105.0f;
+    /* Choose clean world clipping radius (like CID maneuver widget):
+     *   - Roundabout: ~2.6x radius (clamped 50..105 m) for clear center island + exit arms
+     *   - Intersection/turn: 85 m so 1-hop approach landmarks (e.g. plaza entrance before
+     *     turn) and parallel dual carriageways fit crisply without pulling in distant clutter */
+    float clip_r = 85.0f;
     if (junc->is_roundabout) {
-        clip_r = junc->roundabout_radius_m * 2.7f;
-        if (clip_r < 55.0f) clip_r = 55.0f;
-        if (clip_r > 110.0f) clip_r = 110.0f;
+        clip_r = junc->roundabout_radius_m * 2.6f;
+        if (clip_r < 50.0f) clip_r = 50.0f;
+        if (clip_r > 105.0f) clip_r = 105.0f;
     }
 
     /* Map world [-clip_r..+clip_r] into the exact 6WB/HUD 120x72 vector surface
@@ -460,20 +461,19 @@ int semantic_render_hud_minimap(const struct snds_junction *junc,
     int gs = simplify_screen_poly(tmp_c, gc, 1.5f, guided_px, 6);
     if (gs < 2) return 0;
 
-    /* OEM BMW visual widths calibrated for the zoomed-out 120x72 6WB/HUD vector surface:
-     *   - Roundabout: medium strokes (2.8+1.4 px) keep a bold pitch-black center island
-     *   - Intersection: sleeker context/road strokes (1.8+1.0 px; secondary ctx 1.4+0.9 px)
-     *     so parallel dual carriageways and slip ramps stay sharply separated, while the
-     *     guided white route arrow (2.8+1.3 px) pops clearly on top! */
-    const float road_fill_hw  = junc->is_roundabout ? 2.8f : 1.8f;
-    const float border_w      = junc->is_roundabout ? 1.4f : 1.0f;
+    /* OEM BMW visual widths calibrated for the 85 m 120x72 6WB/HUD vector surface:
+     *   - Roundabout: balanced strokes (3.0+1.5 px) keep a bold pitch-black center island
+     *   - Intersection: main cross arms (2.4+1.2 px), 1-hop supporting stubs & opposing
+     *     carriageway (1.8+1.0 px), bold guided white route arrow (3.0+1.4 px) on top! */
+    const float road_fill_hw  = junc->is_roundabout ? 3.0f : 2.4f;
+    const float border_w      = junc->is_roundabout ? 1.5f : 1.2f;
     const float road_bord_hw  = road_fill_hw + border_w;
-    const float ctx_fill_hw   = junc->is_roundabout ? 2.0f : 1.4f;
-    const float ctx_bord_hw   = ctx_fill_hw + 0.9f;
-    const float arrow_fill_hw = junc->is_roundabout ? 2.8f : 2.6f;
-    const float arrow_bord_hw = arrow_fill_hw + (junc->is_roundabout ? 1.4f : 1.3f);
-    const float head_len      = junc->is_roundabout ? 11.5f : 11.0f;
-    const float head_hw       = junc->is_roundabout ? 7.8f : 7.2f;
+    const float ctx_fill_hw   = junc->is_roundabout ? 2.0f : 1.8f;
+    const float ctx_bord_hw   = ctx_fill_hw + 1.0f;
+    const float arrow_fill_hw = junc->is_roundabout ? 3.0f : 3.0f;
+    const float arrow_bord_hw = arrow_fill_hw + (junc->is_roundabout ? 1.5f : 1.4f);
+    const float head_len      = junc->is_roundabout ? 12.0f : 12.0f;
+    const float head_hw       = junc->is_roundabout ? 8.2f : 8.0f;
 
     /* Reserve 4 slots for Layer 3 + 4 (guided route border/fill + arrowhead border/fill).
      * If ring_n >= 6, reserve 4 more slots for ring borders/fills. */

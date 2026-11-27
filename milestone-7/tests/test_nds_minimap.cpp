@@ -310,6 +310,121 @@ static void testAll(const char* outDir) {
         semantic_minimap_shm_clear(NULL);
         assert(semantic_minimap_shm_read(NULL, &rec) == 0);
     }
+
+    // 8. 1-hop approach stub (Michaels/Walgreens entrance before Walton Grove) vs
+    //    2nd-hop parking-lot aisles & floating oval rejection
+    {
+        snds_graph g;
+        memset(&g, 0, sizeof(g));
+        // Approach on Cumberland Blvd (N): node 1 (0,0) -> node 2 (0,65) -> node 3 (0,100)
+        snds_pt a1[2] = { {0, 0}, {0, 65} };
+        snds_pt a2[2] = { {0, 65}, {0, 100} };
+        snds_pt straight[2] = { {0, 100}, {0, 180} };
+        snds_pt walton[2] = { {0, 100}, {70, 100} };     // Right turn into Walton Grove (FRC 6)
+        // Hop-1 Michaels/Walgreens plaza entrance at node 2 (35m before turn, FRC 6)
+        snds_pt michaels[2] = { {0, 65}, {65, 65} };
+        snds_pt walgreens[2] = { {0, 65}, {-65, 65} };
+        // Hop-2 parking-lot aisle branching off Michaels at (65,65) -> MUST NOT be drawn!
+        snds_pt lot_aisle[2] = { {65, 65}, {65, 130} };
+        // Disconnected floating drop-off oval on left (-45, 70) -> MUST NOT be drawn!
+        snds_pt oval1[2] = { {-55, 70}, {-35, 70} };
+        snds_pt oval2[2] = { {-35, 70}, {-55, 70} };
+
+        addLink(g, 1, 1, 2, a1, 2, 0, 0, 3, 2, "Cumberland Blvd");
+        addLink(g, 2, 2, 3, a2, 2, 0, 0, 3, 2, "Cumberland Blvd");
+        addLink(g, 3, 3, 4, straight, 2, 0, 0, 3, 2, "Cumberland Blvd");
+        addLink(g, 4, 3, 5, walton, 2, 0, 0, 6, 1, "");
+        addLink(g, 5, 2, 6, michaels, 2, 0, 0, 6, 1, "");
+        addLink(g, 6, 2, 7, walgreens, 2, 0, 0, 6, 1, "");
+        addLink(g, 7, 6, 8, lot_aisle, 2, 0, 0, 6, 1, "");
+        addLink(g, 8, 9, 10, oval1, 2, 1, 1, 6, 1, "");
+        addLink(g, 9, 10, 9, oval2, 2, 1, 1, 6, 1, "");
+
+        snds_query q;
+        memset(&q, 0, sizeof(q));
+        q.car_heading_deg = 0.0f;
+        q.aa_type = 8; // TURN_RIGHT
+        q.dist_m = 100.0f;
+
+        snds_junction j;
+        assert(snds_match_maneuver(&g, &q, &j) == 1);
+        assert(j.valid && !j.is_roundabout && j.arm_count == 1);
+        // context[0] = full walton continuation, context[1..2] = 1-hop Michaels & Walgreens stubs
+        // (lot_aisle at hop-2 and floating oval MUST be excluded!)
+        assert(j.context_count == 3);
+        for (uint8_t c = 1; c < j.context_count; ++c) {
+            // 1-hop stubs must be trimmed to ~35m (not extending to 65m parking lot!)
+            float dx = j.context[c].pts[j.context[c].pt_count - 1].x - j.context[c].pts[0].x;
+            float dy = j.context[c].pts[j.context[c].pt_count - 1].y - j.context[c].pts[0].y;
+            float len = sqrtf(dx * dx + dy * dy);
+            assert(len >= 30.0f && len <= 37.0f);
+        }
+        semantic_hud_minimap mm;
+        assert(semantic_render_hud_minimap(&j, 8, 55, &mm) == 1);
+    }
+
+    // 9. Residential FRC 7 stop-sign 4-way intersection without road names
+    {
+        snds_graph g;
+        memset(&g, 0, sizeof(g));
+        snds_pt app[2] = { {0, 0}, {0, 80} };
+        snds_pt str[2] = { {0, 80}, {0, 160} };
+        snds_pt lft[2] = { {0, 80}, {-80, 80} };
+        snds_pt rgt[2] = { {0, 80}, {80, 80} };
+        addLink(g, 1, 1, 2, app, 2, 0, 0, 7, 1, "");
+        addLink(g, 2, 2, 3, str, 2, 0, 0, 7, 1, "");
+        addLink(g, 3, 2, 4, lft, 2, 0, 0, 7, 1, "");
+        addLink(g, 4, 2, 5, rgt, 2, 0, 0, 7, 1, "");
+
+        snds_query q;
+        memset(&q, 0, sizeof(q));
+        q.car_heading_deg = 0.0f;
+        q.aa_type = 7; // TURN_LEFT
+        q.dist_m = 80.0f;
+
+        snds_junction j;
+        assert(snds_match_maneuver(&g, &q, &j) == 1);
+        assert(j.valid && !j.is_roundabout && j.arm_count == 2);
+        semantic_hud_minimap mm;
+        assert(semantic_render_hud_minimap(&j, 9, 55, &mm) == 1);
+    }
+
+    // 10. Roundabout with reversed one-way ring links (fallback undirected ring trace)
+    {
+        snds_graph g;
+        memset(&g, 0, sizeof(g));
+        const float cx = 0.0f, cy = 80.0f, R = 16.0f;
+        snds_pt app[2] = { {0, 0}, {cx, cy - R} };
+        addLink(g, 1, 10, 1, app, 2, 0, 0, 4, 1, "");
+        // 4-link CCW ring marked one_way=2 (reversed!) so strict pass fails and fallback succeeds
+        snds_pt r1[2] = { {cx, cy - R}, {cx + R, cy} };
+        snds_pt r2[2] = { {cx + R, cy}, {cx, cy + R} };
+        snds_pt r3[2] = { {cx, cy + R}, {cx - R, cy} };
+        snds_pt r4[2] = { {cx - R, cy}, {cx, cy - R} };
+        addLink(g, 2, 1, 2, r1, 2, 1, 2, 4, 1, "");
+        addLink(g, 3, 2, 3, r2, 2, 1, 2, 4, 1, "");
+        addLink(g, 4, 3, 4, r3, 2, 1, 2, 4, 1, "");
+        addLink(g, 5, 4, 1, r4, 2, 1, 2, 4, 1, "");
+        snds_pt e1[2] = { {cx + R, cy}, {cx + R + 50, cy} };
+        snds_pt e2[2] = { {cx, cy + R}, {cx, cy + R + 50} };
+        snds_pt e3[2] = { {cx - R, cy}, {cx - R - 50, cy} };
+        addLink(g, 6, 2, 20, e1, 2, 0, 0, 4, 1, "");
+        addLink(g, 7, 3, 21, e2, 2, 0, 0, 4, 1, "");
+        addLink(g, 8, 4, 22, e3, 2, 0, 0, 4, 1, "");
+
+        snds_query q;
+        memset(&q, 0, sizeof(q));
+        q.car_heading_deg = 0.0f;
+        q.aa_type = 34; // ROUNDABOUT_ENTER_AND_EXIT_CCW
+        q.dist_m = 64.0f;
+        q.exit_number = 2;
+
+        snds_junction j;
+        assert(snds_match_maneuver(&g, &q, &j) == 1);
+        assert(j.valid && j.is_roundabout && j.arm_count == 2);
+        semantic_hud_minimap mm;
+        assert(semantic_render_hud_minimap(&j, 10, 55, &mm) == 1);
+    }
 }
 
 int main(int argc, char** argv) {

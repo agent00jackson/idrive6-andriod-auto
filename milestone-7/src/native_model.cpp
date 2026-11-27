@@ -702,7 +702,7 @@ void Backend::run() {
                     dirty = false;
                     printf("[Native model] AA model accepted distance_mm=%u lanes=%u (HUD unqualified)\n",
                            active.distanceMm, unsigned(active.laneCount));
-                    nextUpdate = millis() + 2000;
+                    nextUpdate = millis() + 500;
                     // A slow receipt already used some of the heartbeat interval.
                     nextHeartbeat = now + 2000;
                 }

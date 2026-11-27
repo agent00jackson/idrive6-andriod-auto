@@ -266,7 +266,7 @@ inline bool fromNav(const kombinav::NavView& view, Message& out, unsigned capabi
             message.roadLength = uint16_t(length);
             memcpy(message.road, view.road.data(), length);
         }
-        const bool roundabout=(view.aa_type>=32&&view.aa_type<=35)||(view.aa_type>=43&&view.aa_type<=46);
+        const bool roundabout=(view.aa_type>=32&&view.aa_type<=35)||view.aa_type==37||view.aa_type==38||(view.aa_type>=43&&view.aa_type<=46);
         if(roundabout&&view.has_exit_number&&view.exit_number>=1&&view.exit_number<=255) {
             message.metadataFlags|=NG_META_EXIT_NUMBER;
             message.exitNumber=int32_t(view.exit_number);

@@ -90,8 +90,10 @@ enum {
     HEAP_SCAN_BEGIN = 0x0255c000,
     HEAP_SCAN_END = 0x20000000,
     RG_VPTR = 0x00f44450,
+    RG_UPDATE_DTM_ORIG = 0x0086d0b8,
     RG_CARPOS_OFF = 0x24c,
     RG_CARPOS_VPTR = 0x00f446b8,
+    RG_DEADRECK_ORIG = 0x004006fc,
     RG_CARPOS_ORIG = 0x00402674,
     RG_DTMCALC_OFF = 0x308,
     RG_DTMCALC_VPTR = 0x00f447e0,
@@ -130,8 +132,9 @@ static volatile uint32_t tour_low_cached;
 static uint32_t resolver_vtable_copy[10];
 static uint32_t wrapped_resolver_addr;
 static uint32_t wrapped_stub_addr;
-static uint32_t rg_carpos_vtable_copy[8];   /* [-2..+5]: offset-to-top, RTTI, 6 slots */
-static uint32_t rg_dtmcalc_vtable_copy[5];  /* [-2..+2]: offset-to-top, RTTI, 3 slots */
+static uint32_t rg_primary_vtable_copy[104]; /* [-2..+101]: offset-to-top, RTTI, 102 slots */
+static uint32_t rg_carpos_vtable_copy[8];    /* [-2..+5]: offset-to-top, RTTI, 6 slots */
+static uint32_t rg_dtmcalc_vtable_copy[5];   /* [-2..+2]: offset-to-top, RTTI, 3 slots */
 static volatile uint32_t g_rg_gps_suppressed;
 static uint32_t fixture_source_handle;
 static uint32_t fixture_factory_calls;
@@ -672,6 +675,18 @@ static void wrapped_rg_on_car_pos(void *subobj, const void *pos) {
     FN(RG_CARPOS_ORIG, void, void *, const void *)(subobj, pos);
 }
 
+static void wrapped_rg_on_dead_reck(void *subobj, const void *dr) {
+    if (__atomic_load_n(&g_rg_gps_suppressed, __ATOMIC_ACQUIRE))
+        return;
+    FN(RG_DEADRECK_ORIG, void, void *, const void *)(subobj, dr);
+}
+
+static void wrapped_rg_update_dtm(void *rg_self, const void *dtm) {
+    if (__atomic_load_n(&g_rg_gps_suppressed, __ATOMIC_ACQUIRE))
+        return; /* Block ALL internal NavigationBasic DTM overwrites while AA is guiding. */
+    FN(RG_UPDATE_DTM_ORIG, void, void *, const void *)(rg_self, dtm);
+}
+
 static void wrapped_rg_on_dtm_calc(void *subobj, const void *ev) {
     if (__atomic_load_n(&g_rg_gps_suppressed, __ATOMIC_ACQUIRE)) {
         uint32_t our_route = __atomic_load_n(&active_route_id, __ATOMIC_ACQUIRE);
@@ -683,6 +698,18 @@ static void wrapped_rg_on_dtm_calc(void *subobj, const void *ev) {
 }
 
 static void install_rg_gps_wrappers(uint32_t rg) {
+    uint32_t rg_vptr = *(uint32_t *)(uintptr_t)rg;
+    int primary_ok = (rg_vptr == (uint32_t)(uintptr_t)&rg_primary_vtable_copy[2]);
+    if (!primary_ok && rg_vptr == RG_VPTR) {
+        memcpy(rg_primary_vtable_copy, (const void *)(uintptr_t)(RG_VPTR - 8u),
+               sizeof(rg_primary_vtable_copy));
+        if (rg_primary_vtable_copy[2 + 8] == RG_UPDATE_DTM_ORIG) {
+            rg_primary_vtable_copy[2 + 8] = (uint32_t)(uintptr_t)&wrapped_rg_update_dtm;
+            *(uint32_t *)(uintptr_t)rg = (uint32_t)(uintptr_t)&rg_primary_vtable_copy[2];
+            primary_ok = 1;
+        }
+    }
+
     uint32_t carpos_addr = rg + RG_CARPOS_OFF;
     uint32_t carpos_vptr = *(uint32_t *)(uintptr_t)carpos_addr;
     int carpos_ok = (carpos_vptr == (uint32_t)(uintptr_t)&rg_carpos_vtable_copy[2]);
@@ -691,6 +718,8 @@ static void install_rg_gps_wrappers(uint32_t rg) {
                sizeof(rg_carpos_vtable_copy));
         if (rg_carpos_vtable_copy[2 + 3] == RG_CARPOS_ORIG) {
             rg_carpos_vtable_copy[2 + 3] = (uint32_t)(uintptr_t)&wrapped_rg_on_car_pos;
+            if (rg_carpos_vtable_copy[2 + 2] == RG_DEADRECK_ORIG)
+                rg_carpos_vtable_copy[2 + 2] = (uint32_t)(uintptr_t)&wrapped_rg_on_dead_reck;
             *(uint32_t *)(uintptr_t)carpos_addr = (uint32_t)(uintptr_t)&rg_carpos_vtable_copy[2];
             carpos_ok = 1;
         }
@@ -708,13 +737,14 @@ static void install_rg_gps_wrappers(uint32_t rg) {
             dtmcalc_ok = 1;
         }
     }
-    basic_log("SEMANTIC_BASIC rg_gps_wrap carpos=%d dtmcalc=%d\n", carpos_ok, dtmcalc_ok);
+    basic_log("SEMANTIC_BASIC rg_gps_wrap primary=%d carpos=%d dtmcalc=%d\n",
+              primary_ok, carpos_ok, dtmcalc_ok);
 }
 
 static void publish_dtm(uint32_t rg, uint32_t route_id, uint32_t man_id,
                         uint32_t dist_dm, uint32_t norm_m,
                         uint32_t bargraph_flag, uint32_t bargraph_max_dm,
-                        const void *locale) {
+                        const void *locale, int force_send) {
     _Alignas(8) uint8_t dtm[0x2c];
     memset(dtm, 0, sizeof(dtm));
     *(uint32_t *)(dtm + 0x00) = route_id;
@@ -726,7 +756,11 @@ static void publish_dtm(uint32_t rg, uint32_t route_id, uint32_t man_id,
     FN(0x16ce4c, void, void *, const void *)(dtm + 0x14, locale);
     *(uint32_t *)(dtm + 0x24) = norm_m;
     *(uint32_t *)(dtm + 0x28) = 0u; /* UNIT_METERS */
-    FN(0x86d0b8, void, void *, const void *)((void *)(uintptr_t)rg, dtm);
+    if (force_send) {
+        /* Clear mDtmState ([rg+400]) so 0x86d0b8 does not suppress identical post-DRP DTM. */
+        *(uint32_t *)(uintptr_t)(rg + 400u) = 0u;
+    }
+    FN(RG_UPDATE_DTM_ORIG, void, void *, const void *)((void *)(uintptr_t)rg, dtm);
     FN(0x16cf50, void, void *)(dtm + 0x14);
 }
 
@@ -835,8 +869,9 @@ static void execute_hud_phase(const struct owner_event *event, unsigned context)
     uint32_t rg = event->component;
     uint32_t milca = event->stub;
     uint32_t route_id = event->arg0;
+    uint32_t cur_rg_vptr = *(uint32_t *)(uintptr_t)rg;
     if (context != event->thread ||
-        *(uint32_t *)(uintptr_t)rg != RG_VPTR ||
+        (cur_rg_vptr != RG_VPTR && cur_rg_vptr != (uint32_t)(uintptr_t)&rg_primary_vtable_copy[2]) ||
         *(uint32_t *)(uintptr_t)milca != MILCA_VPTR) {
         __atomic_store_n(&hud_dispatch_state, 2u, __ATOMIC_RELEASE);
         return;
@@ -867,7 +902,7 @@ static void execute_hud_phase(const struct owner_event *event, unsigned context)
         if (g_pending_dtm_only && g_active_man_id != 0u) {
             publish_dtm(rg, route_id, g_active_man_id, cue->dist_dm, cue->norm_m,
                         cue->bargraph_flag, cue->bargraph_max_dm,
-                        (const void *)(uintptr_t)(list + 0x50));
+                        (const void *)(uintptr_t)(list + 0x50), 0);
             __atomic_store_n(&hud_dispatch_state, 1u, __ATOMIC_RELEASE);
             return;
         }
@@ -907,7 +942,7 @@ static void execute_hud_phase(const struct owner_event *event, unsigned context)
          * populates maneuverData->dtm immediately instead of rendering -1 -> "0". */
         publish_dtm(rg, route_id, id, cue->dist_dm, cue->norm_m,
                     cue->bargraph_flag, cue->bargraph_max_dm,
-                    (const void *)(uintptr_t)(list + 0x50));
+                    (const void *)(uintptr_t)(list + 0x50), 1);
 
         _Alignas(8) uint8_t drp[0x1c];
         memset(drp, 0, sizeof(drp));
@@ -920,9 +955,10 @@ static void execute_hud_phase(const struct owner_event *event, unsigned context)
         FN(0x86cf6c, void, void *, uint32_t)((void *)(uintptr_t)rg, 0xc0000000u);
         FN(0x16cf50, void, void *)(drp + 0x0c);
 
+        /* Force post-DRP DTM broadcast (resetting mDtmState so operator== does not drop it). */
         publish_dtm(rg, route_id, id, cue->dist_dm, cue->norm_m,
                     cue->bargraph_flag, cue->bargraph_max_dm,
-                    (const void *)(uintptr_t)(list + 0x50));
+                    (const void *)(uintptr_t)(list + 0x50), 1);
         __atomic_store_n(&hud_dispatch_state, 1u, __ATOMIC_RELEASE);
         return;
     }
@@ -1215,7 +1251,7 @@ static int refresh_nds_minimap(struct basic_runtime *rt, int force) {
 
     struct semantic_hud_minimap mm;
     memset(&mm, 0, sizeof(mm));
-    if (matched && semantic_render_hud_minimap(&junc, g_next_man_id, 65u, &mm)) {
+    if (matched && semantic_render_hud_minimap(&junc, g_next_man_id, 55u, &mm)) {
         rt->minimap_seq++;
         (void)semantic_minimap_shm_write(NULL, rt->session, rt->minimap_seq, &mm);
         rt->has_active_minimap = 1;

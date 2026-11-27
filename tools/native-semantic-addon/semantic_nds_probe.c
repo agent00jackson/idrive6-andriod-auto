@@ -193,8 +193,8 @@ int semantic_nds_query_local_graph(int mem_fd,
 
     double ahead_dlat = ((double)dist_ahead * (double)m_cosf(h_rad)) / 111320.0;
     double ahead_dlon = ((double)dist_ahead * (double)m_sinf(h_rad)) / (111320.0 * cos_lat);
-    double pad_lat = 135.0 / 111320.0;
-    double pad_lon = 135.0 / (111320.0 * cos_lat);
+    double pad_lat = 110.0 / 111320.0;
+    double pad_lon = 110.0 / (111320.0 * cos_lat);
 
     double lat_min = gps->lat_deg < (gps->lat_deg + ahead_dlat) ? gps->lat_deg : (gps->lat_deg + ahead_dlat);
     double lat_max = gps->lat_deg > (gps->lat_deg + ahead_dlat) ? gps->lat_deg : (gps->lat_deg + ahead_dlat);
@@ -321,7 +321,8 @@ int semantic_nds_query_local_graph(int mem_fd,
                         }
                     }
 
-                    if (lnk->frc < 7u || lnk->is_roundabout)
+                    /* Keep FRC 0..7 (residential neighborhood streets can be FRC 7 in NA NDS). */
+                    if (lnk->frc <= 7u || lnk->is_roundabout)
                         out_graph->link_count++;
                 }
             }
