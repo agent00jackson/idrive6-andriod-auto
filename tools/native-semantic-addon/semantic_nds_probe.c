@@ -175,18 +175,32 @@ int semantic_nds_query_local_graph(int mem_fd,
         return 0;
 
     if (radius_m < 140.0f) radius_m = 140.0f;
-    if (radius_m > 480.0f) radius_m = 480.0f;
+    if (radius_m > 520.0f) radius_m = 520.0f;
 
+    /* Tight corridor bounding box covering both the car position and the predicted
+     * maneuver point (~dist_m ahead along heading_deg) with +-110m margin, avoiding
+     * dense urban link-cap truncation from unrelated roads behind/beside the car. */
+    float dist_ahead = radius_m - 120.0f;
+    if (dist_ahead < 40.0f) dist_ahead = 40.0f;
+    float h_rad = gps->heading_deg * (float)(3.14159265358979323846 / 180.0);
     double cos_lat = (double)m_cosf((float)(gps->lat_deg * (3.14159265358979323846 / 180.0)));
     if (cos_lat < 0.1) cos_lat = 0.1;
-    double dlat = (double)radius_m / 111320.0;
-    double dlon = (double)radius_m / (111320.0 * cos_lat);
+
+    double ahead_dlat = ((double)dist_ahead * (double)m_cosf(h_rad)) / 111320.0;
+    double ahead_dlon = ((double)dist_ahead * (double)m_sinf(h_rad)) / (111320.0 * cos_lat);
+    double pad_lat = 110.0 / 111320.0;
+    double pad_lon = 110.0 / (111320.0 * cos_lat);
+
+    double lat_min = gps->lat_deg < (gps->lat_deg + ahead_dlat) ? gps->lat_deg : (gps->lat_deg + ahead_dlat);
+    double lat_max = gps->lat_deg > (gps->lat_deg + ahead_dlat) ? gps->lat_deg : (gps->lat_deg + ahead_dlat);
+    double lon_min = gps->lon_deg < (gps->lon_deg + ahead_dlon) ? gps->lon_deg : (gps->lon_deg + ahead_dlon);
+    double lon_max = gps->lon_deg > (gps->lon_deg + ahead_dlon) ? gps->lon_deg : (gps->lon_deg + ahead_dlon);
 
     int32_t bbox[4];
-    bbox[0] = clamp_deg_to_nds(gps->lon_deg - dlon);
-    bbox[1] = clamp_deg_to_nds(gps->lat_deg - dlat);
-    bbox[2] = clamp_deg_to_nds(gps->lon_deg + dlon);
-    bbox[3] = clamp_deg_to_nds(gps->lat_deg + dlat);
+    bbox[0] = clamp_deg_to_nds(lon_min - pad_lon);
+    bbox[1] = clamp_deg_to_nds(lat_min - pad_lat);
+    bbox[2] = clamp_deg_to_nds(lon_max + pad_lon);
+    bbox[3] = clamp_deg_to_nds(lat_max + pad_lat);
 
     typedef void *(*create_scan_fn)(void *, const int32_t *);
     typedef uint64_t (*scan_id_fn)(void *);
@@ -302,7 +316,8 @@ int semantic_nds_query_local_graph(int mem_fd,
                         }
                     }
 
-                    out_graph->link_count++;
+                    if (lnk->frc < 7u || lnk->is_roundabout)
+                        out_graph->link_count++;
                 }
             }
         }

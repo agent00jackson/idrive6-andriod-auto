@@ -12,7 +12,7 @@ extern "C" {
 #endif
 
 #define SNDS_MAX_LINK_PTS     24u
-#define SNDS_MAX_GRAPH_LINKS  128u
+#define SNDS_MAX_GRAPH_LINKS  384u
 #define SNDS_MAX_ROAD_NAME    64u
 #define SNDS_MAX_JUNCTION_PTS 48u
 #define SNDS_MAX_ARMS         6u

@@ -615,6 +615,32 @@ static void store_live_gps(const struct semantic_car_gps *src) {
 }
 
 static int load_live_gps(struct semantic_car_gps *out) {
+    /* Optional test-only GPS override (/dev/shmem/aa-semantic-test-gps: "lat lon heading")
+     * so parked tests can query real OEM NDS intersections anywhere in the map database. */
+    {
+        int tfd = open("/dev/shmem/aa-semantic-test-gps", O_RDONLY);
+        if (tfd >= 0) {
+            char buf[128];
+            ssize_t n = read(tfd, buf, sizeof(buf) - 1u);
+            close(tfd);
+            if (n > 0) {
+                buf[n] = '\0';
+                double lat = 0.0, lon = 0.0;
+                float hdg = 0.0f;
+                if (sscanf(buf, "%lf %lf %f", &lat, &lon, &hdg) == 3 &&
+                    lat >= -85.0 && lat <= 85.0 && lon >= -180.0 && lon <= 180.0) {
+                    while (hdg < 0.0f) hdg += 360.0f;
+                    while (hdg >= 360.0f) hdg -= 360.0f;
+                    out->lat_deg = lat;
+                    out->lon_deg = lon;
+                    out->heading_deg = hdg;
+                    out->timestamp_ms = mono_ms();
+                    out->valid = 1;
+                    return 1;
+                }
+            }
+        }
+    }
     for (unsigned tries = 0u; tries < 4u; ++tries) {
         uint32_t s1 = __atomic_load_n(&g_gps_seq, __ATOMIC_ACQUIRE);
         if (s1 & 1u)
@@ -1165,9 +1191,9 @@ static int refresh_nds_minimap(struct basic_runtime *rt, int force) {
         rt->minimap_seq++;
         (void)semantic_minimap_shm_write(NULL, rt->session, rt->minimap_seq, &mm);
         rt->has_active_minimap = 1;
-        basic_log("SEMANTIC_BASIC nds_minimap ok links=%d rb=%u conf=%u polys=%u dist_m=%.0f\n",
-                  links, (unsigned)mm.is_roundabout, (unsigned)mm.confidence,
-                  (unsigned)mm.poly_count, (double)dist_m);
+        basic_log("SEMANTIC_BASIC nds_minimap ok links=%d rb=%u arms=%u conf=%u polys=%u dist_m=%.0f ctr=(%.0f,%.0f)\n",
+                  links, (unsigned)mm.is_roundabout, (unsigned)junc.arm_count, (unsigned)mm.confidence,
+                  (unsigned)mm.poly_count, (double)dist_m, (double)junc.center.x, (double)junc.center.y);
         return 1;
     }
 
@@ -1176,8 +1202,9 @@ static int refresh_nds_minimap(struct basic_runtime *rt, int force) {
         rt->has_active_minimap = 0;
     }
     if (force) {
-        basic_log("SEMANTIC_BASIC nds_minimap fallback links=%d matched=%d conf=%u dist_m=%.0f\n",
-                  links, matched, (unsigned)junc.confidence, (double)dist_m);
+        basic_log("SEMANTIC_BASIC nds_minimap fallback links=%d matched=%d conf=%u dist_m=%.0f lat=%.5f lon=%.5f hdg=%.1f\n",
+                  links, matched, (unsigned)junc.confidence, (double)dist_m,
+                  gps.lat_deg, gps.lon_deg, (double)gps.heading_deg);
     }
     return 0;
 }
