@@ -328,7 +328,10 @@ static int snap_car_to_link(const struct snds_graph *g, const struct snds_query 
                                     : vec_heading_deg(b.x - a.x, b.y - a.y);
                 float dh = m_fabsf(wrap_deg_180(seg_hdg - q->car_heading_deg));
                 if (d < 40.0f && dh < 55.0f) {
-                    float frc_pen = (l->frc >= 7u) ? 22.0f : (l->frc >= 6u ? 12.0f : 0.0f);
+                    /* Light preference for higher road classes when distance is similar,
+                     * without pulling a car on an FRC 7 residential/apartment driveway off
+                     * onto an adjacent arterial 20m away. */
+                    float frc_pen = (l->frc >= 7u) ? 8.0f : (l->frc >= 6u ? 4.0f : 0.0f);
                     float cost = d + dh * 0.45f + frc_pen;
                     if (cost < best_cost) {
                         best_cost = cost;
@@ -597,7 +600,7 @@ static int match_turn_at_node(const struct snds_graph *g,
         int score = 42;
         score += (int)((60.0f - adiff) * 0.45f); /* up to +27 for tight angle match */
         float ddiff = m_fabsf(cum_dist_m - q->dist_m);
-        float tol = q->dist_m * 0.45f + 40.0f;
+        float tol = q->dist_m * 0.35f + 30.0f;
         if (ddiff < tol)
             score += (int)((1.0f - ddiff / tol) * 26.0f); /* up to +26 for exact distance */
         if (q->road_name[0])
@@ -752,16 +755,18 @@ static void collect_context_roads(const struct snds_graph *g,
         if (link_already_covered(l, out)) { used[i] = 1u; continue; }
     }
 
-    /* 1. 1-hop branches directly touching intermediate approach vertices (within 70m of center). */
-    uint8_t max_branch_frc = (approach_frc >= 6u) ? 7u : 6u;
+    /* 1. 1-hop branches directly touching intermediate approach vertices (within 65m of center).
+     *    Allow FRC 7 1-hop stubs within 55m of center (e.g. Michaels/Walgreens plaza entrance
+     *    right before Walton Grove), strictly trimmed to 35m stubs (never chaining 2+ hops). */
     for (uint8_t k = 0u; k < out->approach.pt_count && out->context_count < MAX_CONTEXT_EMIT; ++k) {
         struct snds_pt apt = out->approach.pts[k];
         float d_ctr = pt_dist(apt, out->center);
-        if (d_ctr < 6.0f || d_ctr > 70.0f) continue; /* skip turn node itself & far behind */
+        if (d_ctr < 6.0f || d_ctr > 65.0f) continue; /* skip turn node itself & far behind */
 
         for (uint16_t i = 0u; i < g->link_count && out->context_count < MAX_CONTEXT_EMIT; ++i) {
             if (used[i]) continue;
             const struct snds_link *l = &g->links[i];
+            uint8_t max_branch_frc = (approach_frc >= 6u || d_ctr <= 55.0f) ? 7u : 6u;
             if (l->frc > max_branch_frc) continue;
             int rev = link_touches_node(l, 0ULL, apt);
             if (rev < 0) continue;
@@ -971,8 +976,8 @@ int snds_match_maneuver(const struct snds_graph *graph,
     int snap_idx = cur_idx, snap_rev = cur_rev;
     uint8_t car_lanes = graph->links[cur_idx].lanes;
     const int want_rb = is_roundabout_aa(query->aa_type);
-    const float max_walk_m = query->dist_m * 1.5f + 80.0f;
-    const float min_match_m = query->dist_m > 50.0f ? query->dist_m * 0.45f : 0.0f;
+    const float max_walk_m = query->dist_m * 1.45f + 70.0f;
+    const float min_match_m = query->dist_m > 40.0f ? query->dist_m * 0.50f : 0.0f;
 
     struct snds_polyline approach;
     memset(&approach, 0, sizeof(approach));

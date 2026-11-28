@@ -27,6 +27,7 @@
 #include "native_model_wire/protocol.h"
 #include "semantic_cue_map.h"
 #include "semantic_handoff.h"
+#include "semantic_math.h"
 #include "semantic_minimap_render.h"
 #include "semantic_minimap_shm.h"
 #include "semantic_nds_map.h"
@@ -90,6 +91,7 @@ enum {
     HEAP_SCAN_BEGIN = 0x0255c000,
     HEAP_SCAN_END = 0x20000000,
     RG_VPTR = 0x00f44450,
+    RG_UPDATE_DRP_ORIG = 0x0086d140,
     RG_UPDATE_DTM_ORIG = 0x0086d0b8,
     RG_CARPOS_OFF = 0x24c,
     RG_CARPOS_VPTR = 0x00f446b8,
@@ -98,6 +100,9 @@ enum {
     RG_DTMCALC_OFF = 0x308,
     RG_DTMCALC_VPTR = 0x00f447e0,
     RG_DTMCALC_ORIG = 0x00402268,
+    RG_DRPEV_OFF = 0x318,
+    RG_DRPEV_VPTR = 0x00f447f4,
+    RG_DRPEV_ORIG = 0x00402054,
     MILCA_VPTR = 0x00f3f3c8,
 };
 
@@ -106,6 +111,7 @@ enum {
     PHASE_CALC_ROUTE = 2,
     PHASE_ACTIVATE_GUIDANCE = 5,
     PHASE_PUBLISH_CUE = 6,
+    PHASE_REBROADCAST_DTM = 7,
     PHASE_CLEAR_GUIDANCE = 8,
 };
 
@@ -135,6 +141,7 @@ static uint32_t wrapped_stub_addr;
 static uint32_t rg_primary_vtable_copy[104]; /* [-2..+101]: offset-to-top, RTTI, 102 slots */
 static uint32_t rg_carpos_vtable_copy[8];    /* [-2..+5]: offset-to-top, RTTI, 6 slots */
 static uint32_t rg_dtmcalc_vtable_copy[5];   /* [-2..+2]: offset-to-top, RTTI, 3 slots */
+static uint32_t rg_drpev_vtable_copy[5];     /* [-2..+2]: offset-to-top, RTTI, 3 slots */
 static volatile uint32_t g_rg_gps_suppressed;
 static uint32_t fixture_source_handle;
 static uint32_t fixture_factory_calls;
@@ -142,6 +149,7 @@ static uint32_t fixture_factory_calls;
 /* Pending cue passed from worker thread to ctx 9 (CRouteGuidance/CMiLCa). */
 static struct semantic_basic_cue g_pending_cue;
 static uint32_t g_pending_dtm_only;
+static uint32_t g_pending_dtm_force;
 static uint32_t g_next_man_id = 1u;
 static uint32_t g_active_man_id = 0u;
 static uint32_t g_sort_counter = 1u;
@@ -681,6 +689,12 @@ static void wrapped_rg_on_dead_reck(void *subobj, const void *dr) {
     FN(RG_DEADRECK_ORIG, void, void *, const void *)(subobj, dr);
 }
 
+static void wrapped_rg_update_drp(void *rg_self, const void *drp) {
+    if (__atomic_load_n(&g_rg_gps_suppressed, __ATOMIC_ACQUIRE))
+        return; /* Block ALL internal NavigationBasic DRP overwrites while AA is guiding. */
+    FN(RG_UPDATE_DRP_ORIG, void, void *, const void *)(rg_self, drp);
+}
+
 static void wrapped_rg_update_dtm(void *rg_self, const void *dtm) {
     if (__atomic_load_n(&g_rg_gps_suppressed, __ATOMIC_ACQUIRE))
         return; /* Block ALL internal NavigationBasic DTM overwrites while AA is guiding. */
@@ -697,6 +711,12 @@ static void wrapped_rg_on_dtm_calc(void *subobj, const void *ev) {
     FN(RG_DTMCALC_ORIG, void, void *, const void *)(subobj, ev);
 }
 
+static void wrapped_rg_on_drp_event(void *subobj, const void *ev) {
+    if (__atomic_load_n(&g_rg_gps_suppressed, __ATOMIC_ACQUIRE))
+        return; /* Block internal NavigationBasic CDrPointEvent broadcasts (rg+0x318 -> 0x402054). */
+    FN(RG_DRPEV_ORIG, void, void *, const void *)(subobj, ev);
+}
+
 static void install_rg_gps_wrappers(uint32_t rg) {
     uint32_t rg_vptr = *(uint32_t *)(uintptr_t)rg;
     int primary_ok = (rg_vptr == (uint32_t)(uintptr_t)&rg_primary_vtable_copy[2]);
@@ -704,6 +724,8 @@ static void install_rg_gps_wrappers(uint32_t rg) {
         memcpy(rg_primary_vtable_copy, (const void *)(uintptr_t)(RG_VPTR - 8u),
                sizeof(rg_primary_vtable_copy));
         if (rg_primary_vtable_copy[2 + 8] == RG_UPDATE_DTM_ORIG) {
+            if (rg_primary_vtable_copy[2 + 7] == RG_UPDATE_DRP_ORIG)
+                rg_primary_vtable_copy[2 + 7] = (uint32_t)(uintptr_t)&wrapped_rg_update_drp;
             rg_primary_vtable_copy[2 + 8] = (uint32_t)(uintptr_t)&wrapped_rg_update_dtm;
             *(uint32_t *)(uintptr_t)rg = (uint32_t)(uintptr_t)&rg_primary_vtable_copy[2];
             primary_ok = 1;
@@ -737,8 +759,21 @@ static void install_rg_gps_wrappers(uint32_t rg) {
             dtmcalc_ok = 1;
         }
     }
-    basic_log("SEMANTIC_BASIC rg_gps_wrap primary=%d carpos=%d dtmcalc=%d\n",
-              primary_ok, carpos_ok, dtmcalc_ok);
+
+    uint32_t drpev_addr = rg + RG_DRPEV_OFF;
+    uint32_t drpev_vptr = *(uint32_t *)(uintptr_t)drpev_addr;
+    int drpev_ok = (drpev_vptr == (uint32_t)(uintptr_t)&rg_drpev_vtable_copy[2]);
+    if (!drpev_ok && drpev_vptr == RG_DRPEV_VPTR) {
+        memcpy(rg_drpev_vtable_copy, (const void *)(uintptr_t)(RG_DRPEV_VPTR - 8u),
+               sizeof(rg_drpev_vtable_copy));
+        if (rg_drpev_vtable_copy[2 + 2] == RG_DRPEV_ORIG) {
+            rg_drpev_vtable_copy[2 + 2] = (uint32_t)(uintptr_t)&wrapped_rg_on_drp_event;
+            *(uint32_t *)(uintptr_t)drpev_addr = (uint32_t)(uintptr_t)&rg_drpev_vtable_copy[2];
+            drpev_ok = 1;
+        }
+    }
+    basic_log("SEMANTIC_BASIC rg_gps_wrap primary=%d carpos=%d dtmcalc=%d drpev=%d\n",
+              primary_ok, carpos_ok, dtmcalc_ok, drpev_ok);
 }
 
 static void publish_dtm(uint32_t rg, uint32_t route_id, uint32_t man_id,
@@ -892,6 +927,19 @@ static void execute_hud_phase(const struct owner_event *event, unsigned context)
         __atomic_store_n(&hud_dispatch_state, 1u, __ATOMIC_RELEASE);
         return;
     }
+    if (event->phase == PHASE_REBROADCAST_DTM) {
+        uint32_t list = find_milca_list_for_route(milca, route_id);
+        if (list >= 0x10000u && list < 0x80000000u && g_active_man_id != 0u) {
+            const struct semantic_basic_cue *cue = &g_pending_cue;
+            publish_dtm(rg, route_id, g_active_man_id, cue->dist_dm, cue->norm_m,
+                        cue->bargraph_flag, cue->bargraph_max_dm,
+                        (const void *)(uintptr_t)(list + 0x50), 1);
+            __atomic_store_n(&hud_dispatch_state, 1u, __ATOMIC_RELEASE);
+        } else {
+            __atomic_store_n(&hud_dispatch_state, 2u, __ATOMIC_RELEASE);
+        }
+        return;
+    }
     if (event->phase == PHASE_PUBLISH_CUE) {
         uint32_t list = find_milca_list_for_route(milca, route_id);
         if (list < 0x10000u || list >= 0x80000000u) {
@@ -899,10 +947,17 @@ static void execute_hud_phase(const struct owner_event *event, unsigned context)
             return;
         }
         const struct semantic_basic_cue *cue = &g_pending_cue;
+        uint32_t loc_ms = *(const uint32_t *)(uintptr_t)(list + 0x50 + 0x0c);
         if (g_pending_dtm_only && g_active_man_id != 0u) {
             publish_dtm(rg, route_id, g_active_man_id, cue->dist_dm, cue->norm_m,
                         cue->bargraph_flag, cue->bargraph_max_dm,
-                        (const void *)(uintptr_t)(list + 0x50), 0);
+                        (const void *)(uintptr_t)(list + 0x50),
+                        g_pending_dtm_force ? 1 : 0);
+            if (g_pending_dtm_force) {
+                basic_log("SEMANTIC_BASIC dtm_only id=%u dist_dm=%u bg=%u/%u ms=%u\n",
+                          g_active_man_id, cue->dist_dm, cue->bargraph_flag,
+                          cue->bargraph_max_dm, loc_ms);
+            }
             __atomic_store_n(&hud_dispatch_state, 1u, __ATOMIC_RELEASE);
             return;
         }
@@ -959,6 +1014,8 @@ static void execute_hud_phase(const struct owner_event *event, unsigned context)
         publish_dtm(rg, route_id, id, cue->dist_dm, cue->norm_m,
                     cue->bargraph_flag, cue->bargraph_max_dm,
                     (const void *)(uintptr_t)(list + 0x50), 1);
+        basic_log("SEMANTIC_BASIC pub_cue id=%u dist_dm=%u bg=%u/%u ms=%u\n",
+                  id, cue->dist_dm, cue->bargraph_flag, cue->bargraph_max_dm, loc_ms);
         __atomic_store_n(&hud_dispatch_state, 1u, __ATOMIC_RELEASE);
         return;
     }
@@ -1118,33 +1175,51 @@ struct basic_runtime {
     uint64_t last_alive_ms;
     uint64_t next_calc_ms;
     uint64_t last_nds_query_ms;
+    uint64_t republish_dtm_at_ms;
     uint32_t calc_attempts;
     uint32_t last_seq;
     uint32_t minimap_seq;
     int has_active_minimap;
+    float last_mm_dist_m;
+    float last_mm_hdg_deg;
+    double last_mm_ctr_lat;
+    double last_mm_ctr_lon;
 };
 
 static int cue_eligible_for_minimap(const struct ng_message *msg,
                                     const struct semantic_basic_cue *cue) {
     if (!msg || !cue || cue->is_arrival)
         return 0;
-    float dist_m = (float)msg->distance_mm * 0.001f;
-    if (dist_m > 450.0f)
-        return 0;
-    /* Roundabouts (AA 32..38), turns/forks/ramps (anything non-straight/non-depart). */
     uint16_t aa = (msg->metadata_flags & NG_META_AA_TYPE) ? msg->aa_type : 0u;
     if (aa == 1u || aa == 2u || aa == 39u || aa == 40u || aa == 41u)
         return 0; /* DEPART, NAME_CHANGE, DESTINATION_* */
     if (aa == 0u && msg->turn == NG_STRAIGHT)
         return 0;
+    float dist_m = (float)msg->distance_mm * 0.001f;
+    /* Keep motorway off-ramps/forks eligible out to 450m; tighten urban turns &
+     * roundabouts to 260m so we don't lock onto a wrong earlier intersection in
+     * dense commercial corridors before reaching the actual approach road. */
+    float max_dist_m = (aa >= 21u && aa <= 26u) ? 450.0f : 260.0f;
+    if (dist_m > max_dist_m)
+        return 0;
     return 1;
 }
 
-/* Returns 1 if a fresh valid minimap was just written to SHM, 0 otherwise. */
+static float heading_delta_abs(float a, float b) {
+    float d = a - b;
+    while (d > 180.0f) d -= 360.0f;
+    while (d <= -180.0f) d += 360.0f;
+    return d < 0.0f ? -d : d;
+}
+
+/* Returns:
+ *   2 if SHM minimap newly appeared OR moved to a meaningfully different junction (>18m)
+ *   1 if SHM minimap refreshed on the same junction (no HUD redraw needed)
+ *   0 if fallback (no minimap) */
 static int refresh_nds_minimap(struct basic_runtime *rt, int force) {
     uint64_t now = mono_ms();
     if (!force && now < rt->last_nds_query_ms + 600u)
-        return 0;
+        return rt->has_active_minimap ? 1 : 0;
 
     /* Test-only sentinel: lets a parked synthetic test drive /dev/shmem/aa-semantic-minimap
      * directly without NavigationBasic overwriting or clearing it on cue publish. */
@@ -1252,14 +1327,29 @@ static int refresh_nds_minimap(struct basic_runtime *rt, int force) {
     struct semantic_hud_minimap mm;
     memset(&mm, 0, sizeof(mm));
     if (matched && semantic_render_hud_minimap(&junc, g_next_man_id, 55u, &mm)) {
+        double cos_lat = (double)m_cosf((float)(gps.lat_deg * (3.14159265358979323846 / 180.0)));
+        if (cos_lat < 0.1) cos_lat = 0.1;
+        double ctr_lat = gps.lat_deg + (double)junc.center.y / 111320.0;
+        double ctr_lon = gps.lon_deg + (double)junc.center.x / (111320.0 * cos_lat);
+        int changed = !rt->has_active_minimap;
+        if (!changed) {
+            double dlat_m = (ctr_lat - rt->last_mm_ctr_lat) * 111320.0;
+            double dlon_m = (ctr_lon - rt->last_mm_ctr_lon) * 111320.0 * cos_lat;
+            if (dlat_m * dlat_m + dlon_m * dlon_m > 18.0 * 18.0)
+                changed = 1;
+        }
         rt->minimap_seq++;
         (void)semantic_minimap_shm_write(NULL, rt->session, rt->minimap_seq, &mm);
         rt->has_active_minimap = 1;
-        basic_log("SEMANTIC_BASIC nds_minimap ok links=%d rb=%u arms=%u ctx=%u conf=%u polys=%u dist_m=%.0f ctr=(%.0f,%.0f)\n",
+        rt->last_mm_dist_m = dist_m;
+        rt->last_mm_hdg_deg = gps.heading_deg;
+        rt->last_mm_ctr_lat = ctr_lat;
+        rt->last_mm_ctr_lon = ctr_lon;
+        basic_log("SEMANTIC_BASIC nds_minimap ok links=%d rb=%u arms=%u ctx=%u conf=%u polys=%u dist_m=%.0f ctr=(%.0f,%.0f) chg=%d\n",
                   links, (unsigned)mm.is_roundabout, (unsigned)junc.arm_count, (unsigned)junc.context_count,
                   (unsigned)mm.confidence, (unsigned)mm.poly_count, (double)dist_m,
-                  (double)junc.center.x, (double)junc.center.y);
-        return 1;
+                  (double)junc.center.x, (double)junc.center.y, changed);
+        return changed ? 2 : 1;
     }
 
     if (rt->has_active_minimap || force) {
@@ -1285,16 +1375,46 @@ static int try_publish_pending(struct basic_runtime *rt) {
     g_pending_cue = rt->pending_cue;
     g_pending_dtm_only = (rt->has_published &&
                           semantic_cue_is_distance_only(&rt->published_cue, &rt->pending_cue)) ? 1u : 0u;
+    g_pending_dtm_force = (rt->has_published &&
+                           (rt->published_cue.bargraph_flag != rt->pending_cue.bargraph_flag ||
+                            rt->published_cue.bargraph_max_dm != rt->pending_cue.bargraph_max_dm)) ? 1u : 0u;
     if (!g_pending_dtm_only) {
         (void)refresh_nds_minimap(rt, 1);
-    } else if (!rt->has_active_minimap &&
-               cue_eligible_for_minimap(&rt->pending_msg, &rt->pending_cue)) {
-        /* Maneuver just entered <=450m approach range: upgrade to real NDS minimap once! */
-        if (refresh_nds_minimap(rt, 0))
-            g_pending_dtm_only = 0u;
+    } else if (cue_eligible_for_minimap(&rt->pending_msg, &rt->pending_cue)) {
+        if (!rt->has_active_minimap) {
+            /* Maneuver just entered approach range: upgrade to real NDS minimap once! */
+            if (refresh_nds_minimap(rt, 0) == 2)
+                g_pending_dtm_only = 0u;
+        } else {
+            /* Refine active minimap if car advanced >=65m or turned >=25deg since last match
+             * (fixes early/mid-turn wrong-junction lock without redrawing if center matches). */
+            float cur_dist_m = (float)rt->pending_msg.distance_mm * 0.001f;
+            struct semantic_car_gps gps;
+            int hdg_moved = (load_live_gps(&gps) &&
+                             heading_delta_abs(gps.heading_deg, rt->last_mm_hdg_deg) >= 25.0f);
+            if ((rt->last_mm_dist_m - cur_dist_m) >= 65.0f || hdg_moved) {
+                int rc = refresh_nds_minimap(rt, 0);
+                if (rc == 2 || rc == 0)
+                    g_pending_dtm_only = 0u;
+            }
+        }
     }
     if (dispatch_owner(rt->rg, rt->milca, rt->rg_tid, PHASE_PUBLISH_CUE, route_id, &hud_dispatch_state) != 1u)
         return 0;
+    if (!g_pending_dtm_only) {
+        /* Re-broadcast DTM 150ms later, after NavigationBasic answers NavigationFully's
+         * async requestGetManeuverListStartingAtManeuver(id), so updateBargraphDtm &
+         * updateDtm2 are guaranteed to hit the live maneuver object. */
+        rt->republish_dtm_at_ms = mono_ms() + 150u;
+        basic_log("SEMANTIC_BASIC cue_full dist_dm=%u bg=%u/%u lanes=%u road='%s'\n",
+                  rt->pending_cue.dist_dm, rt->pending_cue.bargraph_flag,
+                  rt->pending_cue.bargraph_max_dm, (unsigned)rt->pending_cue.lane_count,
+                  rt->pending_cue.road);
+    } else if (g_pending_dtm_force) {
+        basic_log("SEMANTIC_BASIC cue_bg_chg dist_dm=%u bg=%u/%u\n",
+                  rt->pending_cue.dist_dm, rt->pending_cue.bargraph_flag,
+                  rt->pending_cue.bargraph_max_dm);
+    }
     rt->published_cue = rt->pending_cue;
     rt->has_published = 1;
     rt->has_pending = 0;
@@ -1312,6 +1432,7 @@ static void clear_session(struct basic_runtime *rt) {
     rt->has_pending = 0;
     rt->has_published = 0;
     rt->has_active_minimap = 0;
+    rt->republish_dtm_at_ms = 0u;
     rt->session = 0;
     rt->last_seq = 0;
     __atomic_store_n(&resolver_armed_flag, 0u, __ATOMIC_RELEASE);
@@ -1580,6 +1701,15 @@ static void *worker_main(void *administrator) {
         progress_handoff(&rt);
         if (rt.guidance_active && rt.has_pending)
             (void)try_publish_pending(&rt);
+        if (rt.guidance_active && rt.has_published && rt.republish_dtm_at_ms && now >= rt.republish_dtm_at_ms) {
+            uint32_t rid = __atomic_load_n(&active_route_id, __ATOMIC_ACQUIRE);
+            rt.republish_dtm_at_ms = 0u;
+            if (rid) {
+                g_pending_cue = rt.published_cue;
+                (void)dispatch_owner(rt.rg, rt.milca, rt.rg_tid, PHASE_REBROADCAST_DTM,
+                                     rid, &hud_dispatch_state);
+            }
+        }
 
         /* Lease expiry: if nbt-aad disappears for >10 s, clear our owned guidance cleanly. */
         if (rt.session && rt.last_alive_ms && now > rt.last_alive_ms + NG_ALIVE_LEASE_MS) {

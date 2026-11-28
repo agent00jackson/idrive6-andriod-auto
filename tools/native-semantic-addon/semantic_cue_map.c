@@ -261,8 +261,6 @@ int semantic_cue_is_distance_only(const struct semantic_basic_cue *prev,
         prev->direction != next->direction ||
         prev->elem_type != next->elem_type ||
         prev->angle_deg != next->angle_deg ||
-        prev->bargraph_flag != next->bargraph_flag ||
-        prev->bargraph_max_dm != next->bargraph_max_dm ||
         prev->is_arrival != next->is_arrival ||
         prev->extra_arm_count != next->extra_arm_count ||
         prev->lane_count != next->lane_count ||

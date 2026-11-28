@@ -332,6 +332,33 @@ static void wrapped_hud_draw_command_data(void *self, const void *chunk, int top
     }
     FN(HUD_COMM_DRAW_CMD_ORIG, void, void *, const void *, int, int, int, int, int, int)(
         self, chunk, top_frame, arg3, man_id, man_type, data_seq, man_phase);
+    if (sess != 0u && owned_trip_handle != 0u && top_frame == 11 && chunk) {
+        uint8_t is_fpk = *((const uint8_t *)self + 224u);
+        uint32_t bg_beg = 0u, bg_end = 0u, bg_cur = 0u, bg_max = 0u;
+        uint32_t dist_beg = 0u, dist_end = 0u;
+        uint32_t prev_cur = 0u, prev_max = 0u;
+        int32_t prev_inst = -1;
+        uint32_t chunk_addr = (uint32_t)(uintptr_t)chunk;
+        uint32_t self_addr = (uint32_t)(uintptr_t)self;
+        (void)word_at(chunk_addr + 24u, &bg_beg);
+        (void)word_at(chunk_addr + 28u, &bg_end);
+        uint32_t bg_cnt = (bg_beg && bg_end > bg_beg && ((bg_end - bg_beg) % 8u) == 0u)
+                              ? (bg_end - bg_beg) / 8u : 0u;
+        if (bg_cnt > 0u) {
+            (void)word_at(bg_end - 8u, &bg_cur);
+            (void)word_at(bg_end - 4u, &bg_max);
+        }
+        (void)word_at(chunk_addr + 56u, &dist_beg);
+        (void)word_at(chunk_addr + 60u, &dist_end);
+        uint32_t dist_cnt = (dist_beg && dist_end > dist_beg && ((dist_end - dist_beg) % 8u) == 0u)
+                                ? (dist_end - dist_beg) / 8u : 0u;
+        (void)word_at(self_addr + 300u, &prev_cur);
+        (void)word_at(self_addr + 304u, &prev_max);
+        (void)read_at(self_addr + 308u, &prev_inst, sizeof(prev_inst));
+        ctrl_log("SEMANTIC_CTRL hud_cmd fpk=%u tf=%d man=%d ph=%d bg_cnt=%u bg=%u/%u prev=%u/%u@%d dist_cnt=%u\n",
+                 (unsigned)is_fpk, top_frame, man_id, man_phase,
+                 bg_cnt, bg_cur, bg_max, prev_cur, prev_max, prev_inst, dist_cnt);
+    }
     g_mm_override_active = 0;
     g_mm_override_self = NULL;
 }

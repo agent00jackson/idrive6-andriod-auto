@@ -174,8 +174,9 @@ static void testCueMappings() {
         m.distance_mm = 150000; // 150 m -> BG_VISIBLE
         assert(semantic_map_ng_message(&m, &c2));
         assert(c2.bargraph_max_dm == 2500u && c2.bargraph_flag == SEMANTIC_BG_VISIBLE);
-        // Crossing BG_ENABLED -> BG_VISIBLE triggers one full publish to activate the bargraph
-        assert(semantic_cue_is_distance_only(&c1, &c2) == 0);
+        // Crossing BG_ENABLED -> BG_VISIBLE stays distance-only (NavigationFully 0x86cc44
+        // updates bargraph_flag directly without tearing down man_id or blipping to 0).
+        assert(semantic_cue_is_distance_only(&c1, &c2) == 1);
 
         semantic_basic_cue c3;
         m.distance_mm = 100000; // 100 m -> still BG_VISIBLE: distance-only!
